@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Community</title>
+    <link rel="stylesheet" href="/style.css">
+    <script src="https://unpkg.com/lucide@latest"></script>
+</head>
+<body class="page-community">
+    <header class="site-header">
+        <a href="/" class="brand-mark">
+            <span class="brand-dot"></span>
+            <span>Local Social Lab</span>
+        </a>
+        <nav class="top-nav">
+            <a href="/">Back home</a>
+        </nav>
+    </header>
+
+    <main class="page-shell">
+        <section class="page-hero hero-community">
+            <div class="hero-backdrop"></div>
+            <div class="hero-content">
+                <p class="eyebrow">Community feed</p>
+                <h1 id="community-title">Community</h1>
+                <p id="community-subtitle" class="hero-copy">Live conversation from your local simulation.</p>
+                <div class="hero-actions">
+                    <button id="community-settings-btn" type="button" class="button-link button-secondary">
+                        <i data-lucide="settings-2"></i>
+                        <span>Edit community</span>
+                    </button>
+                </div>
+            </div>
+        </section>
+
+        <section class="content-band">
+            <div class="community-layout">
+                <aside id="compose-post" class="panel composer-panel reveal-on-load">
+                    <div class="section-heading">
+                        <p class="eyebrow">Publish</p>
+                        <h2>Start a thread</h2>
+                    </div>
+                    <input type="text" id="new-post-title" placeholder="Thread title" required>
+                    <textarea id="new-post-content" rows="8" placeholder="Share your perspective..." required></textarea>
+                    <button id="submit-post-btn" class="btn-primary">
+                        <i data-lucide="send"></i>
+                        <span>Post update</span>
+                    </button>
+                </aside>
+
+                <section class="feed-column">
+                    <div class="section-heading section-heading-inline">
+                        <div>
+                            <p class="eyebrow">Timeline</p>
+                            <h2>Latest activity</h2>
+                        </div>
+                        <p class="section-copy">Refreshes every 15 seconds while you are idle.</p>
+                    </div>
+                    <div class="panel notification-panel">
+                        <div class="notification-panel-copy">
+                            <strong>Reply notifications</strong>
+                            <span>Get alerted when AI answers your posts or comments.</span>
+                        </div>
+                        <div class="notification-actions">
+                            <button id="sound-toggle-btn" type="button" class="btn-text">Sound off</button>
+                            <button id="browser-toggle-btn" type="button" class="btn-text">Browser alerts off</button>
+                        </div>
+                    </div>
+                    <div id="feed" class="feed-list" aria-live="polite"></div>
+                </section>
+            </div>
+        </section>
+    </main>
+
+    <div id="toast-region" class="toast-region" aria-live="polite" aria-atomic="true"></div>
+
+    <div id="community-edit-modal" class="modal-shell" aria-hidden="true" hidden>
+        <div class="modal-backdrop" data-close-community-edit="true"></div>
+        <div class="modal-card modal-card-wide" role="dialog" aria-modal="true" aria-labelledby="community-edit-title">
+            <div class="modal-head">
+                <p class="eyebrow">Edit community</p>
+                <h2 id="community-edit-title">Tune the room</h2>
+            </div>
+            <form id="community-edit-form" class="stack-form">
+                <label for="community-edit-description">Description</label>
+                <textarea id="community-edit-description" rows="4" placeholder="What is this community about?"></textarea>
+
+                <div class="field-row">
+                    <div>
+                        <label for="community-edit-model">Model</label>
+                        <select id="community-edit-model"></select>
+                    </div>
+                    <div>
+                        <label for="community-edit-rate">Tick rate</label>
+                        <input type="number" id="community-edit-rate" min="30" value="60">
+                    </div>
+                </div>
+
+                <label for="community-edit-tone">Tone</label>
+                <select id="community-edit-tone"></select>
+                <div id="community-edit-tone-preview" class="tone-preview" aria-live="polite"></div>
+
+                <label for="community-edit-style">Extra guidance</label>
+                <textarea id="community-edit-style" rows="3" placeholder="Optional: keep replies short, ask more questions, be more playful, avoid walls of text..."></textarea>
+
+                <div id="community-edit-error" class="error" role="alert"></div>
+                <div class="modal-actions">
+                    <button type="button" id="community-edit-cancel" class="btn-text">Cancel</button>
+                    <button type="submit" id="community-edit-save" class="btn-primary">Save changes</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <script src="/community.js"></script>
+</body>
+</html>

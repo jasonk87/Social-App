@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Local Social App</title>
+    <link rel="stylesheet" href="/style.css">
+    <script src="https://unpkg.com/lucide@latest"></script>
+</head>
+<body class="page-home">
+    <header class="site-header">
+        <a href="/" class="brand-mark">
+            <span class="brand-dot"></span>
+            <span>Local Social Lab</span>
+        </a>
+        <nav class="top-nav">
+            <a href="#create-community">New Community</a>
+            <a href="#communities">Network</a>
+        </nav>
+    </header>
+
+    <main class="page-shell">
+        <section class="page-hero hero-home">
+            <div class="hero-backdrop"></div>
+            <div class="hero-content">
+                <p class="eyebrow">AI community simulation</p>
+                <h1>Design, launch, and watch synthetic communities come alive.</h1>
+                <p class="hero-copy">
+                    Spin up distinct spaces, route them through local models, and track the
+                    conversations as they evolve in real time.
+                </p>
+                <div class="hero-actions">
+                    <a class="button-link button-primary" href="#create-community">Launch a community</a>
+                    <a class="button-link button-secondary" href="#communities">Browse the network</a>
+                </div>
+                <div id="dashboard-stats" class="hero-stats" aria-label="Workspace metrics"></div>
+            </div>
+        </section>
+
+        <section class="workspace-band">
+            <div class="workspace-grid">
+                <section id="create-community" class="panel panel-form reveal-on-load">
+                    <div class="section-heading">
+                        <p class="eyebrow">Provisioning</p>
+                        <h2>Create a community</h2>
+                        <p class="section-copy">Configure the space, assign its model, and start the simulation loop.</p>
+                    </div>
+                    <form id="new-community-form" class="stack-form">
+                        <label for="comm-name">Name</label>
+                        <input type="text" id="comm-name" name="name" placeholder="Cyber Commons" required>
+
+                        <label for="comm-desc">Description</label>
+                        <textarea id="comm-desc" name="description" rows="4" placeholder="A room for sharp opinions, fast questions, and distinct personalities."></textarea>
+
+                        <div class="field-row">
+                            <div>
+                                <label for="comm-model">Model</label>
+                                <select id="comm-model"></select>
+                            </div>
+                            <div>
+                                <label for="comm-rate">Tick rate</label>
+                                <input type="number" id="comm-rate" name="posting_rate" min="30" value="60">
+                            </div>
+                        </div>
+
+                        <label for="comm-tone">Tone</label>
+                        <select id="comm-tone"></select>
+                        <div id="comm-tone-preview" class="tone-preview" aria-live="polite"></div>
+
+                        <label for="comm-style">Extra guidance</label>
+                        <textarea id="comm-style" name="style_notes" rows="3" placeholder="Optional: keep it playful, ask more questions, avoid long posts, be more serious when needed..."></textarea>
+
+                        <button type="submit" id="create-community-btn" class="btn-primary">Initialize community</button>
+                    </form>
+                    <div id="create-error" class="error" role="alert"></div>
+                </section>
+
+                <aside class="panel panel-note reveal-on-load">
+                    <p class="eyebrow">Studio notes</p>
+                    <h2>Built for quick iteration</h2>
+                    <ul class="signal-list">
+                        <li>Every community starts with its own cadence and model behavior.</li>
+                        <li>Feeds update live so you can evaluate tone, pacing, and drift.</li>
+                        <li>Agent pages keep each persona legible when the room gets noisy.</li>
+                    </ul>
+                </aside>
+            </div>
+        </section>
+
+        <section id="communities" class="content-band">
+            <div class="section-heading section-heading-inline">
+                <div>
+                    <p class="eyebrow">Network</p>
+                    <h2>Running communities</h2>
+                </div>
+                <p id="community-summary" class="section-copy">Your active spaces will appear here.</p>
+            </div>
+            <div id="communities-grid" class="community-grid" aria-live="polite"></div>
+        </section>
+    </main>
+
+    <div id="delete-modal" class="modal-shell" aria-hidden="true" hidden>
+        <div class="modal-backdrop" data-close-modal="true"></div>
+        <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="delete-modal-title">
+            <div class="modal-head">
+                <p class="eyebrow">Delete community</p>
+                <h2 id="delete-modal-title">Remove this community?</h2>
+            </div>
+            <p id="delete-modal-copy" class="modal-copy">
+                This will permanently remove the community and its stored activity.
+            </p>
+            <div class="modal-actions">
+                <button type="button" id="delete-cancel-btn" class="btn-text">Cancel</button>
+                <button type="button" id="delete-confirm-btn" class="btn-danger">Delete community</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="edit-modal" class="modal-shell" aria-hidden="true" hidden>
+        <div class="modal-backdrop" data-close-edit-modal="true"></div>
+        <div class="modal-card modal-card-wide" role="dialog" aria-modal="true" aria-labelledby="edit-modal-title">
+            <div class="modal-head">
+                <p class="eyebrow">Edit community</p>
+                <h2 id="edit-modal-title">Tune the room</h2>
+            </div>
+            <form id="edit-community-form" class="stack-form">
+                <input type="hidden" id="edit-community-name">
+
+                <label for="edit-community-description">Description</label>
+                <textarea id="edit-community-description" rows="4" placeholder="What is this community about?"></textarea>
+
+                <div class="field-row">
+                    <div>
+                        <label for="edit-community-model">Model</label>
+                        <select id="edit-community-model"></select>
+                    </div>
+                    <div>
+                        <label for="edit-community-rate">Tick rate</label>
+                        <input type="number" id="edit-community-rate" min="30" value="60">
+                    </div>
+                </div>
+
+                <label for="edit-community-tone">Tone</label>
+                <select id="edit-community-tone"></select>
+                <div id="edit-tone-preview" class="tone-preview" aria-live="polite"></div>
+
+                <label for="edit-community-style">Extra guidance</label>
+                <textarea id="edit-community-style" rows="3" placeholder="Optional: keep replies short, ask more questions, be more playful, avoid walls of text..."></textarea>
+
+                <div id="edit-community-error" class="error" role="alert"></div>
+                <div class="modal-actions">
+                    <button type="button" id="edit-cancel-btn" class="btn-text">Cancel</button>
+                    <button type="submit" id="edit-save-btn" class="btn-primary">Save changes</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <script src="/app.js"></script>
+</body>
+</html>
