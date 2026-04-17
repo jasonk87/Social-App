@@ -309,7 +309,7 @@ def generate_text(model: str, prompt: str, system: Optional[str] = None, max_tok
 
     for attempt in range(3):
         try:
-            resp = requests.post(f"{OLLAMA_BASE_URL}/api/generate", json=payload, timeout=60)
+            resp = requests.post(f"{OLLAMA_BASE_URL}/api/generate", json=payload, timeout=600)
             if resp.status_code != 200:
                 raise OllamaError(f"generate failed: {resp.status_code} {resp.text}")
             data = resp.json()
@@ -484,48 +484,73 @@ JSON, just the reply text.
 # does not spin indefinitely.
 #
 
-class Simulation:
-    def __init__(self, community_id: int, name: str, description: str, model: str, posting_rate: int, tone: str = DEFAULT_COMMUNITY_TONE, style_notes: str = ""):
-        self.community_id = community_id
-        self.name = name
-        self.description = description or name
-        self.model = model
-        self.posting_rate = max(30, posting_rate)  # minimum 30 seconds between actions
-        self.tone = normalize_tone(tone)
-        self.style_notes = style_notes or ""
+
+import heapq
+import dataclasses
+from enum import IntEnum
+
+class EventPriority(IntEnum):
+    HIGH = 1
+    LOW = 2
+
+@dataclasses.dataclass(order=True)
+class SimEvent:
+    timestamp: float
+    priority: int
+    event_type: str = dataclasses.field(compare=False)
+    data: dict = dataclasses.field(compare=False)
+
+class SimulationEngine:
+    def __init__(self):
+        self._queue = []
+        self._lock = threading.Lock()
         self._stop_event = threading.Event()
-        self.thread = threading.Thread(target=self.run, daemon=True)
+        self._thread = None
 
-    def effective_posting_rate(self) -> int:
-        profile = tone_runtime_profile(self.tone)
-        return max(30, int(round(self.posting_rate * profile["cadence_multiplier"])))
-
-    def start(self) -> None:
-        if not self.thread.is_alive():
+    def start(self):
+        if self._thread is None or not self._thread.is_alive():
             self._stop_event.clear()
-            self.thread = threading.Thread(target=self.run, daemon=True)
-            self.thread.start()
+            self._thread = threading.Thread(target=self._run, daemon=True)
+            self._thread.start()
 
-    def stop(self) -> None:
+    def stop(self):
         self._stop_event.set()
-        if self.thread.is_alive():
-            self.thread.join(timeout=1)
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=2)
 
-    def run(self) -> None:
+    def schedule(self, delay: float, priority: EventPriority, event_type: str, data: dict):
+        with self._lock:
+            event = SimEvent(time.time() + delay, priority.value, event_type, data)
+            heapq.heappush(self._queue, event)
+
+    def _run(self):
         while not self._stop_event.is_set():
-            try:
-                self.step()
-            except Exception as e:
-                # Print error and continue simulation so it doesn't permanently crash
-                print(f"Simulation error in community '{self.name}': {e}")
-            # Sleep until next posting cycle or early exit
-            for _ in range(self.effective_posting_rate()):
-                if self._stop_event.is_set():
-                    return
+            event = None
+            with self._lock:
+                if self._queue and self._queue[0].timestamp <= time.time():
+                    event = heapq.heappop(self._queue)
+
+            if event:
+                try:
+                    if event.event_type == 'COMMUNITY_POST':
+                        self._do_community_post(event.data)
+                    elif event.event_type == 'AGENT_REPLY':
+                        self._do_agent_reply(event.data)
+                except Exception as e:
+                    print(f"Simulation engine error processing {event.event_type}: {e}")
+            else:
                 time.sleep(1)
 
-    def step(self) -> None:
-        """Perform a single simulation step: either create a new post or comment."""
+    def _do_community_post(self, data: dict):
+        community_id = data['community_id']
+        sim = SIMULATIONS.get(community_id)
+        if not sim:
+            return
+
+        # Schedule the next heartbeat
+        self.schedule(sim.effective_posting_rate(), EventPriority.LOW, 'COMMUNITY_POST', {'community_id': community_id})
+
+        # Step logic ...
         # Phase 1: Read needed state from DB
         conn = get_db_connection()
         try:
@@ -533,22 +558,20 @@ class Simulation:
             # Fetch all agents for this community
             cur.execute(
                 """
-
                 SELECT agents.id, agents.username, agents.persona, agents.model, agents.memory
                 FROM agents
-
                 JOIN community_agents ON agents.id = community_agents.agent_id
                 WHERE community_agents.community_id = ?
                 """,
-                (self.community_id,),
+                (community_id,),
             )
             agents = [dict(r) for r in cur.fetchall()]
 
             # With probability favouring new posts when there are fewer posts
-            cur.execute("SELECT COUNT(*) FROM posts WHERE community_id = ?", (self.community_id,))
+            cur.execute("SELECT COUNT(*) FROM posts WHERE community_id = ?", (community_id,))
             post_count = cur.fetchone()[0]
 
-            cur.execute("SELECT COUNT(*) FROM comments JOIN posts ON comments.post_id = posts.id WHERE posts.community_id = ?", (self.community_id,))
+            cur.execute("SELECT COUNT(*) FROM comments JOIN posts ON comments.post_id = posts.id WHERE posts.community_id = ?", (community_id,))
             comment_count = cur.fetchone()[0]
         finally:
             conn.close()
@@ -557,21 +580,21 @@ class Simulation:
         if not agents:
             # If no agents yet, create a couple
             for _ in range(3):
-                persona = create_persona(self.model)
-                agent_id = add_agent(persona['username'], self.model, persona['persona'])
-                assign_agent_to_community(agent_id, self.community_id)
-                agents.append({'id': agent_id, 'username': persona['username'], 'persona': persona['persona'], 'model': self.model, 'memory': None})
+                persona = create_persona(sim.model)
+                agent_id = add_agent(persona['username'], sim.model, persona['persona'])
+                assign_agent_to_community(agent_id, community_id)
+                agents.append({'id': agent_id, 'username': persona['username'], 'persona': persona['persona'], 'model': sim.model, 'memory': None})
                 
-        profile = tone_runtime_profile(self.tone)
+        profile = tone_runtime_profile(sim.tone)
         # Determine action
         make_new_post = post_count < 3 or random.random() < profile["new_post_bias"]
         # 10% chance to introduce a new agent if the population is under 20
         if len(agents) < 20 and random.random() < 0.10:
-            new_persona = create_persona(self.model)
-            new_agent_id = add_agent(new_persona['username'], self.model, new_persona['persona'])
-            assign_agent_to_community(new_agent_id, self.community_id)
-            agent_row = {'id': new_agent_id, 'username': new_persona['username'], 'persona': new_persona['persona'], 'model': self.model, 'memory': None}
-            print(f"[{self.name}] A new agent joined the community: {agent_row['username']}")
+            new_persona = create_persona(sim.model)
+            new_agent_id = add_agent(new_persona['username'], sim.model, new_persona['persona'])
+            assign_agent_to_community(new_agent_id, community_id)
+            agent_row = {'id': new_agent_id, 'username': new_persona['username'], 'persona': new_persona['persona'], 'model': sim.model, 'memory': None}
+            print(f"[{sim.name}] A new agent joined the community: {agent_row['username']}")
         else:
             agent_row = random.choice(agents)
 
@@ -600,9 +623,9 @@ class Simulation:
         # Phase 3: Generate content
         if make_new_post:
             # Generate post
-            post_data = generate_post(model, persona, self.name, self.description, self.tone, self.style_notes, memory_str)
-            post_id = add_post(self.community_id, agent_id, post_data['title'], post_data['content'])
-            print(f"[{self.name}] Generated new post: {post_data['title']}")
+            post_data = generate_post(model, persona, sim.name, sim.description, sim.tone, sim.style_notes, memory_str)
+            post_id = add_post(community_id, agent_id, post_data['title'], post_data['content'])
+            print(f"[{sim.name}] Generated new post: {post_data['title']}")
             append_memory(f"Created a post titled '{post_data['title']}': {post_data['content']}")
         else:
             # Comment on existing post or reply to comment
@@ -616,7 +639,7 @@ class Simulation:
                     cur = conn.cursor()
                     cur.execute(
                         """
-                        SELECT comments.id, comments.content, comments.post_id
+                        SELECT comments.id, comments.content, comments.post_id, comments.agent_id
                         FROM comments
                         JOIN posts ON comments.post_id = posts.id
                         JOIN agents ON comments.agent_id = agents.id
@@ -624,23 +647,42 @@ class Simulation:
                         ORDER BY CASE WHEN agents.username = 'You' THEN 0 ELSE 1 END, RANDOM()
                         LIMIT 1
                         """,
-                        (self.community_id,),
+                        (community_id,),
                     )
                     row = cur.fetchone()
                     if row:
                         parent_id = row['id']
                         parent_content = row['content']
                         post_id = row['post_id']
+                        parent_agent_id = row['agent_id']
                     else:
-                        parent_id, parent_content, post_id = None, None, None
+                        parent_id, parent_content, post_id, parent_agent_id = None, None, None, None
                 finally:
                     conn.close()
 
                 if parent_id is not None:
-                    comment_text = generate_comment_reply(model, persona, self.name, parent_content, self.tone, self.style_notes, memory_str)
-                    add_comment(post_id, agent_id, parent_id, comment_text)
-                    print(f"[{self.name}] Added comment reply by {agent_row['username']}")
+                    comment_text = generate_comment_reply(model, persona, sim.name, parent_content, sim.tone, sim.style_notes, memory_str)
+                    new_comment_id = add_comment(post_id, agent_id, parent_id, comment_text)
+                    print(f"[{sim.name}] Added comment reply by {agent_row['username']}")
                     append_memory(f"Replied to a comment '{parent_content}' with: {comment_text}")
+
+                    # If parent author is an AI, schedule an agent reply event!
+                    if parent_agent_id:
+                        conn = get_db_connection()
+                        try:
+                            cur = conn.cursor()
+                            cur.execute("SELECT model FROM agents WHERE id = ?", (parent_agent_id,))
+                            pa_row = cur.fetchone()
+                            if pa_row and pa_row['model'] != 'none':
+                                ENGINE.schedule(random.randint(60, 180), EventPriority.HIGH, 'AGENT_REPLY', {
+                                    'community_id': community_id,
+                                    'agent_id': parent_agent_id,
+                                    'reply_to_comment_id': new_comment_id,
+                                    'parent_comment_text': comment_text,
+                                    'post_id': post_id
+                                })
+                        finally:
+                            conn.close()
             else:
                 # Select a random existing post
                 conn = get_db_connection()
@@ -648,30 +690,138 @@ class Simulation:
                     cur = conn.cursor()
                     cur.execute(
                         """
-                        SELECT posts.id, posts.title, posts.content
+                        SELECT posts.id, posts.title, posts.content, posts.agent_id
                         FROM posts
                         JOIN agents ON posts.agent_id = agents.id
                         WHERE posts.community_id = ?
                         ORDER BY CASE WHEN agents.username = 'You' THEN 0 ELSE 1 END, RANDOM()
                         LIMIT 1
                         """,
-                        (self.community_id,),
+                        (community_id,),
                     )
                     row = cur.fetchone()
                     if row:
                         post_id = row['id']
                         title = row['title']
                         content = row['content']
+                        post_agent_id = row['agent_id']
                     else:
-                        post_id, title, content = None, None, None
+                        post_id, title, content, post_agent_id = None, None, None, None
                 finally:
                     conn.close()
 
                 if post_id is not None:
-                    comment_text = generate_comment(model, persona, self.name, title, content, self.tone, self.style_notes, memory_str)
-                    add_comment(post_id, agent_id, None, comment_text)
-                    print(f"[{self.name}] Added comment by {agent_row['username']}")
+                    comment_text = generate_comment(model, persona, sim.name, title, content, sim.tone, sim.style_notes, memory_str)
+                    new_comment_id = add_comment(post_id, agent_id, None, comment_text)
+                    print(f"[{sim.name}] Added comment by {agent_row['username']}")
                     append_memory(f"Commented on post '{title}' with: {comment_text}")
+
+                    if post_agent_id:
+                        conn = get_db_connection()
+                        try:
+                            cur = conn.cursor()
+                            cur.execute("SELECT model FROM agents WHERE id = ?", (post_agent_id,))
+                            pa_row = cur.fetchone()
+                            if pa_row and pa_row['model'] != 'none':
+                                ENGINE.schedule(random.randint(60, 180), EventPriority.HIGH, 'AGENT_REPLY', {
+                                    'community_id': community_id,
+                                    'agent_id': post_agent_id,
+                                    'reply_to_comment_id': new_comment_id,
+                                    'parent_comment_text': comment_text,
+                                    'post_id': post_id
+                                })
+                        finally:
+                            conn.close()
+
+    def _do_agent_reply(self, data: dict):
+        community_id = data['community_id']
+        sim = SIMULATIONS.get(community_id)
+        if not sim:
+            return
+
+        agent_id = data['agent_id']
+        parent_comment_text = data['parent_comment_text']
+        post_id = data['post_id']
+
+        # We need the parent_comment_id if we want to reply to it properly. But let's look up the ID of the comment that has parent_comment_text.
+        # It's better to just pass the newly created comment ID in `data` to reply to. Let's assume we pass `reply_to_comment_id`.
+        reply_to_comment_id = data.get('reply_to_comment_id')
+
+        conn = get_db_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT username, persona, model, memory FROM agents WHERE id = ?", (agent_id,))
+            agent_row = cur.fetchone()
+            if not agent_row:
+                return
+        finally:
+            conn.close()
+
+        persona = agent_row['persona']
+        model = agent_row['model']
+        memory_str = agent_row['memory'] or ""
+
+        # Helper to update memory
+        def append_memory(new_interaction: str):
+            try:
+                mem_list = json.loads(memory_str) if memory_str else []
+            except json.JSONDecodeError:
+                mem_list = []
+            mem_list.append(new_interaction)
+            mem_list = mem_list[-5:]
+            new_mem_str = json.dumps(mem_list)
+            conn_upd = get_db_connection()
+            try:
+                conn_upd.execute("UPDATE agents SET memory = ? WHERE id = ?", (new_mem_str, agent_id))
+                conn_upd.commit()
+            finally:
+                conn_upd.close()
+
+        comment_text = generate_comment_reply(model, persona, sim.name, parent_comment_text, sim.tone, sim.style_notes, memory_str)
+        new_comment_id = add_comment(post_id, agent_id, reply_to_comment_id, comment_text)
+        print(f"[{sim.name}] Added priority comment reply by {agent_row['username']}")
+        append_memory(f"Replied to a comment '{parent_comment_text}' with: {comment_text}")
+
+        # Determine if the comment we replied to was by an AI, if so, schedule another reply
+        if reply_to_comment_id:
+            conn = get_db_connection()
+            try:
+                cur = conn.cursor()
+                cur.execute("SELECT agent_id FROM comments WHERE id = ?", (reply_to_comment_id,))
+                c_row = cur.fetchone()
+                if c_row:
+                    parent_agent_id = c_row['agent_id']
+                    cur.execute("SELECT model FROM agents WHERE id = ?", (parent_agent_id,))
+                    pa_row = cur.fetchone()
+                    if pa_row and pa_row['model'] != 'none':
+                        # Avoid infinite immediate loops, maybe a chance to stop or just schedule
+                        import random
+                        if random.random() < 0.7:  # 70% chance to continue the chain
+                            ENGINE.schedule(random.randint(60, 180), EventPriority.HIGH, 'AGENT_REPLY', {
+                                'community_id': community_id,
+                                'agent_id': parent_agent_id,
+                                'reply_to_comment_id': new_comment_id,
+                                'parent_comment_text': comment_text,
+                                'post_id': post_id
+                            })
+            finally:
+                conn.close()
+
+ENGINE = SimulationEngine()
+
+class Simulation:
+    def __init__(self, community_id: int, name: str, description: str, model: str, posting_rate: int, tone: str = DEFAULT_COMMUNITY_TONE, style_notes: str = ""):
+        self.community_id = community_id
+        self.name = name
+        self.description = description or name
+        self.model = model
+        self.posting_rate = max(30, posting_rate)  # minimum 30 seconds between actions
+        self.tone = normalize_tone(tone)
+        self.style_notes = style_notes or ""
+
+    def effective_posting_rate(self) -> int:
+        profile = tone_runtime_profile(self.tone)
+        return max(30, int(round(self.posting_rate * profile["cadence_multiplier"])))
 
 
 # Registry of active simulations keyed by community ID
@@ -1009,10 +1159,10 @@ class RequestHandler(BaseHTTPRequestHandler):
                 community_id = add_community(name, description, model, posting_rate, tone, style_notes)
                 # Note: Initial agents are intentionally NOT generated here to avoid blocking properties.
                 # The simulation engine's step() method will automatically generate them when started.
-                # Immediately spin up the new background simulation thread
+                # Immediately configure simulation and schedule its first heartbeat
                 sim = Simulation(community_id, name, description, model, posting_rate, tone, style_notes)
                 SIMULATIONS[community_id] = sim
-                sim.start()
+                ENGINE.schedule(5, EventPriority.LOW, 'COMMUNITY_POST', {'community_id': community_id})
                 
                 self.respond_json({'success': True, 'community_id': community_id})
             elif path.startswith('community/') and path.endswith('/update'):
@@ -1058,8 +1208,8 @@ class RequestHandler(BaseHTTPRequestHandler):
                     comm_id = row['id']
                     sim = SIMULATIONS.get(comm_id)
                     if sim:
-                        sim.stop()
                         del SIMULATIONS[comm_id]
+                        # We don't remove from the queue; the event handler will just ignore it if community is deleted.
                     conn = get_db_connection()
                     try:
                         conn.execute("DELETE FROM communities WHERE id = ?", (comm_id,))
@@ -1114,6 +1264,39 @@ class RequestHandler(BaseHTTPRequestHandler):
                         cur.execute("SELECT id FROM agents WHERE username = 'You' AND model = 'none'")
                         human_row = cur.fetchone()
                         comment_id = add_comment(post_id, human_row['id'], parent_id, content)
+
+                        # Trigger an AI reply if human is replying to an AI agent
+                        parent_agent_id = None
+                        community_id = None
+                        if parent_id:
+                            cur.execute("SELECT agent_id FROM comments WHERE id = ?", (parent_id,))
+                            p_row = cur.fetchone()
+                            if p_row:
+                                parent_agent_id = p_row['agent_id']
+                        else:
+                            cur.execute("SELECT agent_id FROM posts WHERE id = ?", (post_id,))
+                            p_row = cur.fetchone()
+                            if p_row:
+                                parent_agent_id = p_row['agent_id']
+
+                        if parent_agent_id:
+                            cur.execute("SELECT model FROM agents WHERE id = ?", (parent_agent_id,))
+                            a_row = cur.fetchone()
+                            if a_row and a_row['model'] != 'none':
+                                cur.execute("SELECT community_id FROM posts WHERE id = ?", (post_id,))
+                                c_row = cur.fetchone()
+                                if c_row:
+                                    community_id = c_row['community_id']
+
+                        if community_id and parent_agent_id:
+                            import random
+                            ENGINE.schedule(random.randint(60, 180), EventPriority.HIGH, 'AGENT_REPLY', {
+                                'community_id': community_id,
+                                'agent_id': parent_agent_id,
+                                'parent_comment_text': content,
+                                'post_id': post_id,
+                                'reply_to_comment_id': comment_id
+                            })
                     finally:
                         conn.close()
                     self.respond_json({'success': True, 'comment_id': comment_id})
@@ -1193,10 +1376,12 @@ def run_server(host: str = 'localhost', port: int = 8080) -> None:
     print(f"Serving on http://{host}:{port}")
     try:
         # Auto-boot all communities on startup
+        ENGINE.start()
         conn = get_db_connection()
         try:
             cur = conn.cursor()
             cur.execute("SELECT * FROM communities")
+            start_delay = 5
             for row in cur.fetchall():
                 comm_id = row['id']
                 sim = Simulation(
@@ -1209,7 +1394,8 @@ def run_server(host: str = 'localhost', port: int = 8080) -> None:
                     row['style_notes'],
                 )
                 SIMULATIONS[comm_id] = sim
-                sim.start()
+                ENGINE.schedule(start_delay, EventPriority.LOW, 'COMMUNITY_POST', {'community_id': comm_id})
+                start_delay += 2  # stagger start times
         finally:
             conn.close()
         
@@ -1217,9 +1403,8 @@ def run_server(host: str = 'localhost', port: int = 8080) -> None:
     except KeyboardInterrupt:
         pass
     finally:
-        # Stop all running simulations on shutdown
-        for sim in list(SIMULATIONS.values()):
-            sim.stop()
+        # Stop engine on shutdown
+        ENGINE.stop()
         httpd.server_close()
 
 
