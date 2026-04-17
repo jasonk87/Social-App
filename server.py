@@ -192,11 +192,58 @@ def init_db() -> None:
         conn.close()
 
 
-def get_db_connection() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    return conn
+import queue
+
+class ConnectionPool:
+    def __init__(self, db_path: str, max_connections: int = 20):
+        self.db_path = db_path
+        self.max_connections = max_connections
+        self.pool: queue.Queue = queue.Queue(maxsize=max_connections)
+
+    def get_connection(self) -> sqlite3.Connection:
+        try:
+            return self.pool.get_nowait()
+        except queue.Empty:
+            conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            conn.row_factory = sqlite3.Row
+            # Enable WAL mode for better concurrency
+            conn.execute("PRAGMA journal_mode = WAL")
+            conn.execute("PRAGMA synchronous = NORMAL")
+            conn.execute("PRAGMA foreign_keys = ON")
+            return conn
+
+    def release_connection(self, conn: sqlite3.Connection) -> None:
+        try:
+            self.pool.put_nowait(conn)
+        except queue.Full:
+            conn.close()
+
+DB_POOL = None
+
+def get_db_connection():
+    global DB_POOL
+    if DB_POOL is None:
+        DB_POOL = ConnectionPool(DB_PATH)
+
+    conn = DB_POOL.get_connection()
+
+    class PooledConnection:
+        def __init__(self, _conn):
+            self._conn = _conn
+
+        def __getattr__(self, item):
+            return getattr(self._conn, item)
+
+        def close(self):
+            DB_POOL.release_connection(self._conn)
+
+        def __enter__(self):
+            return self._conn.__enter__()
+
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            return self._conn.__exit__(exc_type, exc_val, exc_tb)
+
+    return PooledConnection(conn)
 
 
 # -----------------------------------------------------------------------------
@@ -460,6 +507,7 @@ class Simulation:
 
     def step(self) -> None:
         """Perform a single simulation step: either create a new post or comment."""
+        # Phase 1: Read needed state from DB
         conn = get_db_connection()
         try:
             cur = conn.cursor()
@@ -473,57 +521,59 @@ class Simulation:
                 """,
                 (self.community_id,),
             )
-            agents = cur.fetchall()
-            if not agents:
-                # If no agents yet, create a couple
-                for _ in range(3):
-                    persona = create_persona(self.model)
-                    agent_id = add_agent(persona['username'], self.model, persona['persona'])
-                    assign_agent_to_community(agent_id, self.community_id)
-                cur.execute(
-                    """
-                    SELECT agents.id, agents.username, agents.persona, agents.model
-                    FROM agents
-                    JOIN community_agents ON agents.id = community_agents.agent_id
-                    WHERE community_agents.community_id = ?
-                    """,
-                    (self.community_id,),
-                )
-                agents = cur.fetchall()
+            agents = [dict(r) for r in cur.fetchall()]
+
             # With probability favouring new posts when there are fewer posts
             cur.execute("SELECT COUNT(*) FROM posts WHERE community_id = ?", (self.community_id,))
             post_count = cur.fetchone()[0]
-            profile = tone_runtime_profile(self.tone)
-            # Determine action
-            make_new_post = post_count < 3 or random.random() < profile["new_post_bias"]
-            # 10% chance to introduce a new agent if the population is under 20
-            if len(agents) < 20 and random.random() < 0.10:
-                new_persona = create_persona(self.model)
-                new_agent_id = add_agent(new_persona['username'], self.model, new_persona['persona'])
-                assign_agent_to_community(new_agent_id, self.community_id)
-                cur.execute("SELECT id, username, persona, model FROM agents WHERE id = ?", (new_agent_id,))
-                agent_row = cur.fetchone()
-                print(f"[{self.name}] A new agent joined the community: {agent_row['username']}")
-            else:
-                agent_row = random.choice(agents)
-                
-            agent_id = agent_row['id']
-            persona = agent_row['persona']
-            model = agent_row['model']
-            if make_new_post:
-                # Generate post
-                post_data = generate_post(model, persona, self.name, self.description, self.tone, self.style_notes)
-                post_id = add_post(self.community_id, agent_id, post_data['title'], post_data['content'])
-                print(f"[{self.name}] Generated new post: {post_data['title']}")
-            else:
-                # Comment on existing post or reply to comment
-                reply_to_comment = False
-                cur.execute("SELECT COUNT(*) FROM comments JOIN posts ON comments.post_id = posts.id WHERE posts.community_id = ?", (self.community_id,))
-                comment_count = cur.fetchone()[0]
-                if comment_count > 0 and random.random() < profile["reply_bias"]:
-                    reply_to_comment = True
 
-                if reply_to_comment:
+            cur.execute("SELECT COUNT(*) FROM comments JOIN posts ON comments.post_id = posts.id WHERE posts.community_id = ?", (self.community_id,))
+            comment_count = cur.fetchone()[0]
+        finally:
+            conn.close()
+
+        # Phase 2: Potentially create new agents without holding the DB lock
+        if not agents:
+            # If no agents yet, create a couple
+            for _ in range(3):
+                persona = create_persona(self.model)
+                agent_id = add_agent(persona['username'], self.model, persona['persona'])
+                assign_agent_to_community(agent_id, self.community_id)
+                agents.append({'id': agent_id, 'username': persona['username'], 'persona': persona['persona'], 'model': self.model})
+                
+        profile = tone_runtime_profile(self.tone)
+        # Determine action
+        make_new_post = post_count < 3 or random.random() < profile["new_post_bias"]
+        # 10% chance to introduce a new agent if the population is under 20
+        if len(agents) < 20 and random.random() < 0.10:
+            new_persona = create_persona(self.model)
+            new_agent_id = add_agent(new_persona['username'], self.model, new_persona['persona'])
+            assign_agent_to_community(new_agent_id, self.community_id)
+            agent_row = {'id': new_agent_id, 'username': new_persona['username'], 'persona': new_persona['persona'], 'model': self.model}
+            print(f"[{self.name}] A new agent joined the community: {agent_row['username']}")
+        else:
+            agent_row = random.choice(agents)
+
+        agent_id = agent_row['id']
+        persona = agent_row['persona']
+        model = agent_row['model']
+
+        # Phase 3: Generate content
+        if make_new_post:
+            # Generate post
+            post_data = generate_post(model, persona, self.name, self.description, self.tone, self.style_notes)
+            post_id = add_post(self.community_id, agent_id, post_data['title'], post_data['content'])
+            print(f"[{self.name}] Generated new post: {post_data['title']}")
+        else:
+            # Comment on existing post or reply to comment
+            reply_to_comment = False
+            if comment_count > 0 and random.random() < profile["reply_bias"]:
+                reply_to_comment = True
+
+            if reply_to_comment:
+                conn = get_db_connection()
+                try:
+                    cur = conn.cursor()
                     cur.execute(
                         """
                         SELECT comments.id, comments.content, comments.post_id
@@ -541,11 +591,20 @@ class Simulation:
                         parent_id = row['id']
                         parent_content = row['content']
                         post_id = row['post_id']
-                        comment_text = generate_comment_reply(model, persona, self.name, parent_content, self.tone, self.style_notes)
-                        add_comment(post_id, agent_id, parent_id, comment_text)
-                        print(f"[{self.name}] Added comment reply by {agent_row['username']}")
-                else:
-                    # Select a random existing post
+                    else:
+                        parent_id, parent_content, post_id = None, None, None
+                finally:
+                    conn.close()
+
+                if parent_id is not None:
+                    comment_text = generate_comment_reply(model, persona, self.name, parent_content, self.tone, self.style_notes)
+                    add_comment(post_id, agent_id, parent_id, comment_text)
+                    print(f"[{self.name}] Added comment reply by {agent_row['username']}")
+            else:
+                # Select a random existing post
+                conn = get_db_connection()
+                try:
+                    cur = conn.cursor()
                     cur.execute(
                         """
                         SELECT posts.id, posts.title, posts.content
@@ -562,11 +621,15 @@ class Simulation:
                         post_id = row['id']
                         title = row['title']
                         content = row['content']
-                        comment_text = generate_comment(model, persona, self.name, title, content, self.tone, self.style_notes)
-                        add_comment(post_id, agent_id, None, comment_text)
-                        print(f"[{self.name}] Added comment by {agent_row['username']}")
-        finally:
-            conn.close()
+                    else:
+                        post_id, title, content = None, None, None
+                finally:
+                    conn.close()
+
+                if post_id is not None:
+                    comment_text = generate_comment(model, persona, self.name, title, content, self.tone, self.style_notes)
+                    add_comment(post_id, agent_id, None, comment_text)
+                    print(f"[{self.name}] Added comment by {agent_row['username']}")
 
 
 # Registry of active simulations keyed by community ID
