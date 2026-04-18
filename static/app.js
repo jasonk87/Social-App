@@ -34,6 +34,7 @@ const appState = {
     feed: [],
     sort: 'best',
     communitySearchInput: '',
+    isAccountMenuOpen: false,
 };
 
 const deleteModalState = { name: null };
@@ -56,6 +57,7 @@ function initScrollObserver() {
 }
 const editModalState = { name: null };
 const SESSION_CACHE_KEY = 'local-social-session';
+const FEED_SORT_STORAGE_KEY = 'local-social-feed-sort';
 
 function readCachedSession() {
     try {
@@ -81,6 +83,28 @@ function writeCachedSession(user) {
     }
 }
 
+function getFeedSortStorageKey() {
+    const actor = appState.currentUser?.agent_username || appState.currentUser?.display_name || 'guest';
+    return `${FEED_SORT_STORAGE_KEY}:${actor}`;
+}
+
+function readSavedFeedSort() {
+    try {
+        const value = localStorage.getItem(getFeedSortStorageKey());
+        return value === 'latest' || value === 'best' ? value : 'best';
+    } catch (err) {
+        return 'best';
+    }
+}
+
+function writeSavedFeedSort(sort) {
+    try {
+        localStorage.setItem(getFeedSortStorageKey(), sort);
+    } catch (err) {
+        // Ignore storage failures; feed still works with in-memory state.
+    }
+}
+
 function renderBootState() {
     const page = document.body;
     const bootTitle = document.getElementById('boot-title');
@@ -91,6 +115,38 @@ function renderBootState() {
     if (cached?.display_name) {
         bootTitle.textContent = `Loading ${cached.display_name}'s feed`;
         bootCopy.textContent = 'Restoring your last signed-in session.';
+    }
+}
+
+function syncFeedSortControl() {
+    const sortSelect = document.getElementById('feed-sort-select');
+    if (sortSelect) {
+        sortSelect.value = appState.sort;
+    }
+}
+
+function closeAccountMenu() {
+    appState.isAccountMenuOpen = false;
+    const menu = document.getElementById('account-menu');
+    const trigger = document.getElementById('account-menu-trigger');
+    if (menu) {
+        menu.hidden = true;
+    }
+    if (trigger) {
+        trigger.setAttribute('aria-expanded', 'false');
+    }
+}
+
+function toggleAccountMenu(force) {
+    const nextState = typeof force === 'boolean' ? force : !appState.isAccountMenuOpen;
+    appState.isAccountMenuOpen = nextState;
+    const menu = document.getElementById('account-menu');
+    const trigger = document.getElementById('account-menu-trigger');
+    if (menu) {
+        menu.hidden = !nextState;
+    }
+    if (trigger) {
+        trigger.setAttribute('aria-expanded', String(nextState));
     }
 }
 
@@ -375,9 +431,19 @@ function renderSessionState() {
         authShell.hidden = true;
         accountChip.hidden = false;
         accountChip.innerHTML = `
-            <span class="account-chip-label">Signed in as</span>
-            <strong>${escapeHTML(appState.currentUser.display_name)}</strong>
+            <button type="button" id="account-menu-trigger" class="account-menu-trigger" aria-haspopup="menu" aria-expanded="false">
+                <span class="account-chip-label">Signed in as</span>
+                <strong>${escapeHTML(appState.currentUser.display_name)}</strong>
+            </button>
+            <div id="account-menu" class="account-menu" role="menu" hidden>
+                <button type="button" id="logout-btn" class="btn-text" role="menuitem">Sign out</button>
+            </div>
         `;
+        closeAccountMenu();
+        document.getElementById('account-menu-trigger').addEventListener('click', () => toggleAccountMenu());
+        document.getElementById('logout-btn').addEventListener('click', handleLogout);
+        appState.sort = readSavedFeedSort();
+        syncFeedSortControl();
         navigateTo(appState.activeView || 'feed');
         refreshApp();
     } else {
@@ -387,6 +453,7 @@ function renderSessionState() {
         feedShell.hidden = true;
         if (createShell) createShell.hidden = true;
         accountChip.hidden = true;
+        closeAccountMenu();
     }
 }
 
@@ -682,6 +749,7 @@ async function handleLogout() {
         appState.currentUser = null;
         appState.communities = [];
         appState.feed = [];
+        appState.sort = 'best';
         writeCachedSession(null);
         window.location.reload();
     } catch (err) {
@@ -820,6 +888,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (current_user) {
             appState.currentUser = current_user;
             writeCachedSession(current_user);
+            await loadModels();
             renderAuthOptions([current_user]);
             renderSessionState();
         } else {
@@ -833,7 +902,6 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     document.getElementById('login-form').addEventListener('submit', handleLogin);
     document.getElementById('register-form').addEventListener('submit', handleRegister);
-    document.getElementById('logout-btn').addEventListener('click', handleLogout);
     document.getElementById('new-community-form').addEventListener('submit', handleCreate);
     document.getElementById('edit-community-form').addEventListener('submit', handleEditSave);
     document.getElementById('comm-tone').addEventListener('change', () => updateTonePreview('comm-tone', 'comm-tone-preview'));
@@ -849,20 +917,30 @@ document.addEventListener('DOMContentLoaded', async () => {
         });
     });
 
-    document.querySelector('.sort-toggle').addEventListener('click', async (event) => {
-        const button = event.target.closest('button[data-sort]');
-        if (!button) {
-            return;
-        }
-        const nextSort = button.getAttribute('data-sort');
+    document.getElementById('feed-sort-select').addEventListener('change', async (event) => {
+        const nextSort = event.target.value;
         if (nextSort === appState.sort) {
             return;
         }
         appState.sort = nextSort;
-        document.querySelectorAll('.sort-toggle button').forEach((node) => {
-            node.classList.toggle('is-active', node === button);
-        });
+        writeSavedFeedSort(nextSort);
         await loadFeed();
+    });
+
+    document.addEventListener('click', (event) => {
+        const accountChip = document.getElementById('account-chip');
+        if (!accountChip || accountChip.hidden) {
+            return;
+        }
+        if (!accountChip.contains(event.target)) {
+            closeAccountMenu();
+        }
+    });
+
+    document.addEventListener('keydown', (event) => {
+        if (event.key === 'Escape') {
+            closeAccountMenu();
+        }
     });
 
     const sidebarToggle = document.getElementById('sidebar-toggle');

@@ -87,11 +87,13 @@
                     <p id="feed-subtitle" class="section-copy"></p>
                 </div>
                 <div class="feed-controls">
-                    <div class="sort-toggle" role="tablist" aria-label="Feed sort">
-                        <button type="button" class="btn-text is-active" data-sort="best">Best</button>
-                        <button type="button" class="btn-text" data-sort="latest">Latest</button>
+                    <div class="sort-select-wrap">
+                        <label class="sr-only" for="feed-sort-select">Feed sort</label>
+                        <select id="feed-sort-select" class="feed-sort-select" aria-label="Feed sort">
+                            <option value="best">Best</option>
+                            <option value="latest">Latest</option>
+                        </select>
                     </div>
-                    <button type="button" id="logout-btn" class="btn-text">Sign out</button>
                 </div>
             </div>
 

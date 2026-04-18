@@ -28,6 +28,7 @@ import sqlite3
 import threading
 import time
 import hashlib
+import sys
 from http import HTTPStatus
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -2253,6 +2254,9 @@ class RequestHandler(BaseHTTPRequestHandler):
                 pass
 
     def serve_static(self, path: str) -> None:
+        if path.startswith('/socket.io/'):
+            self.send_error(HTTPStatus.NOT_FOUND, "Socket.IO is not supported")
+            return
         # Map '/' to index.html
         if path == '/' or path == '':
             filename = 'index.html'
@@ -2307,9 +2311,17 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self.send_error(HTTPStatus.NOT_FOUND, "File not found")
 
 
+class SocialHTTPServer(ThreadingHTTPServer):
+    def handle_error(self, request, client_address) -> None:
+        exc_type, exc, _ = sys.exc_info()
+        if isinstance(exc, (BrokenPipeError, ConnectionAbortedError, ConnectionResetError)):
+            return
+        super().handle_error(request, client_address)
+
+
 def run_server(host: str = 'localhost', port: int = 8080) -> None:
     init_db()
-    httpd = ThreadingHTTPServer((host, port), RequestHandler)
+    httpd = SocialHTTPServer((host, port), RequestHandler)
     print(f"Serving on http://{host}:{port}")
     try:
         # Reset any stuck processing events back to pending
