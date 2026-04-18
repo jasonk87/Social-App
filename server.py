@@ -280,6 +280,19 @@ def init_db() -> None:
             """
         )
         
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS simulation_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp REAL NOT NULL,
+                priority INTEGER NOT NULL,
+                event_type TEXT NOT NULL,
+                event_data TEXT NOT NULL
+            )
+            """
+        )
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_sim_events_time ON simulation_events (timestamp, priority)")
+
         # Ensure Human agent exists for the 'You' interactions
         cur.execute("SELECT id FROM agents WHERE username = 'You' AND model = 'none'")
         if not cur.fetchone():
@@ -543,8 +556,6 @@ class SimEvent:
 
 class SimulationEngine:
     def __init__(self):
-        self._queue = []
-        self._lock = threading.Lock()
         self._stop_event = threading.Event()
         self._thread = None
 
@@ -560,16 +571,42 @@ class SimulationEngine:
             self._thread.join(timeout=2)
 
     def schedule(self, delay: float, priority: EventPriority, event_type: str, data: dict):
-        with self._lock:
-            event = SimEvent(time.time() + delay, priority.value, event_type, data)
-            heapq.heappush(self._queue, event)
+        timestamp = time.time() + delay
+        conn = get_db_connection()
+        try:
+            conn.execute(
+                "INSERT INTO simulation_events (timestamp, priority, event_type, event_data) VALUES (?, ?, ?, ?)",
+                (timestamp, priority.value, event_type, json.dumps(data))
+            )
+            conn.commit()
+        finally:
+            conn.close()
 
     def _run(self):
         while not self._stop_event.is_set():
             event = None
-            with self._lock:
-                if self._queue and self._queue[0].timestamp <= time.time():
-                    event = heapq.heappop(self._queue)
+            conn = get_db_connection()
+            try:
+                # Find the oldest event that is due, ordering by timestamp and then priority (lowest value = highest priority)
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT id, event_type, event_data FROM simulation_events WHERE timestamp <= ? ORDER BY timestamp ASC, priority ASC LIMIT 1",
+                    (time.time(),)
+                )
+                row = cur.fetchone()
+                if row:
+                    # Attempt to delete the event to "claim" it. In a multi-process environment we might need a more robust transaction,
+                    # but here the single daemon thread logic applies.
+                    cur.execute("DELETE FROM simulation_events WHERE id = ?", (row['id'],))
+                    if cur.rowcount > 0:
+                        conn.commit()
+                        event = SimEvent(0, 0, row['event_type'], json.loads(row['event_data']))
+                    else:
+                        conn.rollback()
+            except Exception as e:
+                print(f"Simulation engine queue error: {e}")
+            finally:
+                conn.close()
 
             if event:
                 try:
@@ -1872,6 +1909,14 @@ def run_server(host: str = 'localhost', port: int = 8080) -> None:
     httpd = ThreadingHTTPServer((host, port), RequestHandler)
     print(f"Serving on http://{host}:{port}")
     try:
+        # Clear any pending COMMUNITY_POST events to avoid overlapping timers across restarts
+        conn = get_db_connection()
+        try:
+            conn.execute("DELETE FROM simulation_events WHERE event_type = 'COMMUNITY_POST'")
+            conn.commit()
+        finally:
+            conn.close()
+
         # Start the central simulation engine
         ENGINE.start()
         
