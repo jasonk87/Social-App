@@ -454,17 +454,19 @@ function renderSidebarCommunities() {
             : 'Subscribe to a few communities to start building your feed.';
     }
 
-    if (!appState.communities.length) {
+    const subscribedCommunities = appState.communities.filter((community) => community.subscribed);
+
+    if (!subscribedCommunities.length) {
         grid.innerHTML = `
             <div class="empty-state">
                 <strong>No communities yet</strong>
-                Create the first room and it will immediately show up here.
+                Join a room and it will immediately show up here.
             </div>
         `;
         return;
     }
 
-    grid.innerHTML = appState.communities.map((community) => `
+    grid.innerHTML = subscribedCommunities.map((community) => `
         <article class="community-card community-list-item" data-url="/community.html?name=${encodeURIComponent(community.name)}">
             <div class="community-list-main">
                 <div class="community-list-header">

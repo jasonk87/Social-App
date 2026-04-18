@@ -649,6 +649,7 @@ async function loadFeed(name, options = {}) {
         silentNotifications = false,
         preserveScroll = false,
         focusTarget = false,
+        renderDOM = true,
     } = options;
     const previousScrollY = preserveScroll ? window.scrollY : null;
 
@@ -659,7 +660,10 @@ async function loadFeed(name, options = {}) {
             communityPageState.community = data.community;
         }
         communityPageState.currentUser = data.current_user || communityPageState.currentUser;
-        renderFeed(posts);
+
+        if (renderDOM) {
+            renderFeed(posts);
+        }
 
         const notifications = collectUserReplyNotifications(posts, name);
         if (!silentNotifications) {
@@ -673,14 +677,17 @@ async function loadFeed(name, options = {}) {
                 }
             });
         }
-        if (preserveScroll && previousScrollY !== null) {
+
+        if (renderDOM && preserveScroll && previousScrollY !== null) {
             window.scrollTo({ top: previousScrollY, left: 0, behavior: 'auto' });
         }
-        if (focusTarget) {
+        if (renderDOM && focusTarget) {
             focusTargetFromHash();
         }
     } catch (err) {
-        feed.innerHTML = createEmptyState('Feed unavailable', err.message);
+        if (renderDOM) {
+            feed.innerHTML = createEmptyState('Feed unavailable', err.message);
+        }
     }
 }
 
@@ -773,20 +780,15 @@ document.addEventListener('DOMContentLoaded', () => {
     });
 
     setInterval(() => {
-        if (document.querySelector('.reply-form')) {
-            return;
-        }
-
         const titleVal = document.getElementById('new-post-title').value.trim();
         const contentVal = document.getElementById('new-post-content').value.trim();
         const activeElement = document.activeElement;
         const isTyping = activeElement && (activeElement.id === 'new-post-title' || activeElement.id === 'new-post-content');
 
-        if (titleVal || contentVal || isTyping) {
-            return;
-        }
-
-        loadFeed(name, { preserveScroll: true });
+        // We fetch the data but only re-render if the user isn't actively writing.
+        // This keeps notifications flowing but prevents wiping their typed text.
+        const shouldRender = !document.querySelector('.reply-form') && !titleVal && !contentVal && !isTyping;
+        loadFeed(name, { preserveScroll: true, renderDOM: shouldRender });
     }, 15000);
 
     async function submitPost() {

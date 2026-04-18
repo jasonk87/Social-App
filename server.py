@@ -1509,11 +1509,30 @@ class RequestHandler(BaseHTTPRequestHandler):
                         agent_data = dict(agent_row)
                         
                         # Fetch recent posts by this agent
-                        cur.execute("SELECT id, title, content, created_at, community_id FROM posts WHERE agent_id = ? ORDER BY created_at DESC LIMIT 20", (agent_id,))
+                        cur.execute(
+                            """
+                            SELECT posts.id, posts.title, posts.content, posts.created_at, posts.community_id, communities.name AS community_name
+                            FROM posts
+                            JOIN communities ON posts.community_id = communities.id
+                            WHERE posts.agent_id = ?
+                            ORDER BY posts.created_at DESC LIMIT 20
+                            """,
+                            (agent_id,)
+                        )
                         posts = [dict(r) for r in cur.fetchall()]
                         
                         # Fetch recent comments
-                        cur.execute("SELECT id, content, created_at, post_id, parent_id FROM comments WHERE agent_id = ? ORDER BY created_at DESC LIMIT 20", (agent_id,))
+                        cur.execute(
+                            """
+                            SELECT comments.id, comments.content, comments.created_at, comments.post_id, comments.parent_id, posts.community_id, communities.name AS community_name
+                            FROM comments
+                            JOIN posts ON comments.post_id = posts.id
+                            JOIN communities ON posts.community_id = communities.id
+                            WHERE comments.agent_id = ?
+                            ORDER BY comments.created_at DESC LIMIT 20
+                            """,
+                            (agent_id,)
+                        )
                         comments = [dict(r) for r in cur.fetchall()]
                         
                         self.respond_json({'agent': agent_data, 'posts': posts, 'comments': comments})
@@ -1764,13 +1783,16 @@ class RequestHandler(BaseHTTPRequestHandler):
                         if parent_agent_id:
                             cur.execute("SELECT id FROM agents WHERE id = ? AND model != 'none'", (parent_agent_id,))
                             if cur.fetchone():
-                                ENGINE.schedule(random.randint(45, 120), EventPriority.HIGH, 'AGENT_REPLY', {
-                                    'community_id': row['id'],
-                                    'agent_id': parent_agent_id,
-                                    'parent_comment_text': content,
-                                    'post_id': post_id,
-                                    'reply_to_comment_id': comment_id
-                                })
+                                cur.execute("SELECT community_id FROM posts WHERE id = ?", (post_id,))
+                                post_row = cur.fetchone()
+                                if post_row:
+                                    ENGINE.schedule(random.randint(45, 120), EventPriority.HIGH, 'AGENT_REPLY', {
+                                        'community_id': post_row['community_id'],
+                                        'agent_id': parent_agent_id,
+                                        'parent_comment_text': content,
+                                        'post_id': post_id,
+                                        'reply_to_comment_id': comment_id
+                                    })
                     finally:
                         conn.close()
 
