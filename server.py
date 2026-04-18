@@ -39,6 +39,8 @@ import queue
 import heapq
 import dataclasses
 from enum import IntEnum
+import re
+from collections import Counter
 
 # -----------------------------------------------------------------------------
 # Database and data models
@@ -185,6 +187,23 @@ def init_db() -> None:
             cur.execute("ALTER TABLE communities ADD COLUMN tone TEXT DEFAULT 'casual'")
         if "style_notes" not in community_columns:
             cur.execute("ALTER TABLE communities ADD COLUMN style_notes TEXT DEFAULT ''")
+
+        # Phase 1: Community State Model columns
+        if "mood" not in community_columns:
+            cur.execute("ALTER TABLE communities ADD COLUMN mood REAL DEFAULT 0.0")
+        if "conflict_level" not in community_columns:
+            cur.execute("ALTER TABLE communities ADD COLUMN conflict_level REAL DEFAULT 0.0")
+        if "energy" not in community_columns:
+            cur.execute("ALTER TABLE communities ADD COLUMN energy REAL DEFAULT 1.0")
+        if "trendiness" not in community_columns:
+            cur.execute("ALTER TABLE communities ADD COLUMN trendiness REAL DEFAULT 0.5")
+        if "novelty_pressure" not in community_columns:
+            cur.execute("ALTER TABLE communities ADD COLUMN novelty_pressure REAL DEFAULT 0.5")
+        if "current_topics" not in community_columns:
+            cur.execute("ALTER TABLE communities ADD COLUMN current_topics TEXT DEFAULT '[]'")
+        if "recent_summary" not in community_columns:
+            cur.execute("ALTER TABLE communities ADD COLUMN recent_summary TEXT DEFAULT ''")
+
         cur.execute("UPDATE communities SET tone = ? WHERE tone IS NULL OR TRIM(tone) = ''", (DEFAULT_COMMUNITY_TONE,))
         cur.execute("UPDATE communities SET style_notes = '' WHERE style_notes IS NULL")
         # Create agents table
@@ -448,7 +467,7 @@ def create_persona(model: str) -> Dict[str, str]:
         raise OllamaError(f"Failed to parse persona JSON: {e}\nResponse: {response}")
 
 
-def generate_post(model: str, persona: str, community_name: str, description: str, tone: str, style_notes: str = "", memory: str = "") -> Dict[str, str]:
+def generate_post(model: str, persona: str, community_name: str, description: str, tone: str, style_notes: str = "", memory: str = "", state_context: str = "") -> dict:
     """Generate a post title and content for a community.
 
     Args:
@@ -461,10 +480,11 @@ def generate_post(model: str, persona: str, community_name: str, description: st
         A dictionary with 'title' and 'content'.
     """
     memory_section = f"\nRecent memories of your interactions:\n{memory}\n" if memory else ""
+    state_section = f"\nCurrent Community State:\n{state_context}\n" if state_context else ""
     prompt = f"""You are writing a forum post in a community called '{community_name}'.
 Community description: {description}
 Community tone guidance: {tone_guidance(tone, style_notes)}
-Your persona: {persona}{memory_section}
+Your persona: {persona}{memory_section}{state_section}
 
 It is CRITICAL that your post strongly matches your persona and communication style.
 Make it feel like a real person posting on Reddit, focused heavily on the actual subject matter of the community.
@@ -493,7 +513,7 @@ Return only the JSON object and no other commentary.
         raise OllamaError(f"Failed to parse post JSON: {e}\nResponse: {response}")
 
 
-def generate_comment(model: str, persona: str, community_name: str, post_title: str, post_content: str, tone: str, style_notes: str = "", memory: str = "") -> str:
+def generate_comment(model: str, persona: str, community_name: str, post_title: str, post_content: str, tone: str, style_notes: str = "", memory: str = "", state_context: str = "") -> str:
     """Generate a comment in reply to a post.
 
     Args:
@@ -507,9 +527,10 @@ def generate_comment(model: str, persona: str, community_name: str, post_title: 
         A string containing the comment.
     """
     memory_section = f"\nRecent memories of your interactions:\n{memory}\n" if memory else ""
+    state_section = f"\nCurrent Community State:\n{state_context}\n" if state_context else ""
     prompt = f"""You are replying to a post in the community '{community_name}'.
 Community tone guidance: {tone_guidance(tone, style_notes)}
-Your persona: {persona}{memory_section}
+Your persona: {persona}{memory_section}{state_section}
 
 Post title: {post_title}
 Post content: {post_content}
@@ -525,7 +546,7 @@ JSON, just the comment text.
     return comment.strip()
 
 
-def generate_comment_reply(model: str, persona: str, community_name: str, parent_comment: str, tone: str, style_notes: str = "", memory: str = "") -> str:
+def generate_comment_reply(model: str, persona: str, community_name: str, parent_comment: str, tone: str, style_notes: str = "", memory: str = "", state_context: str = "") -> str:
     """Generate a comment in reply to another comment.
 
     Args:
@@ -538,9 +559,10 @@ def generate_comment_reply(model: str, persona: str, community_name: str, parent
         A string containing the comment.
     """
     memory_section = f"\nRecent memories of your interactions:\n{memory}\n" if memory else ""
+    state_section = f"\nCurrent Community State:\n{state_context}\n" if state_context else ""
     prompt = f"""You are replying to a comment in the community '{community_name}'.
 Community tone guidance: {tone_guidance(tone, style_notes)}
-Your persona: {persona}{memory_section}
+Your persona: {persona}{memory_section}{state_section}
 
 Previous comment: {parent_comment}
 
@@ -701,6 +723,8 @@ class SimulationEngine:
                         self._do_community_post(event.data)
                     elif event.event_type == 'AGENT_REPLY':
                         self._do_agent_reply(event.data)
+                    elif event.event_type == 'COMMUNITY_DRIFT':
+                        self._do_community_drift(event.data)
 
                     # Mark completed *only* if the event isn't already re-scheduled by its own execution.
                     # e.g., if a community post replaces its own dedupe_key row, marking it completed here
@@ -806,13 +830,33 @@ class SimulationEngine:
             finally:
                 conn_upd.close()
 
+        # Helper to summarize current community state
+        def _get_state_context() -> str:
+            mood_str = "neutral"
+            if sim.mood > 0.3: mood_str = "positive/friendly"
+            elif sim.mood < -0.3: mood_str = "negative/cynical"
+
+            conflict_str = "calm"
+            if sim.conflict_level > 0.6: conflict_str = "highly argumentative/heated"
+            elif sim.conflict_level > 0.3: conflict_str = "slightly tense"
+
+            topics = [t['topic'] for t in sim.current_topics]
+            topic_str = ", ".join(topics) if topics else "none yet"
+
+            return f"Mood: {mood_str}. Conflict level: {conflict_str}. Currently discussing: {topic_str}."
+
+        state_ctx = _get_state_context()
+
         # Phase 3: Generate content
         if make_new_post:
             # Generate post
-            post_data = generate_post(model, persona, sim.name, sim.description, sim.tone, sim.style_notes, memory_str)
+            post_data = generate_post(model, persona, sim.name, sim.description, sim.tone, sim.style_notes, memory_str, state_ctx)
             post_id = add_post(community_id, agent_id, post_data['title'], post_data['content'])
             print(f"[{sim.name}] Generated new post: {post_data['title']}")
             append_memory(f"Created a post titled '{post_data['title']}': {post_data['content']}")
+
+            is_argumentative = sim.conflict_level > 0.5 and random.random() < 0.5
+            update_community_state(community_id, f"{post_data['title']} {post_data['content']}", is_argumentative=is_argumentative, is_new_post=True)
         else:
             # Comment on existing post or reply to comment
             reply_to_comment = False
@@ -847,10 +891,12 @@ class SimulationEngine:
                     conn.close()
 
                 if parent_id is not None:
-                    comment_text = generate_comment_reply(model, persona, sim.name, parent_content, sim.tone, sim.style_notes, memory_str)
+                    comment_text = generate_comment_reply(model, persona, sim.name, parent_content, sim.tone, sim.style_notes, memory_str, state_ctx)
                     new_comment_id = add_comment(post_id, agent_id, parent_id, comment_text)
                     print(f"[{sim.name}] Added comment reply by {agent_row['username']}")
                     append_memory(f"Replied to a comment '{parent_content}' with: {comment_text}")
+                    is_argumentative = sim.conflict_level > 0.4 and random.random() < 0.6
+                    update_community_state(community_id, comment_text, is_argumentative=is_argumentative, is_new_post=False)
 
                     # If parent author is an AI, schedule an agent reply event!
                     if parent_agent_id:
@@ -897,10 +943,12 @@ class SimulationEngine:
                     conn.close()
 
                 if post_id is not None:
-                    comment_text = generate_comment(model, persona, sim.name, title, content, sim.tone, sim.style_notes, memory_str)
+                    comment_text = generate_comment(model, persona, sim.name, title, content, sim.tone, sim.style_notes, memory_str, state_ctx)
                     new_comment_id = add_comment(post_id, agent_id, None, comment_text)
                     print(f"[{sim.name}] Added comment by {agent_row['username']}")
                     append_memory(f"Commented on post '{title}' with: {comment_text}")
+                    is_argumentative = sim.conflict_level > 0.4 and random.random() < 0.6
+                    update_community_state(community_id, comment_text, is_argumentative=is_argumentative, is_new_post=False)
 
                     if post_agent_id:
                         conn = get_db_connection()
@@ -960,39 +1008,91 @@ class SimulationEngine:
             finally:
                 conn_upd.close()
 
-        comment_text = generate_comment_reply(model, persona, sim.name, parent_comment_text, sim.tone, sim.style_notes, memory_str)
-        new_comment_id = add_comment(post_id, agent_id, reply_to_comment_id, comment_text)
-        print(f"[{sim.name}] Added priority comment reply by {agent_row['username']}")
-        append_memory(f"Replied to a comment '{parent_comment_text}' with: {comment_text}")
+        def _get_state_context() -> str:
+            mood_str = "neutral"
+            if sim.mood > 0.3: mood_str = "positive/friendly"
+            elif sim.mood < -0.3: mood_str = "negative/cynical"
+            conflict_str = "calm"
+            if sim.conflict_level > 0.6: conflict_str = "highly argumentative/heated"
+            elif sim.conflict_level > 0.3: conflict_str = "slightly tense"
+            topics = [t['topic'] for t in sim.current_topics]
+            topic_str = ", ".join(topics) if topics else "none yet"
+            return f"Mood: {mood_str}. Conflict level: {conflict_str}. Currently discussing: {topic_str}."
 
-        # Determine if the comment we replied to was by an AI, if so, schedule another reply
-        if reply_to_comment_id:
-            conn = get_db_connection()
-            try:
-                cur = conn.cursor()
-                cur.execute("SELECT agent_id FROM comments WHERE id = ?", (reply_to_comment_id,))
-                c_row = cur.fetchone()
-                if c_row:
-                    parent_agent_id = c_row['agent_id']
-                    cur.execute("SELECT id FROM agents WHERE id = ? AND model != 'none'", (parent_agent_id,))
-                    pa_row = cur.fetchone()
-                    if pa_row:
-                        # 70% chance to continue the chain
-                        if random.random() < 0.7:
-                            ENGINE.schedule(random.randint(60, 180), EventPriority.HIGH, 'AGENT_REPLY', {
-                                'community_id': community_id,
-                                'agent_id': parent_agent_id,
-                                'reply_to_comment_id': new_comment_id,
-                                'parent_comment_text': comment_text,
-                                'post_id': post_id
-                            })
-            finally:
-                conn.close()
+        state_ctx = _get_state_context()
+
+        reply_text = generate_comment_reply(model, persona, sim.name, parent_comment_text, sim.tone, sim.style_notes, memory_str, state_ctx)
+        new_comment_id = add_comment(post_id, agent_id, reply_to_comment_id, reply_text)
+        print(f"[{sim.name}] Added priority comment reply by {agent_row['username']}")
+        append_memory(f"Replied to a comment '{parent_comment_text}' with: {reply_text}")
+
+        is_argumentative = sim.conflict_level > 0.4 and random.random() < 0.6
+        update_community_state(community_id, reply_text, is_argumentative=is_argumentative, is_new_post=False)
+
+    def _do_community_drift(self, data: dict):
+        community_id = data['community_id']
+        sim = SIMULATIONS.get(community_id)
+        if not sim:
+            return
+
+        # Re-schedule next drift in 5 minutes
+        self.schedule(
+            300,
+            EventPriority.LOW,
+            'COMMUNITY_DRIFT',
+            {'community_id': community_id},
+            dedupe_key=f"COMMUNITY_DRIFT_{community_id}",
+            replace_existing=True
+        )
+
+        # Decay energy towards 1.0
+        if sim.energy > 1.0:
+            sim.energy = max(1.0, sim.energy - 0.2)
+        elif sim.energy < 1.0:
+            sim.energy = min(1.0, sim.energy + 0.1)
+
+        # Decay mood towards 0.0
+        if sim.mood > 0.0:
+            sim.mood = max(0.0, sim.mood - 0.1)
+        elif sim.mood < 0.0:
+            sim.mood = min(0.0, sim.mood + 0.1)
+
+        # Decay conflict level towards 0.0
+        if sim.conflict_level > 0.0:
+            sim.conflict_level = max(0.0, sim.conflict_level - 0.1)
+
+        # Slowly increase novelty pressure if topics stagnate
+        sim.novelty_pressure = min(1.0, sim.novelty_pressure + 0.05)
+
+        # Decay all active topics
+        topic_dict = {t['topic']: t['weight'] for t in sim.current_topics}
+        for topic in topic_dict:
+            topic_dict[topic] *= 0.8
+
+        # Keep top 10 alive
+        updated_topics = [{"topic": k, "weight": v} for k, v in topic_dict.items() if v > 0.1]
+        updated_topics.sort(key=lambda x: x["weight"], reverse=True)
+        sim.current_topics = updated_topics[:10]
+
+        # Persist back
+        conn = get_db_connection()
+        try:
+            conn.execute(
+                """
+                UPDATE communities
+                SET mood = ?, conflict_level = ?, energy = ?, novelty_pressure = ?, current_topics = ?
+                WHERE id = ?
+                """,
+                (sim.mood, sim.conflict_level, sim.energy, sim.novelty_pressure, json.dumps(sim.current_topics), community_id)
+            )
+            conn.commit()
+        finally:
+            conn.close()
 
 ENGINE = SimulationEngine()
 
 class Simulation:
-    def __init__(self, community_id: int, name: str, description: str, model: str, posting_rate: int, tone: str = DEFAULT_COMMUNITY_TONE, style_notes: str = ""):
+    def __init__(self, community_id: int, name: str, description: str, model: str, posting_rate: int, tone: str = DEFAULT_COMMUNITY_TONE, style_notes: str = "", mood: float = 0.0, conflict_level: float = 0.0, energy: float = 1.0, trendiness: float = 0.5, novelty_pressure: float = 0.5, current_topics: str = "[]", recent_summary: str = ""):
         self.community_id = community_id
         self.name = name
         self.description = description or name
@@ -1001,14 +1101,90 @@ class Simulation:
         self.tone = normalize_tone(tone)
         self.style_notes = style_notes or ""
 
+        # State
+        self.mood = float(mood) if mood is not None else 0.0
+        self.conflict_level = float(conflict_level) if conflict_level is not None else 0.0
+        self.energy = float(energy) if energy is not None else 1.0
+        self.trendiness = float(trendiness) if trendiness is not None else 0.5
+        self.novelty_pressure = float(novelty_pressure) if novelty_pressure is not None else 0.5
+        self.recent_summary = recent_summary or ""
+        try:
+            self.current_topics = json.loads(current_topics) if current_topics else []
+        except:
+            self.current_topics = []
+
     def effective_posting_rate(self) -> int:
         profile = tone_runtime_profile(self.tone)
-        return max(30, int(round(self.posting_rate * profile["cadence_multiplier"])))
+        base_rate = max(30, int(round(self.posting_rate * profile["cadence_multiplier"])))
+        # Energy directly affects posting rate (higher energy = lower interval)
+        effective = base_rate / max(0.2, self.energy)
+        return max(30, int(round(effective)))
 
 
 # Registry of active simulations keyed by community ID
 SIMULATIONS: Dict[int, Simulation] = {}
 
+
+def extract_topics(text: str) -> List[str]:
+    """Lightweight keyword extraction using basic heuristic."""
+    # Remove basic punctuation
+    text = re.sub(r'[^\w\s]', '', text.lower())
+    words = text.split()
+    stopwords = {"the", "a", "an", "and", "or", "but", "in", "on", "at", "to", "for", "of", "with", "by", "as", "is", "are", "was", "were", "be", "been", "this", "that", "it", "they", "we", "you", "i", "not", "no", "yes", "all", "any", "some", "can", "will", "would", "should", "could", "have", "has", "had", "do", "does", "did", "from"}
+    keywords = [w for w in words if len(w) > 3 and w not in stopwords]
+
+    # Return top 3 most common keywords
+    counts = Counter(keywords)
+    return [word for word, count in counts.most_common(3)]
+
+def update_community_state(community_id: int, content: str, is_argumentative: bool = False, is_new_post: bool = False):
+    sim = SIMULATIONS.get(community_id)
+    if not sim:
+        return
+
+    # Extract new topics
+    new_topics = extract_topics(content)
+
+    # Decay existing topics and add new ones
+    topic_dict = {t['topic']: t['weight'] for t in sim.current_topics}
+    for topic in topic_dict:
+        topic_dict[topic] *= 0.9  # Decay
+
+    for topic in new_topics:
+        topic_dict[topic] = topic_dict.get(topic, 0.0) + (0.5 * sim.novelty_pressure)
+
+    # Filter out dead topics and sort by weight
+    updated_topics = [{"topic": k, "weight": v} for k, v in topic_dict.items() if v > 0.1]
+    updated_topics.sort(key=lambda x: x["weight"], reverse=True)
+    sim.current_topics = updated_topics[:10]  # Keep top 10
+
+    # Update energy and conflict
+    if is_new_post:
+        sim.energy = min(3.0, sim.energy + 0.1)
+    else:
+        sim.energy = min(3.0, sim.energy + 0.05)
+
+    if is_argumentative:
+        sim.conflict_level = min(1.0, sim.conflict_level + 0.1)
+        sim.mood = max(-1.0, sim.mood - 0.1) # Mood goes negative
+    else:
+        sim.conflict_level = max(0.0, sim.conflict_level - 0.05)
+        sim.mood = min(1.0, sim.mood + 0.05) # Mood goes positive
+
+    # Persist
+    conn = get_db_connection()
+    try:
+        conn.execute(
+            """
+            UPDATE communities
+            SET mood = ?, conflict_level = ?, energy = ?, current_topics = ?
+            WHERE id = ?
+            """,
+            (sim.mood, sim.conflict_level, sim.energy, json.dumps(sim.current_topics), community_id)
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 # Helper functions for data operations
 
@@ -1579,6 +1755,25 @@ class RequestHandler(BaseHTTPRequestHandler):
                         if q in SSE_CLIENTS:
                             SSE_CLIENTS.remove(q)
                 return
+            elif path.startswith('community_state/'):
+                parts = path.split('/')
+                if len(parts) == 2:
+                    try:
+                        c_id = int(parts[1])
+                        sim = SIMULATIONS.get(c_id)
+                        if sim:
+                            self.respond_json({
+                                'mood': sim.mood,
+                                'conflict_level': sim.conflict_level,
+                                'energy': sim.energy,
+                                'top_topics': sim.current_topics
+                            })
+                        else:
+                            self.respond_json({'error': 'Community not found'}, status=404)
+                    except ValueError:
+                        self.respond_json({'error': 'Invalid community ID'}, status=400)
+                else:
+                    self.respond_json({'error': 'Invalid path'}, status=400)
             elif path == 'session':
                 self.respond_json({
                     'current_user': (
@@ -2103,6 +2298,13 @@ def run_server(host: str = 'localhost', port: int = 8080) -> None:
                     row['posting_rate'],
                     row['tone'],
                     row['style_notes'],
+                    row['mood'],
+                    row['conflict_level'],
+                    row['energy'],
+                    row['trendiness'],
+                    row['novelty_pressure'],
+                    row['current_topics'],
+                    row['recent_summary']
                 )
                 SIMULATIONS[comm_id] = sim
                 ENGINE.schedule(
@@ -2111,6 +2313,14 @@ def run_server(host: str = 'localhost', port: int = 8080) -> None:
                     'COMMUNITY_POST',
                     {'community_id': comm_id},
                     dedupe_key=f"COMMUNITY_POST_{comm_id}",
+                    replace_existing=False
+                )
+                ENGINE.schedule(
+                    start_delay + 60,
+                    EventPriority.LOW,
+                    'COMMUNITY_DRIFT',
+                    {'community_id': comm_id},
+                    dedupe_key=f"COMMUNITY_DRIFT_{comm_id}",
                     replace_existing=False
                 )
                 start_delay += 2 # stagger start times

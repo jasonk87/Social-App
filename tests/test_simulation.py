@@ -183,3 +183,45 @@ def test_simulation_restart_semantics():
     assert ts < time.time() + 150
 
     conn.close()
+
+def test_community_state_update():
+    # Insert dummy community
+    conn = server.get_db_connection()
+    cur = conn.cursor()
+    cur.execute("INSERT INTO communities (name) VALUES ('test_comm')")
+    comm_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+
+    # Initialize simulation instance
+    server.SIMULATIONS[comm_id] = server.Simulation(comm_id, "test_comm", "desc", "none", 60)
+
+    # Test update triggers correctly
+    server.update_community_state(comm_id, "This is a new test topic about apples", is_argumentative=True, is_new_post=True)
+
+    sim = server.SIMULATIONS[comm_id]
+
+    # Energy should go up for new post
+    assert sim.energy > 1.0
+    # Conflict should go up, mood down
+    assert sim.conflict_level > 0.0
+    assert sim.mood < 0.0
+
+    # Topics should contain "test" and "topic" and "about" (due to stopword filtering and count logic)
+    topics = [t['topic'] for t in sim.current_topics]
+    assert "test" in topics
+    assert "topic" in topics
+    assert len(topics) <= 3 # extract_topics grabs top 3
+
+    # Test drift decay
+    sim.energy = 2.0
+    sim.mood = -0.5
+    sim.conflict_level = 0.5
+
+    engine = server.SimulationEngine()
+    engine._do_community_drift({'community_id': comm_id})
+
+    # Verify decay
+    assert sim.energy < 2.0
+    assert sim.mood > -0.5
+    assert sim.conflict_level < 0.5
