@@ -691,7 +691,7 @@ async function loadFeed(name, options = {}) {
     }
 }
 
-document.addEventListener('DOMContentLoaded', () => {
+document.addEventListener('DOMContentLoaded', async () => {
     initScrollObserver();
     const name = getQueryParam('name');
     const titleEl = document.getElementById('community-title');
@@ -713,7 +713,8 @@ document.addEventListener('DOMContentLoaded', () => {
             titleEl.textContent = name;
             document.getElementById('community-subtitle').textContent = err.message;
         });
-    loadFeed(name, { silentNotifications: true, focusTarget: true });
+    await loadFeed(name, { silentNotifications: true, focusTarget: true });
+    await loadCommunityState();
     window.addEventListener('hashchange', focusTargetFromHash);
 
     document.getElementById('community-settings-btn').addEventListener('click', openEditModal);
@@ -788,11 +789,25 @@ document.addEventListener('DOMContentLoaded', () => {
     // Live updates via SSE
     function initSSE() {
         const eventSource = new EventSource('/api/stream');
+        let sseRefreshTimeout = null;
+        const shouldRefreshForEvent = (eventData) => (
+            communityPageState.community
+            && Number(communityPageState.community.id) === Number(eventData.community_id)
+        );
+        const scheduleSseRefresh = () => {
+            if (sseRefreshTimeout) {
+                return;
+            }
+            sseRefreshTimeout = window.setTimeout(async () => {
+                sseRefreshTimeout = null;
+                await window.loadCommunityData();
+            }, 120);
+        };
         eventSource.addEventListener('new_post', async (event) => {
             try {
                 const data = JSON.parse(event.data);
-                if (window.communityPageState && window.communityPageState.community && window.communityPageState.community.id === data.community_id) {
-                    await window.loadCommunityData();
+                if (shouldRefreshForEvent(data)) {
+                    scheduleSseRefresh();
                 }
             } catch (e) {
                 console.error('Failed to parse SSE new_post event', e);
@@ -801,8 +816,8 @@ document.addEventListener('DOMContentLoaded', () => {
         eventSource.addEventListener('new_comment', async (event) => {
             try {
                 const data = JSON.parse(event.data);
-                if (window.communityPageState && window.communityPageState.community && window.communityPageState.community.id === data.community_id) {
-                    await window.loadCommunityData();
+                if (shouldRefreshForEvent(data)) {
+                    scheduleSseRefresh();
                 }
             } catch (e) {
                 console.error('Failed to parse SSE new_comment event', e);
@@ -850,6 +865,11 @@ document.addEventListener('DOMContentLoaded', () => {
         await loadCommunityState();
     };
 
+    async function refreshCommunityAfterLocalAction(options = {}) {
+        await loadFeed(name, options);
+        await loadCommunityState();
+    }
+
     async function submitPost() {
         const button = document.getElementById('submit-post-btn');
         const title = document.getElementById('new-post-title').value.trim();
@@ -870,7 +890,7 @@ document.addEventListener('DOMContentLoaded', () => {
             });
             document.getElementById('new-post-title').value = '';
             document.getElementById('new-post-content').value = '';
-            loadFeed(name, { focusTarget: true });
+            await refreshCommunityAfterLocalAction({ focusTarget: true });
         } catch (err) {
             alert(err.message);
         } finally {
@@ -938,7 +958,7 @@ document.addEventListener('DOMContentLoaded', () => {
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ content, parent_id: parentId ? parseInt(parentId, 10) : null }),
                 });
-        loadFeed(name, { preserveScroll: true });
+                await refreshCommunityAfterLocalAction({ preserveScroll: true });
             } catch (err) {
                 alert(err.message);
             } finally {
