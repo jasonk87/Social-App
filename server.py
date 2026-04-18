@@ -2009,4 +2009,4 @@ def run_server(host: str = 'localhost', port: int = 8080) -> None:
 
 
 if __name__ == '__main__':
-    run_server(host='0.0.0.0', port=3000)
+    run_server(host='0.0.0.0', port=5000)

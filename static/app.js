@@ -379,6 +379,7 @@ function renderSessionState() {
             <strong>${escapeHTML(appState.currentUser.display_name)}</strong>
         `;
         navigateTo(appState.activeView || 'feed');
+        refreshApp();
     } else {
         page.dataset.view = 'auth';
         bootShell.hidden = true;
@@ -608,7 +609,11 @@ function renderFeed() {
 }
 
 async function refreshApp() {
-    await Promise.all([loadCommunities(), loadFeed()]);
+    if (appState.activeView === 'feed') {
+        await Promise.all([loadCommunities(), loadFeed()]);
+    } else {
+        await loadCommunities();
+    }
 }
 
 async function handleLogin(event) {
@@ -631,7 +636,7 @@ async function handleLogin(event) {
         document.getElementById('login-pin').value = '';
         await loadSession();
         if (appState.currentUser) {
-            await mountApp();
+            await refreshApp();
         }
     } catch (err) {
         error.textContent = err.message;
@@ -784,9 +789,9 @@ function initSSE() {
     eventSource.addEventListener('new_post', async (event) => {
         try {
             const data = JSON.parse(event.data);
-            if (appState.currentView === 'feed') {
+            if (appState.activeView === 'feed') {
                 await loadFeed();
-            } else if (appState.currentView === 'community' && window.communityPageState && window.communityPageState.community && window.communityPageState.community.id === data.community_id) {
+            } else if (appState.activeView === 'community' && window.communityPageState && window.communityPageState.community && window.communityPageState.community.id === data.community_id) {
                 if (typeof window.loadCommunityData === 'function') {
                     await window.loadCommunityData();
                 }
@@ -798,9 +803,9 @@ function initSSE() {
     eventSource.addEventListener('new_comment', async (event) => {
         try {
             const data = JSON.parse(event.data);
-            if (appState.currentView === 'feed') {
+            if (appState.activeView === 'feed') {
                 await loadFeed();
-            } else if (appState.currentView === 'community' && window.communityPageState && window.communityPageState.community && window.communityPageState.community.id === data.community_id) {
+            } else if (appState.activeView === 'community' && window.communityPageState && window.communityPageState.community && window.communityPageState.community.id === data.community_id) {
                 if (typeof window.loadCommunityData === 'function') {
                     await window.loadCommunityData();
                 }
@@ -824,7 +829,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (current_user) {
             appState.currentUser = current_user;
             writeCachedSession(current_user);
-            await mountApp();
+            await refreshApp();
         } else {
             populateToneSelect();
             await loadModels();
