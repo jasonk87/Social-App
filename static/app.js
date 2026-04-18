@@ -33,15 +33,33 @@ const appState = {
     communities: [],
     feed: [],
     sort: 'best',
+    communitySearchSearch: '',
 };
 
 const deleteModalState = { name: null };
+
+function toggleSidebar(force) {
+    const page = document.body;
+    const nextState = typeof force === 'boolean' ? force : !page.classList.contains('is-sidebar-open');
+    page.classList.toggle('is-sidebar-open', nextState);
+}
+
+function initScrollObserver() {
+    let scrolled = false;
+    window.addEventListener('scroll', () => {
+        const shouldScroll = window.scrollY > 40;
+        if (shouldScroll !== scrolled) {
+            scrolled = shouldScroll;
+            document.body.classList.toggle('is-scrolled', scrolled);
+        }
+    }, { passive: true });
+}
 const editModalState = { name: null };
 const SESSION_CACHE_KEY = 'local-social-session';
 
 function readCachedSession() {
     try {
-        const raw = sessionStorage.getItem(SESSION_CACHE_KEY);
+        const raw = localStorage.getItem(SESSION_CACHE_KEY);
         return raw ? JSON.parse(raw) : null;
     } catch (err) {
         return null;
@@ -51,10 +69,10 @@ function readCachedSession() {
 function writeCachedSession(user) {
     try {
         if (!user) {
-            sessionStorage.removeItem(SESSION_CACHE_KEY);
+            localStorage.removeItem(SESSION_CACHE_KEY);
             return;
         }
-        sessionStorage.setItem(SESSION_CACHE_KEY, JSON.stringify({
+        localStorage.setItem(SESSION_CACHE_KEY, JSON.stringify({
             display_name: user.display_name,
             agent_username: user.agent_username,
         }));
@@ -313,15 +331,22 @@ function navigateTo(viewName) {
     const page = document.body;
     const feedShell = document.getElementById('feed-shell');
     const createShell = document.getElementById('create-shell');
+    const discoveryShell = document.getElementById('communities-shell');
     
     page.dataset.view = viewName;
     
+    // Hide all shells
+    if (feedShell) feedShell.hidden = true;
+    if (createShell) createShell.hidden = true;
+    if (discoveryShell) discoveryShell.hidden = true;
+
     if (viewName === 'create') {
-        feedShell.hidden = true;
         if (createShell) createShell.hidden = false;
+    } else if (viewName === 'communities') {
+        if (discoveryShell) discoveryShell.hidden = false;
+        renderCommunities();
     } else {
-        feedShell.hidden = false;
-        if (createShell) createShell.hidden = true;
+        if (feedShell) feedShell.hidden = false;
     }
 
     document.querySelectorAll('.top-nav .nav-link').forEach(link => {
@@ -373,8 +398,7 @@ function renderStats(communities = []) {
     const subscribed = communities.filter((community) => community.subscribed);
     const cards = [
         { value: subscribed.length, label: 'Subscribed' },
-        { value: communities.length, label: 'Total rooms' },
-        { value: communities.filter((community) => community.active).length, label: 'Running now' },
+        { value: communities.length, label: 'Communities' },
     ];
 
     stats.innerHTML = cards.map((card) => `
@@ -413,13 +437,22 @@ async function loadCommunities() {
 }
 
 function renderCommunities() {
+    renderSidebarCommunities();
+    renderDiscoveryCommunities();
+}
+
+function renderSidebarCommunities() {
     const grid = document.getElementById('communities-grid');
     const summary = document.getElementById('community-summary');
+    if (!grid) return;
+
     const subscribedCount = appState.communities.filter((community) => community.subscribed).length;
 
-    summary.textContent = subscribedCount
-        ? `${formatCount(subscribedCount, 'subscription')} in your home feed.`
-        : 'Subscribe to a few communities to start building your feed.';
+    if (summary) {
+        summary.textContent = subscribedCount
+            ? `${formatCount(subscribedCount, 'subscription')} in your home feed.`
+            : 'Subscribe to a few communities to start building your feed.';
+    }
 
     if (!appState.communities.length) {
         grid.innerHTML = `
@@ -436,19 +469,61 @@ function renderCommunities() {
             <div class="community-list-main">
                 <div class="community-list-header">
                     <h3 class="community-list-title">${escapeHTML(community.name)}</h3>
+                </div>
+            </div>
+        </article>
+    `).join('');
+
+    if (window.lucide) {
+        lucide.createIcons();
+    }
+}
+
+function renderDiscoveryCommunities() {
+    const grid = document.getElementById('discovery-grid');
+    if (!grid) return;
+
+    const query = (appState.communitySearchSearch || '').toLowerCase();
+    const filtered = appState.communities.filter(c => 
+        c.name.toLowerCase().includes(query) || 
+        (c.description || '').toLowerCase().includes(query)
+    );
+
+    if (!filtered.length) {
+        grid.innerHTML = `
+            <div class="empty-state discovery-empty">
+                <strong>No matches found</strong>
+                Try searching for something else or browse the network.
+            </div>
+        `;
+        return;
+    }
+
+    grid.innerHTML = filtered.map((community) => `
+        <article class="post clickable-card community-discovery-card" data-url="/community.html?name=${encodeURIComponent(community.name)}">
+            <div class="post-header">
+                <div class="pill-row">
+                    <span class="pill pill-accent">${escapeHTML(community.model)}</span>
+                    <span class="pill">${escapeHTML(formatCount(community.subscriber_count || 0, 'subscriber'))}</span>
+                    <span class="pill">${escapeHTML(`${community.posting_rate}s cycle`)}</span>
+                </div>
+                <div class="card-topline">
+                    <h3>${escapeHTML(community.name)}</h3>
                     <div class="card-actions">
-                        <button type="button" class="icon-btn icon-btn-small" data-action="edit" data-name="${escapeHTML(community.name)}" aria-label="Edit community">
-                            <i data-lucide="settings-2"></i>
-                        </button>
-                        <button type="button" class="icon-btn icon-btn-small btn-danger" data-action="delete" data-name="${escapeHTML(community.name)}" aria-label="Delete community">
-                            <i data-lucide="trash-2"></i>
+                        <button type="button" class="btn-text subscribe-btn ${community.subscribed ? 'is-active' : ''}" data-action="subscribe" data-name="${escapeHTML(community.name)}" data-subscribed="${community.subscribed ? 'true' : 'false'}">
+                            ${community.subscribed ? 'Subscribed' : 'Join Community'}
                         </button>
                     </div>
                 </div>
-                <div class="community-list-meta">
-                    <span class="community-list-subscribers">${escapeHTML(formatCount(community.subscriber_count || 0, 'subscriber'))}</span>
-                    <button type="button" class="btn-text subscribe-btn-small ${community.subscribed ? 'is-active' : ''}" data-action="subscribe" data-name="${escapeHTML(community.name)}" data-subscribed="${community.subscribed ? 'true' : 'false'}">
-                        ${community.subscribed ? 'Subscribed' : 'Subscribe'}
+            </div>
+            <div class="post-content">${escapeHTML(community.description || 'No description provided.')}</div>
+            <div class="card-footer card-footer-stack">
+                <div class="card-inline-actions">
+                    <button type="button" class="icon-btn" data-action="edit" data-name="${escapeHTML(community.name)}" aria-label="Edit community">
+                        <i data-lucide="settings-2"></i>
+                    </button>
+                    <button type="button" class="icon-btn btn-danger" data-action="delete" data-name="${escapeHTML(community.name)}" aria-label="Delete community">
+                        <i data-lucide="trash-2"></i>
                     </button>
                 </div>
             </div>
@@ -498,7 +573,7 @@ function renderFeed() {
     }
 
     feed.innerHTML = appState.feed.map((post) => `
-        <article class="post post-feed-card">
+        <article class="post post-feed-card clickable-card" data-url="/community.html?name=${encodeURIComponent(post.community_name)}#post-${post.id}">
             <div class="post-header">
                 <div class="pill-row">
                     <a class="pill pill-accent" href="/community.html?name=${encodeURIComponent(post.community_name)}">${escapeHTML(post.community_name)}</a>
@@ -525,7 +600,6 @@ function renderFeed() {
             <div class="post-content">${escapeHTML(post.content)}</div>
             <div class="card-footer">
                 <span>${escapeHTML(post.community_description || 'Open the community for the full thread.')}</span>
-                <a class="button-link button-secondary button-inline" href="/community.html?name=${encodeURIComponent(post.community_name)}#post-${post.id}">Open thread</a>
             </div>
         </article>
     `).join('');
@@ -555,13 +629,24 @@ async function handleLogin(event) {
         document.getElementById('login-pin').value = '';
         await loadSession();
         if (appState.currentUser) {
-            await refreshApp();
+            await mountApp();
         }
     } catch (err) {
         error.textContent = err.message;
     } finally {
         button.disabled = false;
         button.classList.remove('is-busy');
+    }
+}
+
+async function handleLogout() {
+    try {
+        await fetchJSON('/api/logout', { method: 'POST' });
+        appState.currentUser = null;
+        writeCachedSession(null);
+        window.location.reload();
+    } catch (err) {
+        alert(err.message);
     }
 }
 
@@ -701,12 +786,24 @@ async function toggleSubscription(name, subscribed) {
 }
 
 document.addEventListener('DOMContentLoaded', async () => {
+    initScrollObserver();
     renderBootState();
-    populateToneSelect();
-    await loadModels();
-    await loadSession();
-    if (appState.currentUser) {
-        await refreshApp();
+
+    try {
+        const { current_user } = await fetchJSON('/api/session');
+        if (current_user) {
+            appState.currentUser = current_user;
+            writeCachedSession(current_user);
+            await mountApp();
+        } else {
+            populateToneSelect();
+            await loadModels();
+            await loadSession();
+        }
+    } catch (err) {
+        populateToneSelect();
+        await loadModels();
+        await loadSession();
     }
 
     document.getElementById('login-form').addEventListener('submit', handleLogin);
@@ -743,6 +840,58 @@ document.addEventListener('DOMContentLoaded', async () => {
         await loadFeed();
     });
 
+    const sidebarToggle = document.getElementById('sidebar-toggle');
+    if (sidebarToggle) {
+        sidebarToggle.addEventListener('click', () => toggleSidebar());
+    }
+
+    const sidebarBackdrop = document.getElementById('sidebar-backdrop');
+    if (sidebarBackdrop) {
+        sidebarBackdrop.addEventListener('click', () => toggleSidebar(false));
+    }
+
+    document.getElementById('community-search').addEventListener('input', (event) => {
+        appState.communitySearchSearch = event.target.value;
+        renderDiscoveryCommunities();
+    });
+
+    document.getElementById('discovery-grid').addEventListener('click', async (event) => {
+        const editButton = event.target.closest('button[data-action="edit"]');
+        if (editButton) {
+            const community = appState.communities.find((item) => item.name === editButton.getAttribute('data-name'));
+            if (community) {
+                openEditModal(community);
+            }
+            return;
+        }
+
+        const deleteButton = event.target.closest('button[data-action="delete"]');
+        if (deleteButton) {
+            openDeleteModal(deleteButton.getAttribute('data-name'));
+            return;
+        }
+
+        const subscribeButton = event.target.closest('button[data-action="subscribe"]');
+        if (subscribeButton) {
+            const name = subscribeButton.getAttribute('data-name');
+            const subscribed = subscribeButton.getAttribute('data-subscribed') !== 'true';
+            await toggleSubscription(name, subscribed);
+            return;
+        }
+
+        const card = event.target.closest('.community-discovery-card[data-url]');
+        if (card && !event.target.closest('a, button')) {
+            window.location.href = card.getAttribute('data-url');
+        }
+    });
+    
+    document.getElementById('home-feed').addEventListener('click', (event) => {
+        const card = event.target.closest('.clickable-card[data-url]');
+        if (card && !event.target.closest('a, button')) {
+            window.location.href = card.getAttribute('data-url');
+        }
+    });
+
     document.getElementById('communities-grid').addEventListener('click', async (event) => {
         const editButton = event.target.closest('button[data-action="edit"]');
         if (editButton) {
@@ -769,6 +918,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
         const card = event.target.closest('.community-card[data-url]');
         if (card && !event.target.closest('a, button')) {
+            toggleSidebar(false);
             window.location.href = card.getAttribute('data-url');
         }
     });

@@ -13,9 +13,12 @@
             <span class="brand-dot"></span>
             <span>Local Social Lab</span>
         </a>
+        <button id="sidebar-toggle" class="sidebar-toggle" aria-label="Toggle communities menu" hidden>
+            <i data-lucide="menu"></i>
+        </button>
         <nav class="top-nav">
             <a href="#feed" class="nav-link" data-view-target="feed">Feed</a>
-            <a href="#communities">Communities</a>
+            <a href="#communities" class="nav-link" data-view-target="communities">Communities</a>
             <a href="#create" class="nav-link" data-view-target="create">Create</a>
         </nav>
         <div id="account-chip" class="account-chip" hidden></div>
@@ -118,9 +121,28 @@
                         </div>
                         <div id="dashboard-stats" class="hero-stats hero-stats-compact" aria-label="Workspace metrics"></div>
                     </section>
-
                 </aside>
+                <div id="sidebar-backdrop" class="sidebar-backdrop"></div>
             </div>
+        </section>
+
+        <section id="communities-shell" class="communities-shell" hidden>
+            <div class="feed-header feed-header-home">
+                <div class="feed-header-copy">
+                    <p class="eyebrow">Discover</p>
+                    <h1>Explore Communities</h1>
+                    <p class="section-copy">Browse all available spaces, find new interests, and join communities to build your personalized feed.</p>
+                </div>
+            </div>
+
+            <div class="discovery-controls">
+                <div class="search-wrap">
+                    <div class="search-icon"><i data-lucide="search"></i></div>
+                    <input type="text" id="community-search" placeholder="Search your network..." aria-label="Search communities">
+                </div>
+            </div>
+
+            <div id="discovery-grid" class="discovery-grid" aria-live="polite"></div>
         </section>
 
         <section id="create-shell" class="create-shell" hidden>

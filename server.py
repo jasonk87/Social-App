@@ -1555,7 +1555,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                             'agent_username': user['agent_username'],
                         },
                     },
-                    extra_headers=[('Set-Cookie', f'{SESSION_COOKIE_NAME}={token}; Path=/; HttpOnly; SameSite=Lax')],
+                    extra_headers=[('Set-Cookie', f'{SESSION_COOKIE_NAME}={token}; Path=/; HttpOnly; Max-Age=2592000; SameSite=Lax')],
                 )
             elif path == 'register':
                 display_name = data.get('display_name')
@@ -1576,7 +1576,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                             'agent_username': user['agent_username'],
                         },
                     },
-                    extra_headers=[('Set-Cookie', f'{SESSION_COOKIE_NAME}={token}; Path=/; HttpOnly; SameSite=Lax')],
+                    extra_headers=[('Set-Cookie', f'{SESSION_COOKIE_NAME}={token}; Path=/; HttpOnly; Max-Age=2592000; SameSite=Lax')],
                 )
             elif path == 'logout':
                 token = self.get_session_token()
@@ -1605,6 +1605,14 @@ class RequestHandler(BaseHTTPRequestHandler):
                     self.respond_json({'error': 'Community already exists'}, status=400)
                     return
                 community_id = add_community(name, description, model, posting_rate, tone, style_notes)
+                # Mark as active in DB so UI reflects it
+                conn = get_db_connection()
+                try:
+                    conn.execute("UPDATE communities SET active = 1 WHERE id = ?", (community_id,))
+                    conn.commit()
+                finally:
+                    conn.close()
+
                 # Immediately register the simulation and schedule its first heartbeat in the central engine
                 sim = Simulation(community_id, name, description, model, posting_rate, tone, style_notes)
                 SIMULATIONS[community_id] = sim
@@ -1842,6 +1850,10 @@ def run_server(host: str = 'localhost', port: int = 8080) -> None:
         # Auto-boot all communities on startup by scheduling their heartbeats
         conn = get_db_connection()
         try:
+            # Mark all as active for the UI
+            conn.execute("UPDATE communities SET active = 1")
+            conn.commit()
+            
             cur = conn.cursor()
             cur.execute("SELECT * FROM communities")
             start_delay = 5

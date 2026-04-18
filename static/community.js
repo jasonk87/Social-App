@@ -142,6 +142,17 @@ function getToneOption(value) {
     return toneOptions.find((tone) => tone.value === value) || toneOptions[0];
 }
 
+function initScrollObserver() {
+    let scrolled = false;
+    window.addEventListener('scroll', () => {
+        const shouldScroll = window.scrollY > 40;
+        if (shouldScroll !== scrolled) {
+            scrolled = shouldScroll;
+            document.body.classList.toggle('is-scrolled', scrolled);
+        }
+    }, { passive: true });
+}
+
 function updateTonePreview() {
     const select = document.getElementById('community-edit-tone');
     const preview = document.getElementById('community-edit-tone-preview');
@@ -674,6 +685,7 @@ async function loadFeed(name, options = {}) {
 }
 
 document.addEventListener('DOMContentLoaded', () => {
+    initScrollObserver();
     const name = getQueryParam('name');
     const titleEl = document.getElementById('community-title');
 
@@ -716,9 +728,23 @@ document.addEventListener('DOMContentLoaded', () => {
             showToast('Subscription update failed', err.message);
         }
     });
-    document.getElementById('community-edit-form').addEventListener('submit', saveCommunityEdits);
     document.getElementById('community-edit-tone').addEventListener('change', updateTonePreview);
     document.getElementById('community-edit-cancel').addEventListener('click', closeEditModal);
+    document.getElementById('community-delete-btn').addEventListener('click', async () => {
+        if (!communityPageState.name) return;
+        if (!confirm(`Are you sure you want to delete "${communityPageState.name}"? This will remove all simulations and data for this room.`)) {
+            return;
+        }
+
+        try {
+            await fetchJSON(`/api/community/${encodeURIComponent(communityPageState.name)}/delete`, {
+                method: 'POST',
+            });
+            window.location.href = '/';
+        } catch (err) {
+            showToast('Deletion failed', err.message);
+        }
+    });
 
     const editModal = document.getElementById('community-edit-modal');
     editModal.addEventListener('click', (event) => {
