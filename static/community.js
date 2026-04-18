@@ -780,6 +780,10 @@ document.addEventListener('DOMContentLoaded', () => {
     });
 
     setInterval(() => {
+        window.loadCommunityData();
+    }, 15000);
+
+    window.loadCommunityData = async function() {
         const titleVal = document.getElementById('new-post-title').value.trim();
         const contentVal = document.getElementById('new-post-content').value.trim();
         const activeElement = document.activeElement;
@@ -788,8 +792,8 @@ document.addEventListener('DOMContentLoaded', () => {
         // We fetch the data but only re-render if the user isn't actively writing.
         // This keeps notifications flowing but prevents wiping their typed text.
         const shouldRender = !document.querySelector('.reply-form') && !titleVal && !contentVal && !isTyping;
-        loadFeed(name, { preserveScroll: true, renderDOM: shouldRender });
-    }, 15000);
+        await loadFeed(name, { preserveScroll: true, renderDOM: shouldRender });
+    };
 
     async function submitPost() {
         const button = document.getElementById('submit-post-btn');

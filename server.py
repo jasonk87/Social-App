@@ -1204,6 +1204,7 @@ def add_post(community_id: int, agent_id: int, title: str, content: str) -> int:
         )
         post_id = cur.lastrowid
         conn.commit()
+        broadcast_sse('new_post', {'post_id': post_id, 'community_id': community_id})
         return post_id
     finally:
         conn.close()
@@ -1218,7 +1219,12 @@ def add_comment(post_id: int, agent_id: int, parent_id: Optional[int], content: 
             (post_id, agent_id, parent_id, content, time.time()),
         )
         comment_id = cur.lastrowid
+        cur.execute("SELECT community_id FROM posts WHERE id = ?", (post_id,))
+        p_row = cur.fetchone()
+        community_id = p_row['community_id'] if p_row else None
         conn.commit()
+        if community_id is not None:
+            broadcast_sse('new_comment', {'comment_id': comment_id, 'post_id': post_id, 'community_id': community_id})
         return comment_id
     finally:
         conn.close()
@@ -1364,6 +1370,19 @@ def fetch_home_feed(user_id: int, sort: str = "latest") -> List[Dict[str, Any]]:
 
 STATIC_DIR = os.path.join(os.path.dirname(__file__), 'static')
 
+# Global list of SSE queues
+SSE_CLIENTS: List[queue.Queue] = []
+SSE_LOCK = threading.Lock()
+
+def broadcast_sse(event_type: str, data: dict):
+    message = f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
+    with SSE_LOCK:
+        for q in SSE_CLIENTS:
+            try:
+                q.put_nowait(message)
+            except queue.Full:
+                pass
+
 
 class RequestHandler(BaseHTTPRequestHandler):
     server_version = "SocialApp/0.1"
@@ -1419,7 +1438,40 @@ class RequestHandler(BaseHTTPRequestHandler):
         query = parse_qs(parsed.query)
         current_user = self.get_current_user()
         try:
-            if path == 'session':
+            if path == 'stream':
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/event-stream')
+                self.send_header('Cache-Control', 'no-cache')
+                self.send_header('Connection', 'keep-alive')
+                self.end_headers()
+
+                q = queue.Queue(maxsize=100)
+                with SSE_LOCK:
+                    SSE_CLIENTS.append(q)
+
+                try:
+                    # Send an initial ping so the client knows it connected
+                    self.wfile.write(b": ping\n\n")
+                    self.wfile.flush()
+                    while True:
+                        try:
+                            # Use a timeout so we can periodically check if the client disconnected
+                            message = q.get(timeout=15)
+                            self.wfile.write(message.encode('utf-8'))
+                            self.wfile.flush()
+                        except queue.Empty:
+                            # Send a keep-alive ping
+                            self.wfile.write(b": ping\n\n")
+                            self.wfile.flush()
+                except Exception as e:
+                    # Client disconnected or network error
+                    pass
+                finally:
+                    with SSE_LOCK:
+                        if q in SSE_CLIENTS:
+                            SSE_CLIENTS.remove(q)
+                return
+            elif path == 'session':
                 self.respond_json({
                     'current_user': (
                         {
