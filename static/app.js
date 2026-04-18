@@ -33,7 +33,7 @@ const appState = {
     communities: [],
     feed: [],
     sort: 'best',
-    communitySearchSearch: '',
+    communitySearchInput: '',
 };
 
 const deleteModalState = { name: null };
@@ -483,7 +483,7 @@ function renderDiscoveryCommunities() {
     const grid = document.getElementById('discovery-grid');
     if (!grid) return;
 
-    const query = (appState.communitySearchSearch || '').toLowerCase();
+    const query = (appState.communitySearchInput || '').toLowerCase();
     const filtered = appState.communities.filter(c => 
         c.name.toLowerCase().includes(query) || 
         (c.description || '').toLowerCase().includes(query)
@@ -639,17 +639,6 @@ async function handleLogin(event) {
     }
 }
 
-async function handleLogout() {
-    try {
-        await fetchJSON('/api/logout', { method: 'POST' });
-        appState.currentUser = null;
-        writeCachedSession(null);
-        window.location.reload();
-    } catch (err) {
-        alert(err.message);
-    }
-}
-
 async function handleRegister(event) {
     event.preventDefault();
     const button = document.getElementById('register-btn');
@@ -681,13 +670,16 @@ async function handleRegister(event) {
 }
 
 async function handleLogout() {
-    await fetchJSON('/api/logout', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
-    appState.currentUser = null;
-    appState.communities = [];
-    appState.feed = [];
-    writeCachedSession(null);
-    renderSessionState();
-    await loadSession();
+    try {
+        await fetchJSON('/api/logout', { method: 'POST' });
+        appState.currentUser = null;
+        appState.communities = [];
+        appState.feed = [];
+        writeCachedSession(null);
+        window.location.reload();
+    } catch (err) {
+        alert(err.message);
+    }
 }
 
 async function handleCreate(event) {
@@ -851,7 +843,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
 
     document.getElementById('community-search').addEventListener('input', (event) => {
-        appState.communitySearchSearch = event.target.value;
+        appState.communitySearchInput = event.target.value;
         renderDiscoveryCommunities();
     });
 
