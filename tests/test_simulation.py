@@ -120,10 +120,11 @@ def test_simulation_lifecycle():
     engine._claim_next_due_event()
 
     engine._mark_event_failed(event.id, "error 3") # attempts=3
-    cur.execute("SELECT status, attempts FROM simulation_events WHERE id = ?", (event.id,))
+    cur.execute("SELECT status, attempts, claimed_at FROM simulation_events WHERE id = ?", (event.id,))
     row = cur.fetchone()
     assert row['attempts'] == 3
     assert row['status'] == 'failed' # Reached terminal failure
+    assert row['claimed_at'] is None
 
     # Verify terminal status dedupe key override behavior
     engine.schedule(0, server.EventPriority.HIGH, 'TERM_TEST', {}, dedupe_key='term_key', replace_existing=False)
@@ -154,11 +155,13 @@ def test_simulation_restart_semantics():
     assert cur.fetchone()['status'] == 'processing'
 
     # Simulate restart logic
-    conn.execute("UPDATE simulation_events SET status = 'pending' WHERE status = 'processing'")
+    conn.execute("UPDATE simulation_events SET status = 'pending', claimed_at = NULL WHERE status = 'processing'")
     conn.commit()
 
-    cur.execute("SELECT status FROM simulation_events WHERE id = ?", (event.id,))
-    assert cur.fetchone()['status'] == 'pending'
+    cur.execute("SELECT status, claimed_at FROM simulation_events WHERE id = ?", (event.id,))
+    row = cur.fetchone()
+    assert row['status'] == 'pending'
+    assert row['claimed_at'] is None
 
     # 2. No duplicate COMMUNITY_POST scheduling after restart
     engine.schedule(100, server.EventPriority.LOW, 'COMMUNITY_POST', {'community_id': 99}, dedupe_key='COMMUNITY_POST_99', replace_existing=False)

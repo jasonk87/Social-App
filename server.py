@@ -672,7 +672,7 @@ class SimulationEngine:
                 attempts = row['attempts']
                 # Retry up to 3 times
                 if attempts < 3:
-                    # Exponential backoff (e.g., 5s, 10s, 15s)
+                    # Linear backoff: 5s, 10s
                     backoff_delay = attempts * 5
                     new_timestamp = time.time() + backoff_delay
                     conn.execute(
@@ -685,7 +685,7 @@ class SimulationEngine:
                     )
                 else:
                     conn.execute(
-                        "UPDATE simulation_events SET status = 'failed', last_error = ? WHERE id = ?",
+                        "UPDATE simulation_events SET status = 'failed', claimed_at = NULL, last_error = ? WHERE id = ?",
                         (error_msg, event_id)
                     )
                 conn.commit()
@@ -2072,7 +2072,7 @@ def run_server(host: str = 'localhost', port: int = 8080) -> None:
         # Reset any stuck processing events back to pending
         conn = get_db_connection()
         try:
-            conn.execute("UPDATE simulation_events SET status = 'pending' WHERE status = 'processing'")
+            conn.execute("UPDATE simulation_events SET status = 'pending', claimed_at = NULL WHERE status = 'processing'")
             conn.commit()
         finally:
             conn.close()
