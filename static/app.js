@@ -813,20 +813,20 @@ document.addEventListener('DOMContentLoaded', async () => {
     initScrollObserver();
     renderBootState();
     initSSE();
+    populateToneSelect();
 
     try {
         const { current_user } = await fetchJSON('/api/session');
         if (current_user) {
             appState.currentUser = current_user;
             writeCachedSession(current_user);
-            await refreshApp();
+            renderAuthOptions([current_user]);
+            renderSessionState();
         } else {
-            populateToneSelect();
             await loadModels();
             await loadSession();
         }
     } catch (err) {
-        populateToneSelect();
         await loadModels();
         await loadSession();
     }

@@ -652,9 +652,15 @@ async function loadFeed(name, options = {}) {
         renderDOM = true,
     } = options;
     const previousScrollY = preserveScroll ? window.scrollY : null;
+    const hash = window.location.hash.replace('#', '').trim();
+    const targetPostMatch = hash.match(/^post-(\d+)$/);
+    const targetPostId = targetPostMatch ? targetPostMatch[1] : '';
+    const requestUrl = targetPostId
+        ? `/api/community/${encodeURIComponent(name)}/feed?target_post_id=${encodeURIComponent(targetPostId)}`
+        : `/api/community/${encodeURIComponent(name)}/feed`;
 
     try {
-        const data = await fetchJSON(`/api/community/${encodeURIComponent(name)}/feed`);
+        const data = await fetchJSON(requestUrl);
         const posts = data.posts || [];
         if (data.community) {
             communityPageState.community = data.community;

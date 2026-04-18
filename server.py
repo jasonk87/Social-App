@@ -15,8 +15,8 @@ engine runs in the background using separate threads.
 To start the server run:
     python3 server.py
 
-By default the server listens on localhost port 8080.  Open a browser
-and navigate to http://localhost:8080/ to access the UI.
+By default the server listens on localhost port 5000.  Open a browser
+and navigate to http://localhost:5000/ to access the UI.
 """
 from __future__ import annotations
 
@@ -1533,11 +1533,42 @@ def build_comments_tree(comments_rows: List[sqlite3.Row]) -> List[Dict[str, Any]
     return comments_tree
 
 
-def fetch_community_feed(community_id: int) -> List[Dict[str, Any]]:
+def fetch_community_feed(community_id: int, target_post_id: Optional[int] = None) -> List[Dict[str, Any]]:
     """Return a list of posts with nested comments for a community."""
     conn = get_db_connection()
     try:
         cur = conn.cursor()
+        post_map: Dict[int, Dict[str, Any]] = {}
+
+        def append_posts(rows: List[sqlite3.Row]) -> None:
+            for p_row in rows:
+                post_id = p_row['post_id']
+                if post_id in post_map:
+                    continue
+                # Fetch comments for this post
+                cur.execute(
+                    """
+                    SELECT comments.id, comments.content, comments.created_at, comments.parent_id,
+                           agents.username AS author, agents.id AS agent_id
+                    FROM comments
+                    JOIN agents ON comments.agent_id = agents.id
+                    WHERE comments.post_id = ?
+                    ORDER BY comments.created_at ASC
+                    """,
+                    (post_id,),
+                )
+                comments_rows = cur.fetchall()
+                comments_tree = build_comments_tree(comments_rows)
+                post_map[post_id] = {
+                    'id': post_id,
+                    'title': p_row['title'],
+                    'content': p_row['content'],
+                    'author': p_row['author'],
+                    'agent_id': p_row['agent_id'],
+                    'created_at': p_row['created_at'],
+                    'comments': comments_tree,
+                }
+
         cur.execute(
             """
             SELECT posts.id as post_id, posts.title, posts.content, posts.created_at,
@@ -1550,33 +1581,25 @@ def fetch_community_feed(community_id: int) -> List[Dict[str, Any]]:
             """,
             (community_id,),
         )
-        posts = []
-        post_rows = cur.fetchall()
-        for p_row in post_rows:
-            post_id = p_row['post_id']
-            # Fetch comments for this post
+        append_posts(cur.fetchall())
+
+        if target_post_id is not None and target_post_id not in post_map:
             cur.execute(
                 """
-                SELECT comments.id, comments.content, comments.created_at, comments.parent_id,
+                SELECT posts.id as post_id, posts.title, posts.content, posts.created_at,
                        agents.username AS author, agents.id AS agent_id
-                FROM comments
-                JOIN agents ON comments.agent_id = agents.id
-                WHERE comments.post_id = ?
-                ORDER BY comments.created_at ASC
+                FROM posts
+                JOIN agents ON posts.agent_id = agents.id
+                WHERE posts.community_id = ? AND posts.id = ?
                 """,
-                (post_id,),
+                (community_id, target_post_id),
             )
-            comments_rows = cur.fetchall()
-            comments_tree = build_comments_tree(comments_rows)
-            posts.append({
-                'id': post_id,
-                'title': p_row['title'],
-                'content': p_row['content'],
-                'author': p_row['author'],
-                'agent_id': p_row['agent_id'],
-                'created_at': p_row['created_at'],
-                'comments': comments_tree,
-            })
+            row = cur.fetchone()
+            if row is not None:
+                append_posts([row])
+
+        posts = list(post_map.values())
+        posts.sort(key=lambda post: post['created_at'], reverse=True)
         return posts
     finally:
         conn.close()
@@ -1865,7 +1888,9 @@ class RequestHandler(BaseHTTPRequestHandler):
                     if row is None:
                         self.respond_json({'error': 'Community not found'}, status=404)
                         return
-                    posts = fetch_community_feed(row['id'])
+                    target_post_id_raw = (query.get('target_post_id', [''])[0] or '').strip()
+                    target_post_id = int(target_post_id_raw) if target_post_id_raw.isdigit() else None
+                    posts = fetch_community_feed(row['id'], target_post_id=target_post_id)
                     self.respond_json({
                         'posts': posts,
                         'community': {
