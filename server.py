@@ -287,11 +287,31 @@ def init_db() -> None:
                 timestamp REAL NOT NULL,
                 priority INTEGER NOT NULL,
                 event_type TEXT NOT NULL,
-                event_data TEXT NOT NULL
+                event_data TEXT NOT NULL,
+                status TEXT DEFAULT 'pending',
+                attempts INTEGER DEFAULT 0,
+                claimed_at REAL,
+                last_error TEXT,
+                dedupe_key TEXT
             )
             """
         )
+
+        sim_event_columns = {row[1] for row in cur.execute("PRAGMA table_info(simulation_events)").fetchall()}
+        if "status" not in sim_event_columns:
+            cur.execute("ALTER TABLE simulation_events ADD COLUMN status TEXT DEFAULT 'pending'")
+        if "attempts" not in sim_event_columns:
+            cur.execute("ALTER TABLE simulation_events ADD COLUMN attempts INTEGER DEFAULT 0")
+        if "claimed_at" not in sim_event_columns:
+            cur.execute("ALTER TABLE simulation_events ADD COLUMN claimed_at REAL")
+        if "last_error" not in sim_event_columns:
+            cur.execute("ALTER TABLE simulation_events ADD COLUMN last_error TEXT")
+        if "dedupe_key" not in sim_event_columns:
+            cur.execute("ALTER TABLE simulation_events ADD COLUMN dedupe_key TEXT")
+
         cur.execute("CREATE INDEX IF NOT EXISTS idx_sim_events_time ON simulation_events (timestamp, priority)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_sim_events_status_time ON simulation_events (status, timestamp, priority)")
+        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_sim_events_dedupe ON simulation_events (dedupe_key) WHERE dedupe_key IS NOT NULL")
 
         # Ensure Human agent exists for the 'You' interactions
         cur.execute("SELECT id FROM agents WHERE username = 'You' AND model = 'none'")
@@ -553,6 +573,7 @@ class SimEvent:
     priority: int
     event_type: str = dataclasses.field(compare=False)
     data: dict = dataclasses.field(compare=False)
+    id: int = dataclasses.field(default=0, compare=False)
 
 class SimulationEngine:
     def __init__(self):
@@ -570,52 +591,117 @@ class SimulationEngine:
         if self._thread is not None and self._thread.is_alive():
             self._thread.join(timeout=2)
 
-    def schedule(self, delay: float, priority: EventPriority, event_type: str, data: dict):
+    def schedule(self, delay: float, priority: EventPriority, event_type: str, data: dict, dedupe_key: str = None, replace_existing: bool = False):
         timestamp = time.time() + delay
         conn = get_db_connection()
         try:
-            conn.execute(
-                "INSERT INTO simulation_events (timestamp, priority, event_type, event_data) VALUES (?, ?, ?, ?)",
-                (timestamp, priority.value, event_type, json.dumps(data))
-            )
+            if dedupe_key:
+                # To support older sqlite without ON CONFLICT (or with UNIQUE index restrictions on UPSERT),
+                # we'll do an explicit select/update/insert
+                cur = conn.cursor()
+                cur.execute("SELECT id FROM simulation_events WHERE dedupe_key = ?", (dedupe_key,))
+                row = cur.fetchone()
+                if row:
+                    if replace_existing:
+                        cur.execute(
+                            """
+                            UPDATE simulation_events
+                            SET timestamp = ?, priority = ?, event_type = ?, event_data = ?, status = 'pending', attempts = 0, last_error = NULL
+                            WHERE id = ?
+                            """,
+                            (timestamp, priority.value, event_type, json.dumps(data), row['id'])
+                        )
+                else:
+                    cur.execute(
+                        "INSERT INTO simulation_events (timestamp, priority, event_type, event_data, dedupe_key, status) VALUES (?, ?, ?, ?, ?, 'pending')",
+                        (timestamp, priority.value, event_type, json.dumps(data), dedupe_key)
+                    )
+            else:
+                conn.execute(
+                    "INSERT INTO simulation_events (timestamp, priority, event_type, event_data, status) VALUES (?, ?, ?, ?, 'pending')",
+                    (timestamp, priority.value, event_type, json.dumps(data))
+                )
             conn.commit()
+        finally:
+            conn.close()
+
+    def _claim_next_due_event(self):
+        conn = get_db_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT id, event_type, event_data FROM simulation_events WHERE status = 'pending' AND timestamp <= ? ORDER BY timestamp ASC, priority ASC LIMIT 1",
+                (time.time(),)
+            )
+            row = cur.fetchone()
+            if row:
+                cur.execute(
+                    "UPDATE simulation_events SET status = 'processing', attempts = attempts + 1, claimed_at = ? WHERE id = ? AND status = 'pending'",
+                    (time.time(), row['id'])
+                )
+                if cur.rowcount > 0:
+                    conn.commit()
+                    return SimEvent(0, 0, row['event_type'], json.loads(row['event_data']), id=row['id'])
+                else:
+                    conn.rollback()
+            return None
+        except Exception as e:
+            print(f"Simulation engine queue error: {e}")
+            return None
+        finally:
+            conn.close()
+
+    def _mark_event_completed(self, event_id: int):
+        conn = get_db_connection()
+        try:
+            conn.execute("UPDATE simulation_events SET status = 'completed' WHERE id = ?", (event_id,))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _mark_event_failed(self, event_id: int, error_msg: str):
+        conn = get_db_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT attempts FROM simulation_events WHERE id = ?", (event_id,))
+            row = cur.fetchone()
+            if row:
+                attempts = row['attempts']
+                # Retry up to 3 times
+                new_status = 'pending' if attempts < 3 else 'failed'
+                conn.execute(
+                    "UPDATE simulation_events SET status = ?, last_error = ? WHERE id = ?",
+                    (new_status, error_msg, event_id)
+                )
+                conn.commit()
         finally:
             conn.close()
 
     def _run(self):
         while not self._stop_event.is_set():
-            event = None
-            conn = get_db_connection()
-            try:
-                # Find the oldest event that is due, ordering by timestamp and then priority (lowest value = highest priority)
-                cur = conn.cursor()
-                cur.execute(
-                    "SELECT id, event_type, event_data FROM simulation_events WHERE timestamp <= ? ORDER BY timestamp ASC, priority ASC LIMIT 1",
-                    (time.time(),)
-                )
-                row = cur.fetchone()
-                if row:
-                    # Attempt to delete the event to "claim" it. In a multi-process environment we might need a more robust transaction,
-                    # but here the single daemon thread logic applies.
-                    cur.execute("DELETE FROM simulation_events WHERE id = ?", (row['id'],))
-                    if cur.rowcount > 0:
-                        conn.commit()
-                        event = SimEvent(0, 0, row['event_type'], json.loads(row['event_data']))
-                    else:
-                        conn.rollback()
-            except Exception as e:
-                print(f"Simulation engine queue error: {e}")
-            finally:
-                conn.close()
-
+            event = self._claim_next_due_event()
             if event:
                 try:
                     if event.event_type == 'COMMUNITY_POST':
                         self._do_community_post(event.data)
                     elif event.event_type == 'AGENT_REPLY':
                         self._do_agent_reply(event.data)
+
+                    # Mark completed *only* if the event isn't already re-scheduled by its own execution.
+                    # e.g., if a community post replaces its own dedupe_key row, marking it completed here
+                    # would accidentally cancel the future heartbeat.
+                    conn = get_db_connection()
+                    try:
+                        cur = conn.cursor()
+                        cur.execute("SELECT status FROM simulation_events WHERE id = ?", (event.id,))
+                        row = cur.fetchone()
+                        if row and row['status'] == 'processing':
+                            self._mark_event_completed(event.id)
+                    finally:
+                        conn.close()
                 except Exception as e:
                     print(f"Simulation engine error processing {event.event_type}: {e}")
+                    self._mark_event_failed(event.id, str(e))
             else:
                 time.sleep(1)
 
@@ -625,8 +711,15 @@ class SimulationEngine:
         if not sim:
             return
 
-        # Schedule the next heartbeat
-        self.schedule(sim.effective_posting_rate(), EventPriority.LOW, 'COMMUNITY_POST', {'community_id': community_id})
+        # Schedule the next heartbeat. We replace any existing one to prevent overlap.
+        self.schedule(
+            sim.effective_posting_rate(),
+            EventPriority.LOW,
+            'COMMUNITY_POST',
+            {'community_id': community_id},
+            dedupe_key=f"COMMUNITY_POST_{community_id}",
+            replace_existing=True
+        )
 
         # Step logic ...
         # Phase 1: Read needed state from DB
@@ -1961,10 +2054,10 @@ def run_server(host: str = 'localhost', port: int = 8080) -> None:
     httpd = ThreadingHTTPServer((host, port), RequestHandler)
     print(f"Serving on http://{host}:{port}")
     try:
-        # Clear any pending COMMUNITY_POST events to avoid overlapping timers across restarts
+        # Reset any stuck processing events back to pending
         conn = get_db_connection()
         try:
-            conn.execute("DELETE FROM simulation_events WHERE event_type = 'COMMUNITY_POST'")
+            conn.execute("UPDATE simulation_events SET status = 'pending' WHERE status = 'processing'")
             conn.commit()
         finally:
             conn.close()
@@ -1972,11 +2065,18 @@ def run_server(host: str = 'localhost', port: int = 8080) -> None:
         # Start the central simulation engine
         ENGINE.start()
         
-        # Auto-boot all communities on startup by scheduling their heartbeats
+        # Auto-boot all communities on startup by scheduling their heartbeats.
+        # We use dedupe_key + replace_existing=False so that if a community
+        # already has a pending event, we don't duplicate it or override its timestamp.
+        # However, if it exists but is 'completed' or 'failed', we DO want to replace it
+        # to ensure the community boots.
         conn = get_db_connection()
         try:
             # Mark all as active for the UI
             conn.execute("UPDATE communities SET active = 1")
+
+            # Reset any terminal community post events so replace_existing=False works below
+            conn.execute("DELETE FROM simulation_events WHERE event_type = 'COMMUNITY_POST' AND status IN ('completed', 'failed')")
             conn.commit()
             
             cur = conn.cursor()
@@ -1994,7 +2094,14 @@ def run_server(host: str = 'localhost', port: int = 8080) -> None:
                     row['style_notes'],
                 )
                 SIMULATIONS[comm_id] = sim
-                ENGINE.schedule(start_delay, EventPriority.LOW, 'COMMUNITY_POST', {'community_id': comm_id})
+                ENGINE.schedule(
+                    start_delay,
+                    EventPriority.LOW,
+                    'COMMUNITY_POST',
+                    {'community_id': comm_id},
+                    dedupe_key=f"COMMUNITY_POST_{comm_id}",
+                    replace_existing=False
+                )
                 start_delay += 2 # stagger start times
         finally:
             conn.close()

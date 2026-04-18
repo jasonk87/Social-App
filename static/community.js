@@ -779,9 +779,7 @@ document.addEventListener('DOMContentLoaded', () => {
         updateNotificationButtons(name);
     });
 
-    setInterval(() => {
-        window.loadCommunityData();
-    }, 15000);
+    // Remove 15-second polling interval. We now rely primarily on SSE for freshness.
 
     window.loadCommunityData = async function() {
         const titleVal = document.getElementById('new-post-title').value.trim();

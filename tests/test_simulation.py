@@ -38,24 +38,70 @@ def test_simulation_pop_order():
     conn.commit()
     conn.close()
 
-    # We will manually trigger the pop logic from _run
+    # We will use the new claim logic
     def pop_next():
-        conn = server.get_db_connection()
-        try:
-            cur = conn.cursor()
-            cur.execute(
-                "SELECT id, event_type, event_data FROM simulation_events WHERE timestamp <= ? ORDER BY timestamp ASC, priority ASC LIMIT 1",
-                (time.time(),)
-            )
-            row = cur.fetchone()
-            if row:
-                cur.execute("DELETE FROM simulation_events WHERE id = ?", (row['id'],))
-                conn.commit()
-                return row['event_type']
-            return None
-        finally:
-            conn.close()
+        event = engine._claim_next_due_event()
+        return event.event_type if event else None
 
     assert pop_next() == 'EVENT_3' # Oldest
     assert pop_next() == 'EVENT_1' # Tied for time, HIGH priority
     assert pop_next() == 'EVENT_2' # Tied for time, LOW priority
+
+
+def test_simulation_dedupe_replace():
+    engine = server.SimulationEngine()
+
+    # Schedule first event
+    engine.schedule(50, server.EventPriority.LOW, 'EVENT_DUP', {'v': 1}, dedupe_key='key1', replace_existing=True)
+
+    # Schedule replacement event with same key but different priority and data
+    engine.schedule(10, server.EventPriority.HIGH, 'EVENT_DUP', {'v': 2}, dedupe_key='key1', replace_existing=True)
+
+    conn = server.get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM simulation_events WHERE dedupe_key = 'key1'")
+    rows = cur.fetchall()
+    conn.close()
+
+    assert len(rows) == 1
+    assert rows[0]['priority'] == server.EventPriority.HIGH.value
+    data = json.loads(rows[0]['event_data'])
+    assert data['v'] == 2
+
+
+def test_simulation_lifecycle():
+    engine = server.SimulationEngine()
+
+    # Schedule an event due immediately
+    engine.schedule(-10, server.EventPriority.HIGH, 'LIFECYCLE_TEST', {})
+
+    conn = server.get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT id, status FROM simulation_events WHERE event_type = 'LIFECYCLE_TEST'")
+    row = cur.fetchone()
+    assert row['status'] == 'pending'
+
+    # Claim it
+    event = engine._claim_next_due_event()
+    assert event is not None
+    assert event.event_type == 'LIFECYCLE_TEST'
+
+    cur.execute("SELECT status, attempts, claimed_at FROM simulation_events WHERE id = ?", (event.id,))
+    row = cur.fetchone()
+    assert row['status'] == 'processing'
+    assert row['attempts'] == 1
+    assert row['claimed_at'] is not None
+
+    # Mark it failed
+    engine._mark_event_failed(event.id, "some error")
+    cur.execute("SELECT status, last_error FROM simulation_events WHERE id = ?", (event.id,))
+    row = cur.fetchone()
+    assert row['status'] == 'pending' # still under 3 attempts
+    assert row['last_error'] == 'some error'
+
+    # Mark it completed
+    engine._mark_event_completed(event.id)
+    cur.execute("SELECT status FROM simulation_events WHERE id = ?", (event.id,))
+    row = cur.fetchone()
+    assert row['status'] == 'completed'
+    conn.close()
