@@ -59,7 +59,7 @@
                             <p class="eyebrow">Timeline</p>
                             <h2>Latest activity</h2>
                         </div>
-                        <p class="section-copy">Refreshes every 15 seconds while you are idle.</p>
+                        <p class="section-copy">Live automatic updates via SSE.</p>
                     </div>
                     <div class="panel notification-panel">
                         <div class="notification-panel-copy">
@@ -69,6 +69,23 @@
                         <div class="notification-actions">
                             <button id="sound-toggle-btn" type="button" class="btn-text">Sound off</button>
                             <button id="browser-toggle-btn" type="button" class="btn-text">Browser alerts off</button>
+                        </div>
+                    </div>
+
+                    <div class="panel" id="community-state-panel" style="display: none; margin-top: 1rem;">
+                        <div style="display: flex; gap: 1rem; align-items: center; justify-content: space-between; flex-wrap: wrap;">
+                            <div>
+                                <strong style="display: block; font-size: 0.875rem;">Community State</strong>
+                                <span style="font-size: 0.75rem; color: var(--color-gray-500);">Current simulation variables</span>
+                            </div>
+                            <div style="display: flex; gap: 1rem; font-size: 0.875rem;">
+                                <div><i data-lucide="zap" style="width: 14px; height: 14px; vertical-align: -2px;"></i> <span id="state-energy">1.0</span></div>
+                                <div><i data-lucide="smile" style="width: 14px; height: 14px; vertical-align: -2px;"></i> <span id="state-mood">0.0</span></div>
+                                <div><i data-lucide="swords" style="width: 14px; height: 14px; vertical-align: -2px;"></i> <span id="state-conflict">0.0</span></div>
+                            </div>
+                        </div>
+                        <div style="margin-top: 0.5rem; font-size: 0.75rem; color: var(--color-gray-600);">
+                            <strong>Top topics: </strong> <span id="state-topics">None</span>
                         </div>
                     </div>
                     <div id="feed" class="feed-list" aria-live="polite"></div>

@@ -201,8 +201,6 @@ def init_db() -> None:
             cur.execute("ALTER TABLE communities ADD COLUMN novelty_pressure REAL DEFAULT 0.5")
         if "current_topics" not in community_columns:
             cur.execute("ALTER TABLE communities ADD COLUMN current_topics TEXT DEFAULT '[]'")
-        if "recent_summary" not in community_columns:
-            cur.execute("ALTER TABLE communities ADD COLUMN recent_summary TEXT DEFAULT ''")
 
         cur.execute("UPDATE communities SET tone = ? WHERE tone IS NULL OR TRIM(tone) = ''", (DEFAULT_COMMUNITY_TONE,))
         cur.execute("UPDATE communities SET style_notes = '' WHERE style_notes IS NULL")
@@ -1064,10 +1062,11 @@ class SimulationEngine:
         # Slowly increase novelty pressure if topics stagnate
         sim.novelty_pressure = min(1.0, sim.novelty_pressure + 0.05)
 
-        # Decay all active topics
+        # Decay all active topics. Higher trendiness means faster decay.
+        decay_factor = max(0.5, 0.9 - (sim.trendiness * 0.3))
         topic_dict = {t['topic']: t['weight'] for t in sim.current_topics}
         for topic in topic_dict:
-            topic_dict[topic] *= 0.8
+            topic_dict[topic] *= decay_factor
 
         # Keep top 10 alive
         updated_topics = [{"topic": k, "weight": v} for k, v in topic_dict.items() if v > 0.1]
@@ -1092,7 +1091,7 @@ class SimulationEngine:
 ENGINE = SimulationEngine()
 
 class Simulation:
-    def __init__(self, community_id: int, name: str, description: str, model: str, posting_rate: int, tone: str = DEFAULT_COMMUNITY_TONE, style_notes: str = "", mood: float = 0.0, conflict_level: float = 0.0, energy: float = 1.0, trendiness: float = 0.5, novelty_pressure: float = 0.5, current_topics: str = "[]", recent_summary: str = ""):
+    def __init__(self, community_id: int, name: str, description: str, model: str, posting_rate: int, tone: str = DEFAULT_COMMUNITY_TONE, style_notes: str = "", mood: float = 0.0, conflict_level: float = 0.0, energy: float = 1.0, trendiness: float = 0.5, novelty_pressure: float = 0.5, current_topics: str = "[]"):
         self.community_id = community_id
         self.name = name
         self.description = description or name
@@ -1107,7 +1106,6 @@ class Simulation:
         self.energy = float(energy) if energy is not None else 1.0
         self.trendiness = float(trendiness) if trendiness is not None else 0.5
         self.novelty_pressure = float(novelty_pressure) if novelty_pressure is not None else 0.5
-        self.recent_summary = recent_summary or ""
         try:
             self.current_topics = json.loads(current_topics) if current_topics else []
         except:
@@ -1760,16 +1758,26 @@ class RequestHandler(BaseHTTPRequestHandler):
                 if len(parts) == 2:
                     try:
                         c_id = int(parts[1])
-                        sim = SIMULATIONS.get(c_id)
-                        if sim:
-                            self.respond_json({
-                                'mood': sim.mood,
-                                'conflict_level': sim.conflict_level,
-                                'energy': sim.energy,
-                                'top_topics': sim.current_topics
-                            })
-                        else:
-                            self.respond_json({'error': 'Community not found'}, status=404)
+                        conn = get_db_connection()
+                        try:
+                            cur = conn.cursor()
+                            cur.execute("SELECT mood, conflict_level, energy, current_topics FROM communities WHERE id = ?", (c_id,))
+                            row = cur.fetchone()
+                            if row:
+                                try:
+                                    topics = json.loads(row['current_topics']) if row['current_topics'] else []
+                                except:
+                                    topics = []
+                                self.respond_json({
+                                    'mood': row['mood'],
+                                    'conflict_level': row['conflict_level'],
+                                    'energy': row['energy'],
+                                    'top_topics': topics
+                                })
+                            else:
+                                self.respond_json({'error': 'Community not found'}, status=404)
+                        finally:
+                            conn.close()
                     except ValueError:
                         self.respond_json({'error': 'Invalid community ID'}, status=400)
                 else:
@@ -2033,7 +2041,22 @@ class RequestHandler(BaseHTTPRequestHandler):
                 # Immediately register the simulation and schedule its first heartbeat in the central engine
                 sim = Simulation(community_id, name, description, model, posting_rate, tone, style_notes)
                 SIMULATIONS[community_id] = sim
-                ENGINE.schedule(5, EventPriority.LOW, 'COMMUNITY_POST', {'community_id': community_id})
+                ENGINE.schedule(
+                    5,
+                    EventPriority.LOW,
+                    'COMMUNITY_POST',
+                    {'community_id': community_id},
+                    dedupe_key=f"COMMUNITY_POST_{community_id}",
+                    replace_existing=False
+                )
+                ENGINE.schedule(
+                    60,
+                    EventPriority.LOW,
+                    'COMMUNITY_DRIFT',
+                    {'community_id': community_id},
+                    dedupe_key=f"COMMUNITY_DRIFT_{community_id}",
+                    replace_existing=False
+                )
                 
                 self.respond_json({'success': True, 'community_id': community_id})
             elif path.startswith('community/') and path.endswith('/update'):
@@ -2303,8 +2326,7 @@ def run_server(host: str = 'localhost', port: int = 8080) -> None:
                     row['energy'],
                     row['trendiness'],
                     row['novelty_pressure'],
-                    row['current_topics'],
-                    row['recent_summary']
+                    row['current_topics']
                 )
                 SIMULATIONS[comm_id] = sim
                 ENGINE.schedule(

@@ -225,3 +225,77 @@ def test_community_state_update():
     assert sim.energy < 2.0
     assert sim.mood > -0.5
     assert sim.conflict_level < 0.5
+
+def test_community_state_endpoint_offline():
+    # Insert dummy community and some state
+    conn = server.get_db_connection()
+    cur = conn.cursor()
+    cur.execute("INSERT INTO communities (name, mood, conflict_level, energy, current_topics) VALUES ('offline_test_comm', 0.8, 0.4, 2.5, '[{\"topic\": \"xyz\", \"weight\": 1.0}]')")
+    comm_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+
+    # Clear SIMULATIONS in-memory map to simulate an offline or not-yet-booted server state
+    server.SIMULATIONS.clear()
+
+    class DummyHandler:
+        def __init__(self):
+            self.headers = {}
+            self.responses = []
+            self.status_code = None
+
+        def send_response(self, code):
+            self.status_code = code
+
+        def send_header(self, k, v):
+            pass
+
+        def end_headers(self):
+            pass
+
+        def wfile_write(self, data):
+            self.responses.append(data)
+
+        # Inject wfile object
+        class WFile:
+            def __init__(self, parent):
+                self.parent = parent
+            def write(self, data):
+                self.parent.wfile_write(data)
+
+        def get_wfile(self):
+            return self.WFile(self)
+
+    # Since RequestHandler requires an active socket connection during init,
+    # we'll create a lightweight mock of the class just to call handle_api_get directly.
+    class MockHandler(server.RequestHandler):
+        def __init__(self):
+            # Skip the actual BaseHTTPRequestHandler init that needs a socket
+            self.headers = {}
+            self.captured_data = None
+            self.captured_status = None
+
+        def respond_json(self, data, status=200, extra_headers=None):
+            self.captured_data = data
+            self.captured_status = status
+
+        def get_current_user(self):
+            return None # Not needed for community_state
+
+    handler = MockHandler()
+
+    class MockParsed:
+        def __init__(self, path):
+            self.path = path
+            self.query = ""
+
+    handler.handle_api_get(MockParsed(f"/api/community_state/{comm_id}"))
+
+    assert handler.captured_status is None or handler.captured_status == 200
+    captured_data = handler.captured_data
+    assert captured_data is not None
+    assert captured_data['mood'] == 0.8
+    assert captured_data['conflict_level'] == 0.4
+    assert captured_data['energy'] == 2.5
+    assert len(captured_data['top_topics']) == 1
+    assert captured_data['top_topics'][0]['topic'] == 'xyz'
