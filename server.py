@@ -280,6 +280,19 @@ def init_db() -> None:
             """
         )
         
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS simulation_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp REAL NOT NULL,
+                priority INTEGER NOT NULL,
+                event_type TEXT NOT NULL,
+                event_data TEXT NOT NULL
+            )
+            """
+        )
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_sim_events_time ON simulation_events (timestamp, priority)")
+
         # Ensure Human agent exists for the 'You' interactions
         cur.execute("SELECT id FROM agents WHERE username = 'You' AND model = 'none'")
         if not cur.fetchone():
@@ -543,8 +556,6 @@ class SimEvent:
 
 class SimulationEngine:
     def __init__(self):
-        self._queue = []
-        self._lock = threading.Lock()
         self._stop_event = threading.Event()
         self._thread = None
 
@@ -560,16 +571,42 @@ class SimulationEngine:
             self._thread.join(timeout=2)
 
     def schedule(self, delay: float, priority: EventPriority, event_type: str, data: dict):
-        with self._lock:
-            event = SimEvent(time.time() + delay, priority.value, event_type, data)
-            heapq.heappush(self._queue, event)
+        timestamp = time.time() + delay
+        conn = get_db_connection()
+        try:
+            conn.execute(
+                "INSERT INTO simulation_events (timestamp, priority, event_type, event_data) VALUES (?, ?, ?, ?)",
+                (timestamp, priority.value, event_type, json.dumps(data))
+            )
+            conn.commit()
+        finally:
+            conn.close()
 
     def _run(self):
         while not self._stop_event.is_set():
             event = None
-            with self._lock:
-                if self._queue and self._queue[0].timestamp <= time.time():
-                    event = heapq.heappop(self._queue)
+            conn = get_db_connection()
+            try:
+                # Find the oldest event that is due, ordering by timestamp and then priority (lowest value = highest priority)
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT id, event_type, event_data FROM simulation_events WHERE timestamp <= ? ORDER BY timestamp ASC, priority ASC LIMIT 1",
+                    (time.time(),)
+                )
+                row = cur.fetchone()
+                if row:
+                    # Attempt to delete the event to "claim" it. In a multi-process environment we might need a more robust transaction,
+                    # but here the single daemon thread logic applies.
+                    cur.execute("DELETE FROM simulation_events WHERE id = ?", (row['id'],))
+                    if cur.rowcount > 0:
+                        conn.commit()
+                        event = SimEvent(0, 0, row['event_type'], json.loads(row['event_data']))
+                    else:
+                        conn.rollback()
+            except Exception as e:
+                print(f"Simulation engine queue error: {e}")
+            finally:
+                conn.close()
 
             if event:
                 try:
@@ -1167,6 +1204,7 @@ def add_post(community_id: int, agent_id: int, title: str, content: str) -> int:
         )
         post_id = cur.lastrowid
         conn.commit()
+        broadcast_sse('new_post', {'post_id': post_id, 'community_id': community_id})
         return post_id
     finally:
         conn.close()
@@ -1181,7 +1219,12 @@ def add_comment(post_id: int, agent_id: int, parent_id: Optional[int], content: 
             (post_id, agent_id, parent_id, content, time.time()),
         )
         comment_id = cur.lastrowid
+        cur.execute("SELECT community_id FROM posts WHERE id = ?", (post_id,))
+        p_row = cur.fetchone()
+        community_id = p_row['community_id'] if p_row else None
         conn.commit()
+        if community_id is not None:
+            broadcast_sse('new_comment', {'comment_id': comment_id, 'post_id': post_id, 'community_id': community_id})
         return comment_id
     finally:
         conn.close()
@@ -1327,6 +1370,19 @@ def fetch_home_feed(user_id: int, sort: str = "latest") -> List[Dict[str, Any]]:
 
 STATIC_DIR = os.path.join(os.path.dirname(__file__), 'static')
 
+# Global list of SSE queues
+SSE_CLIENTS: List[queue.Queue] = []
+SSE_LOCK = threading.Lock()
+
+def broadcast_sse(event_type: str, data: dict):
+    message = f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
+    with SSE_LOCK:
+        for q in SSE_CLIENTS:
+            try:
+                q.put_nowait(message)
+            except queue.Full:
+                pass
+
 
 class RequestHandler(BaseHTTPRequestHandler):
     server_version = "SocialApp/0.1"
@@ -1382,7 +1438,40 @@ class RequestHandler(BaseHTTPRequestHandler):
         query = parse_qs(parsed.query)
         current_user = self.get_current_user()
         try:
-            if path == 'session':
+            if path == 'stream':
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/event-stream')
+                self.send_header('Cache-Control', 'no-cache')
+                self.send_header('Connection', 'keep-alive')
+                self.end_headers()
+
+                q = queue.Queue(maxsize=100)
+                with SSE_LOCK:
+                    SSE_CLIENTS.append(q)
+
+                try:
+                    # Send an initial ping so the client knows it connected
+                    self.wfile.write(b": ping\n\n")
+                    self.wfile.flush()
+                    while True:
+                        try:
+                            # Use a timeout so we can periodically check if the client disconnected
+                            message = q.get(timeout=15)
+                            self.wfile.write(message.encode('utf-8'))
+                            self.wfile.flush()
+                        except queue.Empty:
+                            # Send a keep-alive ping
+                            self.wfile.write(b": ping\n\n")
+                            self.wfile.flush()
+                except Exception as e:
+                    # Client disconnected or network error
+                    pass
+                finally:
+                    with SSE_LOCK:
+                        if q in SSE_CLIENTS:
+                            SSE_CLIENTS.remove(q)
+                return
+            elif path == 'session':
                 self.respond_json({
                     'current_user': (
                         {
@@ -1872,6 +1961,14 @@ def run_server(host: str = 'localhost', port: int = 8080) -> None:
     httpd = ThreadingHTTPServer((host, port), RequestHandler)
     print(f"Serving on http://{host}:{port}")
     try:
+        # Clear any pending COMMUNITY_POST events to avoid overlapping timers across restarts
+        conn = get_db_connection()
+        try:
+            conn.execute("DELETE FROM simulation_events WHERE event_type = 'COMMUNITY_POST'")
+            conn.commit()
+        finally:
+            conn.close()
+
         # Start the central simulation engine
         ENGINE.start()
         
@@ -1912,4 +2009,4 @@ def run_server(host: str = 'localhost', port: int = 8080) -> None:
 
 
 if __name__ == '__main__':
-    run_server(host='0.0.0.0', port=3000)
+    run_server(host='0.0.0.0', port=5000)

@@ -379,6 +379,7 @@ function renderSessionState() {
             <strong>${escapeHTML(appState.currentUser.display_name)}</strong>
         `;
         navigateTo(appState.activeView || 'feed');
+        refreshApp();
     } else {
         page.dataset.view = 'auth';
         bootShell.hidden = true;
@@ -608,7 +609,11 @@ function renderFeed() {
 }
 
 async function refreshApp() {
-    await Promise.all([loadCommunities(), loadFeed()]);
+    if (appState.activeView === 'feed') {
+        await Promise.all([loadCommunities(), loadFeed()]);
+    } else {
+        await loadCommunities();
+    }
 }
 
 async function handleLogin(event) {
@@ -631,7 +636,7 @@ async function handleLogin(event) {
         document.getElementById('login-pin').value = '';
         await loadSession();
         if (appState.currentUser) {
-            await mountApp();
+            await refreshApp();
         }
     } catch (err) {
         error.textContent = err.message;
@@ -779,16 +784,52 @@ async function toggleSubscription(name, subscribed) {
     await refreshApp();
 }
 
+function initSSE() {
+    const eventSource = new EventSource('/api/stream');
+    eventSource.addEventListener('new_post', async (event) => {
+        try {
+            const data = JSON.parse(event.data);
+            if (appState.activeView === 'feed') {
+                await loadFeed();
+            } else if (appState.activeView === 'community' && window.communityPageState && window.communityPageState.community && window.communityPageState.community.id === data.community_id) {
+                if (typeof window.loadCommunityData === 'function') {
+                    await window.loadCommunityData();
+                }
+            }
+        } catch (e) {
+            console.error('Failed to parse SSE new_post event', e);
+        }
+    });
+    eventSource.addEventListener('new_comment', async (event) => {
+        try {
+            const data = JSON.parse(event.data);
+            if (appState.activeView === 'feed') {
+                await loadFeed();
+            } else if (appState.activeView === 'community' && window.communityPageState && window.communityPageState.community && window.communityPageState.community.id === data.community_id) {
+                if (typeof window.loadCommunityData === 'function') {
+                    await window.loadCommunityData();
+                }
+            }
+        } catch (e) {
+            console.error('Failed to parse SSE new_comment event', e);
+        }
+    });
+    eventSource.onerror = () => {
+        console.warn('SSE connection lost. It will attempt to reconnect automatically.');
+    };
+}
+
 document.addEventListener('DOMContentLoaded', async () => {
     initScrollObserver();
     renderBootState();
+    initSSE();
 
     try {
         const { current_user } = await fetchJSON('/api/session');
         if (current_user) {
             appState.currentUser = current_user;
             writeCachedSession(current_user);
-            await mountApp();
+            await refreshApp();
         } else {
             populateToneSelect();
             await loadModels();
