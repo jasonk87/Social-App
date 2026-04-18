@@ -430,29 +430,177 @@ def generate_text(model: str, prompt: str, system: Optional[str] = None, max_tok
 # and description.
 #
 
-PERSONA_PROMPT = """
-You are generating a SINGLE unique username and persona description for an AI agent
-participating in an online community. It is CRITICAL that you wildly vary the
-personalities you generate! Make this specific agent a casual fan, a hardcore enthusiast,
-a newcomer asking for help, a salty veteran, a helpful guide, a meme poster, OR a lore master. Pick ONE trait.
-Focus on making them feel like a real Reddit user who is passionate about the community's topic.
-Do NOT make them sound like a computer program, a software engineer debugging a simulation, or overly academic.
+def build_subject_anchors(community_name: str, description: str) -> List[str]:
+    raw = f"{community_name} {description or ''}"
+    acronym_matches = re.findall(r"\b[A-Z]{2,}\b", raw)
+    lower_text = raw.lower()
+    phrase_hints = []
+    for phrase in (
+        "old school",
+        "world wrestling federation",
+        "world championship wrestling",
+        "no man's sky",
+        "computer craft",
+    ):
+        if phrase in lower_text:
+            phrase_hints.append(phrase)
 
-Respond with ONLY ONE JSON object with the following keys:
-  "username": a concise, imaginative alias (no spaces, no punctuation other
-               than underscores). It should feel like an internet handle.
-  "persona": a detailed, 2-sentence description of the character's specific quirks,
-             unique communication style, and perspectives. Avoid mentioning it is an AI.
-Return only the JSON object and no other commentary. Do not return a list.
-"""
+    tokens = re.findall(r"[A-Za-z][A-Za-z']{2,}", raw)
+    stopwords = {
+        "welcome", "place", "about", "thing", "things", "discuss", "discussing", "discussion", "related",
+        "community", "communities", "come", "here", "share", "sharing", "talk", "talking", "general",
+        "friendly", "anything", "goes", "around", "those", "this", "that", "with", "from", "into",
+        "your", "their", "have", "having", "been", "were", "what", "when", "where", "while", "there",
+        "etc", "thing", "stuff", "the", "and", "for", "but", "not", "all", "any", "some", "are",
+        "its", "it's", "our", "you", "ready", "clear", "call", "often", "maybe", "very", "more", "most"
+    }
+    anchors: List[str] = []
+    for item in acronym_matches + phrase_hints + tokens:
+        cleaned = item.strip().lower()
+        if cleaned in stopwords or len(cleaned) < 3:
+            continue
+        if cleaned not in anchors:
+            anchors.append(cleaned)
+    return anchors[:12]
 
 
-def create_persona(model: str) -> Dict[str, str]:
+def format_subject_anchor_text(community_name: str, description: str) -> str:
+    anchors = build_subject_anchors(community_name, description)
+    if not anchors:
+        return community_name
+    return ", ".join(anchors)
+
+
+def infer_community_mode(community_name: str, description: str) -> str:
+    text = f"{community_name} {description or ''}".lower()
+    if any(term in text for term in ("dad joke", "jokes", "humour", "humor", "pun", "funny")):
+        return "humor"
+    if any(term in text for term in ("wrestling", "wwf", "wcw", "wwe", "wrestler", "promo", "match")):
+        return "wrestling"
+    if any(term in text for term in ("minecraft", "roblox", "game", "gaming", "nms", "no man's sky")):
+        return "gaming"
+    if any(term in text for term in ("ollama", "ai agent", "agents", "programming", "computercraft", "llm", "model")):
+        return "tech"
+    return "general"
+
+
+def community_mode_prompt(mode: str) -> str:
+    prompts = {
+        "humor": "This is a joke community. Posts and comments should usually be actual jokes, puns, groaners, one-liners, playful setups, or riffing on someone else's joke. Do not drift into sincere hobby talk unless the joke clearly lands.",
+        "wrestling": "This is a wrestling community. Posts and comments should mention actual wrestlers, matches, feuds, promos, gimmicks, booking decisions, title runs, eras, factions, or backstage stories.",
+        "gaming": "This is a game community. Posts and comments should talk about actual game mechanics, moments, items, maps, quests, builds, patches, strategies, characters, or fan experiences from that game.",
+        "tech": "This is a tech/tool community. Posts and comments should discuss actual tools, models, workflows, setup issues, prompts, hardware, experiments, or concrete usage.",
+        "general": "Stay tightly grounded in the community's stated subject and examples."
+    }
+    return prompts.get(mode, prompts["general"])
+
+
+def persona_requires_refresh(persona: str, community_name: str, description: str) -> bool:
+    text = (persona or "").lower()
+    abstract_terms = {
+        "timeline", "timelines", "artifact", "artifacts", "entropy", "chronos", "cosmic", "geometry",
+        "phase space", "state vector", "oracle", "architects", "signal", "manifold", "topology",
+        "friction", "latency", "systems", "optimization", "observational", "aether", "scribes"
+    }
+    anchors = set(build_subject_anchors(community_name, description))
+    persona_words = set(re.findall(r"[a-z][a-z']{2,}", text))
+    anchor_overlap = len(persona_words & anchors)
+    abstract_hits = sum(1 for term in abstract_terms if term in text)
+    mode = infer_community_mode(community_name, description)
+    foreign_terms = {
+        "humor": {"cpu", "airflow", "benchmarks", "cooling", "temps", "pc", "modding", "latency", "quantization"},
+        "wrestling": {"artifact", "artifacts", "chronos", "oracle", "entropy", "cosmic", "geometry", "phase"},
+        "gaming": {"artifact", "timelines", "entropy", "chronos", "oracle"},
+        "tech": {"dad", "pun", "groaner", "face palm", "wholesome"},
+    }
+    foreign_hits = sum(1 for term in foreign_terms.get(mode, set()) if term in text)
+    if abstract_hits >= 2 and anchor_overlap == 0:
+        return True
+    if anchor_overlap == 0 and foreign_hits >= 1:
+        return True
+    return False
+
+
+def fallback_persona_for_community(community_name: str, description: str, current_username: str = "") -> Dict[str, str]:
+    mode = infer_community_mode(community_name, description)
+    presets = {
+        "humor": [
+            ("punpatrol_dad", "Posts short groan-worthy puns, loves eye-roll humor, and treats every thread like a chance to squeeze in one more terrible joke. They prefer quick setup-punchline bits and playful riffing over sincere off-topic chatter."),
+            ("groanmachine", "Shows up with corny one-liners, fake seriousness, and a deep respect for jokes that are so bad they become good. They like topping a thread with a dumber pun instead of overexplaining it."),
+        ],
+        "wrestling": [
+            ("kayfabe_lifer", "Talks like an old-school wrestling fan who cares about promos, booking, hot crowds, title runs, and which wrestlers really knew how to work a feud. They bring strong opinions about WWF and WCW moments and love arguing over who deserved the bigger push."),
+            ("squaredcirclevet", "Obsesses over classic matches, gimmicks, backstage stories, and whether a legend's aura matched the booking. They sound like someone who can happily debate Goldberg, Sting, Macho Man, Bret, Hogan, or the nWo for hours."),
+        ],
+        "gaming": [
+            ("patchnotegoblin", "Talks like a player who actually plays the game, remembers real moments, and cares about mechanics, builds, maps, and community drama. They prefer concrete stories and tips over vague theorizing."),
+            ("questlog_junkie", "Likes swapping actual gameplay stories, dumb mistakes, favorite moments, and strong opinions about how the game feels to play. They sound like someone posting from lived experience, not from a vague wiki haze."),
+        ],
+        "tech": [
+            ("localstackfan", "Talks in concrete setup details, practical experiments, and firsthand results instead of abstract philosophy. They like comparing workflows, models, tools, and tradeoffs in plain language."),
+            ("promptgremlin", "Likes testing real prompts, configs, hardware choices, and tool behavior, then reporting what actually worked. They are opinionated, specific, and grounded in hands-on tinkering."),
+        ],
+        "general": [
+            ("regular_poster", "Sounds like a normal community regular with clear opinions, recognizable tastes, and a habit of posting about the actual subject of the room. They keep things concrete, conversational, and grounded."),
+        ],
+    }
+    username, persona = random.choice(presets.get(mode, presets["general"]))
+    if current_username and current_username not in {choice[0] for choice in presets.get(mode, [])}:
+        username = current_username
+    return {"username": username, "persona": persona}
+
+
+def refresh_agent_persona_if_needed(agent_id: int, username: str, persona: str, model: str, community_name: str, description: str) -> Dict[str, str]:
+    if not persona_requires_refresh(persona, community_name, description):
+        return {"username": username, "persona": persona}
+
+    try:
+        new_persona = create_persona(model, community_name, description)
+    except Exception:
+        new_persona = fallback_persona_for_community(community_name, description, username)
+    conn = get_db_connection()
+    try:
+        conn.execute(
+            "UPDATE agents SET username = ?, persona = ? WHERE id = ?",
+            (new_persona["username"], new_persona["persona"], agent_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return new_persona
+
+
+def create_persona(model: str, community_name: str, description: str) -> Dict[str, str]:
     """Generate a new AI persona using the specified model.
 
     Returns a dictionary with 'username' and 'persona'.
     """
-    response = generate_text(model, PERSONA_PROMPT)
+    anchor_text = format_subject_anchor_text(community_name, description)
+    mode = infer_community_mode(community_name, description)
+    prompt = f"""
+You are generating a SINGLE unique username and persona description for an AI agent
+participating in the online community "{community_name}".
+Community description: {description}
+Core subject anchors: {anchor_text}
+Community mode guidance: {community_mode_prompt(mode)}
+
+It is CRITICAL that you wildly vary the personalities you generate. Make this specific agent
+a casual fan, hardcore enthusiast, newcomer asking for help, salty veteran, stats nerd,
+storyline obsessive, collector, contrarian, helpful guide, joke poster, or lore/history head.
+
+The persona must be deeply rooted in this exact community subject. If the room is about wrestling,
+the persona should care about wrestlers, matches, promos, booking, eras, feuds, factions, title runs,
+backstage stories, or fan arguments. If the room is about a game, the persona should care about that game.
+Do NOT make them sound like a computer program, philosopher, cosmic poet, software engineer, or abstract systems theorist
+unless the community itself is explicitly about those things.
+
+Respond with ONLY ONE JSON object with the following keys:
+  "username": a concise, imaginative alias (no spaces, no punctuation other than underscores).
+  "persona": a detailed, 2-sentence description of the character's specific quirks, communication style,
+             opinions, and favorite angles within this community's subject matter.
+Return only the JSON object and no other commentary. Do not return a list.
+"""
+    response = generate_text(model, prompt)
     try:
         start = response.find("{")
         end = response.rfind("}")
@@ -480,18 +628,28 @@ def generate_post(model: str, persona: str, community_name: str, description: st
     """
     memory_section = f"\nRecent memories of your interactions:\n{memory}\n" if memory else ""
     state_section = f"\nCurrent Community State:\n{state_context}\n" if state_context else ""
+    subject_anchors = format_subject_anchor_text(community_name, description)
+    mode = infer_community_mode(community_name, description)
     prompt = f"""You are writing a forum post in a community called '{community_name}'.
 Community description: {description}
+Core subject anchors: {subject_anchors}
+Community mode guidance: {community_mode_prompt(mode)}
 Community tone guidance: {tone_guidance(tone, style_notes)}
 Your persona: {persona}{memory_section}{state_section}
 
 It is CRITICAL that your post strongly matches your persona and communication style.
 Make it feel like a real person posting on Reddit, focused heavily on the actual subject matter of the community.
-Discuss gameplay, share tips, talk about features, lore, or ask relevant questions based on the community description.
+Use the community subject anchors above. Talk about specific people, events, mechanics, moments, storylines, items,
+characters, features, factions, matches, rumors, strategies, or opinions that actually belong in this room.
+If this is a fandom/sports/history room, name concrete subjects instead of drifting into abstractions.
 Do NOT talk about buffer overflows, non-Euclidean geometry, simulations, memory allocation, algorithms, latency, bugs in reality, or any computer science jargon unless the community is specifically about computer programming.
+Do NOT drift into vague cosmic language, generic philosophy, or abstract "timeline/signal/entropy" talk unless the community is explicitly about those topics.
 Aggressively vary the formatting and structure. Some posts should be short. Some should be anecdotal. Some should ask questions.
 If you are a storyteller, share a vivid anecdote. If you are a helpful guide, share a step-by-step tip. If you are a debater, challenge a common assumption.
 Avoid generic observations, inflated vocabulary, and long academic padding.
+Bad example for a wrestling room: "Are we even looking at the right timeline?"
+Good example for a wrestling room: strong opinions about Goldberg's streak, Macho Man promos, Sting in WCW, nWo angles, Bret vs Shawn, or old WWF/WCW booking.
+Good example for a dad jokes room: a short pun, groaner, or setup/punchline that would make people roll their eyes.
 
 Produce EXACTLY ONE JSON object with the keys:
   "title": a short, catchy, and highly-opinionated post title that fits your persona.
@@ -512,7 +670,7 @@ Return only the JSON object and no other commentary.
         raise OllamaError(f"Failed to parse post JSON: {e}\nResponse: {response}")
 
 
-def generate_comment(model: str, persona: str, community_name: str, post_title: str, post_content: str, tone: str, style_notes: str = "", memory: str = "", state_context: str = "") -> str:
+def generate_comment(model: str, persona: str, community_name: str, description: str, post_title: str, post_content: str, tone: str, style_notes: str = "", memory: str = "", state_context: str = "") -> str:
     """Generate a comment in reply to a post.
 
     Args:
@@ -527,25 +685,28 @@ def generate_comment(model: str, persona: str, community_name: str, post_title: 
     """
     memory_section = f"\nRecent memories of your interactions:\n{memory}\n" if memory else ""
     state_section = f"\nCurrent Community State:\n{state_context}\n" if state_context else ""
+    mode = infer_community_mode(community_name, description)
     prompt = f"""You are replying to a post in the community '{community_name}'.
+Community mode guidance: {community_mode_prompt(mode)}
 Community tone guidance: {tone_guidance(tone, style_notes)}
 Your persona: {persona}{memory_section}{state_section}
 
-Post title: {post_title}
-Post content: {post_content}
+  Post title: {post_title}
+  Post content: {post_content}
 
-Write a short comment (1-3 sentences, occasionally 4 if needed) heavily adopting your persona. Sound like a real Reddit user participating in the community.
-Disagree, agree, tease, ask a follow-up, or share a bizarre tangent if your persona dictates it. Keep it conversational and specific to the community topic.
-Do NOT talk about buffer overflows, non-Euclidean geometry, simulations, memory allocation, algorithms, latency, bugs in reality, or any computer science jargon unless the community is specifically about computer programming.
-Do not sound like a lecturer, therapist, consultant, or academic unless the community tone explicitly demands it.
-Avoid mentioning that you are an AI or referencing the instructions. Do not output
-JSON, just the comment text.
-"""
+  Write a short comment (1-3 sentences, occasionally 4 if needed) heavily adopting your persona. Sound like a real Reddit user participating in the community.
+  Disagree, agree, tease, ask a follow-up, or share a bizarre tangent if your persona dictates it. Keep it conversational and specific to the community topic.
+  Do NOT talk about buffer overflows, non-Euclidean geometry, simulations, memory allocation, algorithms, latency, bugs in reality, or any computer science jargon unless the community is specifically about computer programming.
+  Do NOT drift into vague philosophy, cosmic metaphors, or generic abstract language.
+  Do not sound like a lecturer, therapist, consultant, or academic unless the community tone explicitly demands it.
+  Avoid mentioning that you are an AI or referencing the instructions. Do not output
+  JSON, just the comment text.
+  """
     comment = generate_text(model, prompt)
     return comment.strip()
 
 
-def generate_comment_reply(model: str, persona: str, community_name: str, parent_comment: str, tone: str, style_notes: str = "", memory: str = "", state_context: str = "") -> str:
+def generate_comment_reply(model: str, persona: str, community_name: str, description: str, parent_comment: str, tone: str, style_notes: str = "", memory: str = "", state_context: str = "") -> str:
     """Generate a comment in reply to another comment.
 
     Args:
@@ -559,19 +720,22 @@ def generate_comment_reply(model: str, persona: str, community_name: str, parent
     """
     memory_section = f"\nRecent memories of your interactions:\n{memory}\n" if memory else ""
     state_section = f"\nCurrent Community State:\n{state_context}\n" if state_context else ""
+    mode = infer_community_mode(community_name, description)
     prompt = f"""You are replying to a comment in the community '{community_name}'.
+Community mode guidance: {community_mode_prompt(mode)}
 Community tone guidance: {tone_guidance(tone, style_notes)}
 Your persona: {persona}{memory_section}{state_section}
 
-Previous comment: {parent_comment}
+  Previous comment: {parent_comment}
 
-Write a short reply (1-3 sentences, occasionally 4 if needed) to the previous comment heavily adopting your persona.
-Debate them, build off their idea, crack a joke, ask a question, or provide a counterpoint. Make it feel like an actual Reddit back-and-forth.
-Do NOT talk about buffer overflows, non-Euclidean geometry, simulations, memory allocation, algorithms, latency, bugs in reality, or any computer science jargon unless the community is specifically about computer programming.
-Avoid bloated wording and avoid turning this into a mini-essay unless the community tone explicitly calls for that.
-Avoid mentioning that you are an AI or referencing the instructions. Do not output
-JSON, just the reply text.
-"""
+  Write a short reply (1-3 sentences, occasionally 4 if needed) to the previous comment heavily adopting your persona.
+  Debate them, build off their idea, crack a joke, ask a question, or provide a counterpoint. Make it feel like an actual Reddit back-and-forth.
+  Do NOT talk about buffer overflows, non-Euclidean geometry, simulations, memory allocation, algorithms, latency, bugs in reality, or any computer science jargon unless the community is specifically about computer programming.
+  Do NOT drift into vague philosophy, cosmic metaphors, or generic abstract language.
+  Avoid bloated wording and avoid turning this into a mini-essay unless the community tone explicitly calls for that.
+  Avoid mentioning that you are an AI or referencing the instructions. Do not output
+  JSON, just the reply text.
+  """
     reply = generate_text(model, prompt)
     return reply.strip()
 
@@ -789,7 +953,7 @@ class SimulationEngine:
         if not agents:
             # If no agents yet, create a couple
             for _ in range(3):
-                persona = create_persona(sim.model)
+                persona = create_persona(sim.model, sim.name, sim.description)
                 agent_id = add_agent(persona['username'], sim.model, persona['persona'])
                 assign_agent_to_community(agent_id, community_id)
                 agents.append({'id': agent_id, 'username': persona['username'], 'persona': persona['persona'], 'model': sim.model, 'memory': None})
@@ -799,7 +963,7 @@ class SimulationEngine:
         make_new_post = post_count < 3 or random.random() < profile["new_post_bias"]
         # 10% chance to introduce a new agent if the population is under 20
         if len(agents) < 20 and random.random() < 0.10:
-            new_persona = create_persona(sim.model)
+            new_persona = create_persona(sim.model, sim.name, sim.description)
             new_agent_id = add_agent(new_persona['username'], sim.model, new_persona['persona'])
             assign_agent_to_community(new_agent_id, community_id)
             agent_row = {'id': new_agent_id, 'username': new_persona['username'], 'persona': new_persona['persona'], 'model': sim.model, 'memory': None}
@@ -808,6 +972,16 @@ class SimulationEngine:
             agent_row = random.choice(agents)
 
         agent_id = agent_row['id']
+        refreshed = refresh_agent_persona_if_needed(
+            agent_id,
+            agent_row['username'],
+            agent_row['persona'],
+            agent_row['model'],
+            sim.name,
+            sim.description,
+        )
+        agent_row['username'] = refreshed['username']
+        agent_row['persona'] = refreshed['persona']
         persona = agent_row['persona']
         model = agent_row['model']
         memory_str = agent_row.get('memory') or ""
@@ -890,7 +1064,7 @@ class SimulationEngine:
                     conn.close()
 
                 if parent_id is not None:
-                    comment_text = generate_comment_reply(model, persona, sim.name, parent_content, sim.tone, sim.style_notes, memory_str, state_ctx)
+                    comment_text = generate_comment_reply(model, persona, sim.name, sim.description, parent_content, sim.tone, sim.style_notes, memory_str, state_ctx)
                     new_comment_id = add_comment(post_id, agent_id, parent_id, comment_text)
                     print(f"[{sim.name}] Added comment reply by {agent_row['username']}")
                     append_memory(f"Replied to a comment '{parent_content}' with: {comment_text}")
@@ -942,7 +1116,7 @@ class SimulationEngine:
                     conn.close()
 
                 if post_id is not None:
-                    comment_text = generate_comment(model, persona, sim.name, title, content, sim.tone, sim.style_notes, memory_str, state_ctx)
+                    comment_text = generate_comment(model, persona, sim.name, sim.description, title, content, sim.tone, sim.style_notes, memory_str, state_ctx)
                     new_comment_id = add_comment(post_id, agent_id, None, comment_text)
                     print(f"[{sim.name}] Added comment by {agent_row['username']}")
                     append_memory(f"Commented on post '{title}' with: {comment_text}")
@@ -1020,7 +1194,7 @@ class SimulationEngine:
 
         state_ctx = _get_state_context()
 
-        reply_text = generate_comment_reply(model, persona, sim.name, parent_comment_text, sim.tone, sim.style_notes, memory_str, state_ctx)
+        reply_text = generate_comment_reply(model, persona, sim.name, sim.description, parent_comment_text, sim.tone, sim.style_notes, memory_str, state_ctx)
         new_comment_id = add_comment(post_id, agent_id, reply_to_comment_id, reply_text)
         print(f"[{sim.name}] Added priority comment reply by {agent_row['username']}")
         append_memory(f"Replied to a comment '{parent_comment_text}' with: {reply_text}")
@@ -1108,7 +1282,7 @@ class Simulation:
         self.trendiness = float(trendiness) if trendiness is not None else 0.5
         self.novelty_pressure = float(novelty_pressure) if novelty_pressure is not None else 0.5
         try:
-            self.current_topics = json.loads(current_topics) if current_topics else []
+            self.current_topics = prune_topic_list(json.loads(current_topics) if current_topics else [])
         except:
             self.current_topics = []
 
@@ -1129,12 +1303,44 @@ def extract_topics(text: str) -> List[str]:
     # Remove basic punctuation
     text = re.sub(r'[^\w\s]', '', text.lower())
     words = text.split()
-    stopwords = {"the", "a", "an", "and", "or", "but", "in", "on", "at", "to", "for", "of", "with", "by", "as", "is", "are", "was", "were", "be", "been", "this", "that", "it", "they", "we", "you", "i", "not", "no", "yes", "all", "any", "some", "can", "will", "would", "should", "could", "have", "has", "had", "do", "does", "did", "from"}
-    keywords = [w for w in words if len(w) > 3 and w not in stopwords]
+    stopwords = {
+        "the", "a", "an", "and", "or", "but", "in", "on", "at", "to", "for", "of", "with", "by", "as", "is", "are",
+        "was", "were", "be", "been", "this", "that", "it", "they", "we", "you", "your", "i", "not", "no", "yes",
+        "all", "any", "some", "can", "will", "would", "should", "could", "have", "has", "had", "do", "does", "did",
+        "from", "just", "like", "look", "true", "really", "very", "more", "most", "much", "many", "less", "still",
+        "about", "into", "than", "then", "them", "their", "there", "here", "what", "when", "where", "which", "while",
+        "because", "also", "even", "ever", "thing", "things", "stuff", "welcome", "place", "discussion", "discussing",
+        "discuss", "community", "communities", "people", "someone", "anyone", "nothing", "everything", "forgotten",
+        "right", "wrong", "maybe", "though", "those", "these", "make", "made", "making", "gets", "getting", "got",
+        "good", "bad", "great", "better", "best", "worst", "feel", "feels", "felt"
+    }
+    keywords = [
+        w for w in words
+        if len(w) > 3
+        and w not in stopwords
+        and not w.isdigit()
+        and re.search(r'[a-z]', w)
+    ]
 
     # Return top 3 most common keywords
     counts = Counter(keywords)
     return [word for word, count in counts.most_common(3)]
+
+
+def prune_topic_list(topics: Any) -> List[Dict[str, Any]]:
+    pruned: List[Dict[str, Any]] = []
+    for item in topics or []:
+        if not isinstance(item, dict):
+            continue
+        topic = str(item.get("topic", "")).strip().lower()
+        weight = float(item.get("weight", 0.0) or 0.0)
+        if weight <= 0:
+            continue
+        if topic not in extract_topics(topic):
+            continue
+        pruned.append({"topic": topic, "weight": weight})
+    pruned.sort(key=lambda entry: entry["weight"], reverse=True)
+    return pruned[:10]
 
 def update_community_state(community_id: int, content: str, is_argumentative: bool = False, is_new_post: bool = False):
     sim = SIMULATIONS.get(community_id)
@@ -1154,8 +1360,7 @@ def update_community_state(community_id: int, content: str, is_argumentative: bo
 
     # Filter out dead topics and sort by weight
     updated_topics = [{"topic": k, "weight": v} for k, v in topic_dict.items() if v > 0.1]
-    updated_topics.sort(key=lambda x: x["weight"], reverse=True)
-    sim.current_topics = updated_topics[:10]  # Keep top 10
+    sim.current_topics = prune_topic_list(updated_topics)
 
     # Update energy and conflict
     if is_new_post:
