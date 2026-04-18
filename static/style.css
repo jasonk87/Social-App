@@ -427,7 +427,7 @@ button:not(.btn-primary, .btn-danger) {
         position: fixed;
         inset: 0 auto 0 0;
         z-index: 100;
-        width: 280px;
+        width: min(86vw, 320px);
         background: var(--bg-body);
         border-right: 1px solid var(--border-strong);
         padding: 1.5rem;
@@ -1628,9 +1628,8 @@ body[data-view="feed"] .home-sidebar {
     font-size: 1rem;
     font-weight: 700;
     margin: 0;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
+    white-space: normal;
+    overflow-wrap: anywhere;
 }
 
 .community-list-meta {
@@ -1724,9 +1723,17 @@ body[data-view="feed"] .home-sidebar {
 
 @media (width <= 720px) {
     .site-header {
-        flex-direction: row; /* Keep it in a row to save space */
-        justify-content: space-between;
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) auto auto;
+        align-items: center;
+        column-gap: 0.6rem;
         padding: 0.6rem 0.85rem;
+    }
+
+    .brand-mark {
+        min-width: 0;
+        gap: 0.55rem;
+        font-size: 0.96rem;
     }
 
     .top-nav {
@@ -1743,6 +1750,27 @@ body[data-view="feed"] .home-sidebar {
         transition: min-height 0.4s var(--transition), padding 0.4s var(--transition);
     }
 
+    .hero-content {
+        gap: 0.8rem;
+        padding: 1rem;
+        justify-content: flex-end;
+    }
+
+    .hero-copy,
+    .section-copy {
+        font-size: 0.95rem;
+    }
+
+    .hero-actions {
+        display: grid;
+        grid-template-columns: 1fr;
+        gap: 0.6rem;
+    }
+
+    .hero-actions > * {
+        width: 100%;
+    }
+
     .is-scrolled .page-hero {
         min-height: 180px;
         padding-top: 1rem;
@@ -1752,6 +1780,50 @@ body[data-view="feed"] .home-sidebar {
         padding: 0.5rem 0 0.75rem;
         margin-bottom: 0.15rem;
         transition: padding 0.4s var(--transition);
+    }
+
+    .feed-header {
+        flex-direction: column;
+        align-items: stretch;
+        gap: 0.85rem;
+    }
+
+    .feed-header-copy {
+        max-width: none;
+        gap: 0.35rem;
+    }
+
+    .feed-header-home h1 {
+        font-size: clamp(1.9rem, 8vw, 2.35rem);
+        line-height: 1.05;
+    }
+
+    .feed-controls {
+        width: 100%;
+        justify-content: stretch;
+    }
+
+    .sort-select-wrap,
+    .feed-sort-select,
+    .search-wrap,
+    .account-chip,
+    .account-menu-trigger {
+        width: 100%;
+    }
+
+    .feed-sort-select,
+    .account-menu-trigger {
+        min-height: 42px;
+    }
+
+    .auth-hero {
+        gap: 0.55rem;
+        padding-top: 1rem;
+    }
+
+    .auth-hero h1 {
+        font-size: clamp(1.75rem, 8vw, 2.2rem);
+        line-height: 1.08;
     }
 
     .is-scrolled .feed-header-home {
@@ -1800,15 +1872,107 @@ body[data-view="feed"] .home-sidebar {
         min-height: 42px;
     }
 
-    .account-chip {
-        width: 100%;
-        justify-content: flex-end;
+    .home-layout-stream {
+        gap: 0.9rem;
+    }
+
+    .home-feed-stage,
+    .home-sidebar-stack {
+        gap: 0.9rem;
+    }
+
+    .community-layout,
+    .agent-band,
+    .workspace-grid,
+    .auth-grid {
+        gap: 0.9rem;
     }
 
     .account-menu {
         left: 0;
         right: 0;
         min-width: 0;
+    }
+
+    .account-chip-label {
+        font-size: 0.84rem;
+    }
+
+    .card-inline-actions,
+    .notification-actions,
+    .modal-actions {
+        width: 100%;
+    }
+
+    .card-inline-actions > *,
+    .notification-actions > * {
+        flex: 1 1 auto;
+    }
+
+    .comment {
+        margin-left: calc(var(--depth, 0) * 0.55rem);
+        padding: 0.85rem 0.85rem 0.85rem 0.95rem;
+    }
+
+    .reply-badge {
+        max-width: 100%;
+    }
+
+    .community-list {
+        gap: 0.5rem;
+    }
+
+    .community-list-item {
+        padding: 0.7rem 0.85rem;
+    }
+
+    .community-list-header,
+    .community-list-meta {
+        align-items: flex-start;
+    }
+
+    .discovery-controls {
+        margin: 1rem 0 1.25rem;
+    }
+
+    .workspace-grid {
+        gap: 1rem;
+    }
+
+    .hero-stats {
+        grid-template-columns: 1fr;
+        gap: 0.55rem;
+    }
+
+    .notification-panel-copy {
+        gap: 0.3rem;
+    }
+
+    .notification-actions {
+        width: 100%;
+    }
+
+    .notification-actions > * {
+        flex: 1 1 100%;
+    }
+
+    .composer-panel input,
+    .composer-panel textarea,
+    .panel-form input,
+    .panel-form textarea,
+    .panel-form select {
+        font-size: 16px;
+    }
+
+    .modal-card {
+        padding: 1rem;
+    }
+
+    .tone-preview,
+    .tone-sample,
+    .reply-form {
+        padding-left: 0.8rem;
+        padding-right: 0.8rem;
     }
 
     .modal-actions {
