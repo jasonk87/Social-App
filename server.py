@@ -382,14 +382,16 @@ def generate_text(model: str, prompt: str, system: Optional[str] = None, max_tok
 PERSONA_PROMPT = """
 You are generating a SINGLE unique username and persona description for an AI agent
 participating in an online community. It is CRITICAL that you wildly vary the
-personalities you generate! Make this specific agent highly technical, overly emotional,
-conspiratorial, tutorial-focused, a storyteller, OR someone who only asks questions. Pick ONE extreme trait.
+personalities you generate! Make this specific agent a casual fan, a hardcore enthusiast,
+a newcomer asking for help, a salty veteran, a helpful guide, a meme poster, OR a lore master. Pick ONE trait.
+Focus on making them feel like a real Reddit user who is passionate about the community's topic.
+Do NOT make them sound like a computer program, a software engineer debugging a simulation, or overly academic.
 
 Respond with ONLY ONE JSON object with the following keys:
   "username": a concise, imaginative alias (no spaces, no punctuation other
                than underscores). It should feel like an internet handle.
   "persona": a detailed, 2-sentence description of the character's specific quirks,
-             unique communication style, and extreme perspectives. Avoid mentioning it is an AI.
+             unique communication style, and perspectives. Avoid mentioning it is an AI.
 Return only the JSON object and no other commentary. Do not return a list.
 """
 
@@ -432,9 +434,11 @@ Community tone guidance: {tone_guidance(tone, style_notes)}
 Your persona: {persona}{memory_section}
 
 It is CRITICAL that your post strongly matches your persona and communication style.
-Make it feel like a real person posting online, not an essay or whitepaper.
+Make it feel like a real person posting on Reddit, focused heavily on the actual subject matter of the community.
+Discuss gameplay, share tips, talk about features, lore, or ask relevant questions based on the community description.
+Do NOT talk about buffer overflows, non-Euclidean geometry, simulations, memory allocation, algorithms, latency, bugs in reality, or any computer science jargon unless the community is specifically about computer programming.
 Aggressively vary the formatting and structure. Some posts should be short. Some should be anecdotal. Some should ask questions.
-If you are a storyteller, share a vivid anecdote. If you are a tutorial-maker, share a step-by-step tip. If you are a debater, challenge a common assumption.
+If you are a storyteller, share a vivid anecdote. If you are a helpful guide, share a step-by-step tip. If you are a debater, challenge a common assumption.
 Avoid generic observations, inflated vocabulary, and long academic padding.
 
 Produce EXACTLY ONE JSON object with the keys:
@@ -477,8 +481,9 @@ Your persona: {persona}{memory_section}
 Post title: {post_title}
 Post content: {post_content}
 
-Write a short comment (1-3 sentences, occasionally 4 if needed) heavily adopting your persona. Sound like a real participant.
-Disagree, agree, tease, ask a follow-up, or share a bizarre tangent if your persona dictates it. Keep it conversational and specific.
+Write a short comment (1-3 sentences, occasionally 4 if needed) heavily adopting your persona. Sound like a real Reddit user participating in the community.
+Disagree, agree, tease, ask a follow-up, or share a bizarre tangent if your persona dictates it. Keep it conversational and specific to the community topic.
+Do NOT talk about buffer overflows, non-Euclidean geometry, simulations, memory allocation, algorithms, latency, bugs in reality, or any computer science jargon unless the community is specifically about computer programming.
 Do not sound like a lecturer, therapist, consultant, or academic unless the community tone explicitly demands it.
 Avoid mentioning that you are an AI or referencing the instructions. Do not output
 JSON, just the comment text.
@@ -507,7 +512,8 @@ Your persona: {persona}{memory_section}
 Previous comment: {parent_comment}
 
 Write a short reply (1-3 sentences, occasionally 4 if needed) to the previous comment heavily adopting your persona.
-Debate them, build off their idea, crack a joke, ask a question, or provide a counterpoint. Make it feel like an actual back-and-forth.
+Debate them, build off their idea, crack a joke, ask a question, or provide a counterpoint. Make it feel like an actual Reddit back-and-forth.
+Do NOT talk about buffer overflows, non-Euclidean geometry, simulations, memory allocation, algorithms, latency, bugs in reality, or any computer science jargon unless the community is specifically about computer programming.
 Avoid bloated wording and avoid turning this into a mini-essay unless the community tone explicitly calls for that.
 Avoid mentioning that you are an AI or referencing the instructions. Do not output
 JSON, just the reply text.
@@ -1503,11 +1509,30 @@ class RequestHandler(BaseHTTPRequestHandler):
                         agent_data = dict(agent_row)
                         
                         # Fetch recent posts by this agent
-                        cur.execute("SELECT id, title, content, created_at, community_id FROM posts WHERE agent_id = ? ORDER BY created_at DESC LIMIT 20", (agent_id,))
+                        cur.execute(
+                            """
+                            SELECT posts.id, posts.title, posts.content, posts.created_at, posts.community_id, communities.name AS community_name
+                            FROM posts
+                            JOIN communities ON posts.community_id = communities.id
+                            WHERE posts.agent_id = ?
+                            ORDER BY posts.created_at DESC LIMIT 20
+                            """,
+                            (agent_id,)
+                        )
                         posts = [dict(r) for r in cur.fetchall()]
                         
                         # Fetch recent comments
-                        cur.execute("SELECT id, content, created_at, post_id, parent_id FROM comments WHERE agent_id = ? ORDER BY created_at DESC LIMIT 20", (agent_id,))
+                        cur.execute(
+                            """
+                            SELECT comments.id, comments.content, comments.created_at, comments.post_id, comments.parent_id, posts.community_id, communities.name AS community_name
+                            FROM comments
+                            JOIN posts ON comments.post_id = posts.id
+                            JOIN communities ON posts.community_id = communities.id
+                            WHERE comments.agent_id = ?
+                            ORDER BY comments.created_at DESC LIMIT 20
+                            """,
+                            (agent_id,)
+                        )
                         comments = [dict(r) for r in cur.fetchall()]
                         
                         self.respond_json({'agent': agent_data, 'posts': posts, 'comments': comments})
@@ -1758,13 +1783,16 @@ class RequestHandler(BaseHTTPRequestHandler):
                         if parent_agent_id:
                             cur.execute("SELECT id FROM agents WHERE id = ? AND model != 'none'", (parent_agent_id,))
                             if cur.fetchone():
-                                ENGINE.schedule(random.randint(45, 120), EventPriority.HIGH, 'AGENT_REPLY', {
-                                    'community_id': row['id'],
-                                    'agent_id': parent_agent_id,
-                                    'parent_comment_text': content,
-                                    'post_id': post_id,
-                                    'reply_to_comment_id': comment_id
-                                })
+                                cur.execute("SELECT community_id FROM posts WHERE id = ?", (post_id,))
+                                post_row = cur.fetchone()
+                                if post_row:
+                                    ENGINE.schedule(random.randint(45, 120), EventPriority.HIGH, 'AGENT_REPLY', {
+                                        'community_id': post_row['community_id'],
+                                        'agent_id': parent_agent_id,
+                                        'parent_comment_text': content,
+                                        'post_id': post_id,
+                                        'reply_to_comment_id': comment_id
+                                    })
                     finally:
                         conn.close()
 
@@ -1884,4 +1912,4 @@ def run_server(host: str = 'localhost', port: int = 8080) -> None:
 
 
 if __name__ == '__main__':
-    run_server(host='0.0.0.0', port=5000)
+    run_server(host='0.0.0.0', port=3000)

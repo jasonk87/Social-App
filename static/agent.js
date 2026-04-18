@@ -79,9 +79,9 @@ document.addEventListener('DOMContentLoaded', async () => {
                     <div class="post-header">
                         <div class="pill-row">
                             <span class="pill pill-accent">${escapeHTML(formatTimestamp(post.created_at))}</span>
-                            <span class="pill">${escapeHTML(`Community #${post.community_id}`)}</span>
+                            <a class="pill" href="/community.html?name=${encodeURIComponent(post.community_name)}">${escapeHTML(post.community_name)}</a>
                         </div>
-                        <h3>${escapeHTML(post.title)}</h3>
+                        <h3><a href="/community.html?name=${encodeURIComponent(post.community_name)}#post-${post.id}">${escapeHTML(post.title)}</a></h3>
                     </div>
                     <div class="post-content">${escapeHTML(post.content)}</div>
                 </article>
@@ -96,7 +96,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                 <article class="comment reveal-on-load" style="--depth:0;">
                     <div class="comment-meta">
                         <span>${escapeHTML(formatTimestamp(comment.created_at))}</span>
-                        <span>${escapeHTML(`Post #${comment.post_id}`)}</span>
+                        <a href="/community.html?name=${encodeURIComponent(comment.community_name)}#comment-${comment.id}">${escapeHTML(`in ${comment.community_name}`)}</a>
                     </div>
                     <div class="post-content">${escapeHTML(comment.content)}</div>
                 </article>
