@@ -1692,9 +1692,17 @@ def broadcast_sse(event_type: str, data: dict):
 
 class RequestHandler(BaseHTTPRequestHandler):
     server_version = "SocialApp/0.1"
+    _suppress_access_log = False
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
+        if parsed.path.startswith('/socket.io/'):
+            self._suppress_access_log = True
+            self.send_response(HTTPStatus.NO_CONTENT)
+            self.send_header('Cache-Control', 'no-store')
+            self.send_header('Content-Length', '0')
+            self.end_headers()
+            return
         if parsed.path.startswith('/api/'):
             self.handle_api_get(parsed)
         else:
@@ -1706,6 +1714,11 @@ class RequestHandler(BaseHTTPRequestHandler):
             self.handle_api_post(parsed)
         else:
             self.send_error(HTTPStatus.NOT_FOUND, "Unknown endpoint")
+
+    def log_message(self, format: str, *args) -> None:
+        if getattr(self, '_suppress_access_log', False):
+            return
+        super().log_message(format, *args)
 
     def respond_json(self, data: Any, status: int = 200, extra_headers: Optional[List[tuple[str, str]]] = None) -> None:
         body = json.dumps(data).encode('utf-8')
@@ -2254,9 +2267,6 @@ class RequestHandler(BaseHTTPRequestHandler):
                 pass
 
     def serve_static(self, path: str) -> None:
-        if path.startswith('/socket.io/'):
-            self.send_error(HTTPStatus.NOT_FOUND, "Socket.IO is not supported")
-            return
         # Map '/' to index.html
         if path == '/' or path == '':
             filename = 'index.html'
