@@ -86,22 +86,97 @@ def test_simulation_lifecycle():
     assert event is not None
     assert event.event_type == 'LIFECYCLE_TEST'
 
-    cur.execute("SELECT status, attempts, claimed_at FROM simulation_events WHERE id = ?", (event.id,))
+    cur.execute("SELECT status, attempts, claimed_at, timestamp FROM simulation_events WHERE id = ?", (event.id,))
     row = cur.fetchone()
     assert row['status'] == 'processing'
     assert row['attempts'] == 1
     assert row['claimed_at'] is not None
+    orig_timestamp = row['timestamp']
 
     # Mark it failed
     engine._mark_event_failed(event.id, "some error")
-    cur.execute("SELECT status, last_error FROM simulation_events WHERE id = ?", (event.id,))
+    cur.execute("SELECT status, last_error, timestamp, claimed_at FROM simulation_events WHERE id = ?", (event.id,))
     row = cur.fetchone()
     assert row['status'] == 'pending' # still under 3 attempts
     assert row['last_error'] == 'some error'
+    assert row['claimed_at'] is None
+    assert row['timestamp'] > orig_timestamp # backoff applied
 
-    # Mark it completed
-    engine._mark_event_completed(event.id)
-    cur.execute("SELECT status FROM simulation_events WHERE id = ?", (event.id,))
+    # Claim it again to move to attempts=2
+    event2 = engine._claim_next_due_event()
+    # It won't be claimable immediately because timestamp moved forward, so we hack the timestamp back
+    conn.execute("UPDATE simulation_events SET timestamp = timestamp - 100 WHERE id = ?", (event.id,))
+    conn.commit()
+
+    event2 = engine._claim_next_due_event()
+    assert event2 is not None
+
+    # Fail it up to terminal
+    engine._mark_event_failed(event.id, "error 2") # attempts=2
+
+    # We must claim it again so attempts increments from 2 to 3
+    conn.execute("UPDATE simulation_events SET timestamp = timestamp - 100 WHERE id = ?", (event.id,))
+    conn.commit()
+    engine._claim_next_due_event()
+
+    engine._mark_event_failed(event.id, "error 3") # attempts=3
+    cur.execute("SELECT status, attempts FROM simulation_events WHERE id = ?", (event.id,))
     row = cur.fetchone()
-    assert row['status'] == 'completed'
+    assert row['attempts'] == 3
+    assert row['status'] == 'failed' # Reached terminal failure
+
+    # Verify terminal status dedupe key override behavior
+    engine.schedule(0, server.EventPriority.HIGH, 'TERM_TEST', {}, dedupe_key='term_key', replace_existing=False)
+    # Set to failed
+    conn.execute("UPDATE simulation_events SET status = 'failed' WHERE dedupe_key = 'term_key'")
+    conn.commit()
+
+    # Schedule with replace_existing=False. It SHOULD overwrite because it's terminal.
+    engine.schedule(0, server.EventPriority.HIGH, 'TERM_TEST', {}, dedupe_key='term_key', replace_existing=False)
+    cur.execute("SELECT status, claimed_at FROM simulation_events WHERE dedupe_key = 'term_key'")
+    row = cur.fetchone()
+    assert row['status'] == 'pending'
+    assert row['claimed_at'] is None
+
+    conn.close()
+
+def test_simulation_restart_semantics():
+    engine = server.SimulationEngine()
+
+    # 1. Processing events reset cleanly on restart
+    engine.schedule(-10, server.EventPriority.HIGH, 'STUCK_PROCESS', {})
+    event = engine._claim_next_due_event()
+    assert event is not None
+
+    conn = server.get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT status FROM simulation_events WHERE id = ?", (event.id,))
+    assert cur.fetchone()['status'] == 'processing'
+
+    # Simulate restart logic
+    conn.execute("UPDATE simulation_events SET status = 'pending' WHERE status = 'processing'")
+    conn.commit()
+
+    cur.execute("SELECT status FROM simulation_events WHERE id = ?", (event.id,))
+    assert cur.fetchone()['status'] == 'pending'
+
+    # 2. No duplicate COMMUNITY_POST scheduling after restart
+    engine.schedule(100, server.EventPriority.LOW, 'COMMUNITY_POST', {'community_id': 99}, dedupe_key='COMMUNITY_POST_99', replace_existing=False)
+
+    # Count rows before "restart" schedule
+    cur.execute("SELECT COUNT(*) as count FROM simulation_events WHERE dedupe_key = 'COMMUNITY_POST_99'")
+    assert cur.fetchone()['count'] == 1
+
+    # Simulate restart trying to schedule again
+    engine.schedule(200, server.EventPriority.LOW, 'COMMUNITY_POST', {'community_id': 99}, dedupe_key='COMMUNITY_POST_99', replace_existing=False)
+
+    # Verify no duplicate was added and the timestamp wasn't overridden (it shouldn't replace existing non-terminal)
+    cur.execute("SELECT COUNT(*) as count FROM simulation_events WHERE dedupe_key = 'COMMUNITY_POST_99'")
+    assert cur.fetchone()['count'] == 1
+
+    cur.execute("SELECT timestamp FROM simulation_events WHERE dedupe_key = 'COMMUNITY_POST_99'")
+    # Still the original +100s stamp
+    ts = cur.fetchone()['timestamp']
+    assert ts < time.time() + 150
+
     conn.close()

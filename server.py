@@ -599,14 +599,17 @@ class SimulationEngine:
                 # To support older sqlite without ON CONFLICT (or with UNIQUE index restrictions on UPSERT),
                 # we'll do an explicit select/update/insert
                 cur = conn.cursor()
-                cur.execute("SELECT id FROM simulation_events WHERE dedupe_key = ?", (dedupe_key,))
+                cur.execute("SELECT id, status FROM simulation_events WHERE dedupe_key = ?", (dedupe_key,))
                 row = cur.fetchone()
                 if row:
-                    if replace_existing:
+                    # Overwrite if explicitly requested, OR if the event is terminal (completed/failed)
+                    # We don't want terminal events to permanently poison the dedupe key.
+                    is_terminal = row['status'] in ('completed', 'failed')
+                    if replace_existing or is_terminal:
                         cur.execute(
                             """
                             UPDATE simulation_events
-                            SET timestamp = ?, priority = ?, event_type = ?, event_data = ?, status = 'pending', attempts = 0, last_error = NULL
+                            SET timestamp = ?, priority = ?, event_type = ?, event_data = ?, status = 'pending', attempts = 0, last_error = NULL, claimed_at = NULL
                             WHERE id = ?
                             """,
                             (timestamp, priority.value, event_type, json.dumps(data), row['id'])
@@ -654,7 +657,7 @@ class SimulationEngine:
     def _mark_event_completed(self, event_id: int):
         conn = get_db_connection()
         try:
-            conn.execute("UPDATE simulation_events SET status = 'completed' WHERE id = ?", (event_id,))
+            conn.execute("UPDATE simulation_events SET status = 'completed', claimed_at = NULL WHERE id = ?", (event_id,))
             conn.commit()
         finally:
             conn.close()
@@ -668,11 +671,23 @@ class SimulationEngine:
             if row:
                 attempts = row['attempts']
                 # Retry up to 3 times
-                new_status = 'pending' if attempts < 3 else 'failed'
-                conn.execute(
-                    "UPDATE simulation_events SET status = ?, last_error = ? WHERE id = ?",
-                    (new_status, error_msg, event_id)
-                )
+                if attempts < 3:
+                    # Exponential backoff (e.g., 5s, 10s, 15s)
+                    backoff_delay = attempts * 5
+                    new_timestamp = time.time() + backoff_delay
+                    conn.execute(
+                        """
+                        UPDATE simulation_events
+                        SET status = 'pending', claimed_at = NULL, last_error = ?, timestamp = ?
+                        WHERE id = ?
+                        """,
+                        (error_msg, new_timestamp, event_id)
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE simulation_events SET status = 'failed', last_error = ? WHERE id = ?",
+                        (error_msg, event_id)
+                    )
                 conn.commit()
         finally:
             conn.close()
@@ -2068,15 +2083,11 @@ def run_server(host: str = 'localhost', port: int = 8080) -> None:
         # Auto-boot all communities on startup by scheduling their heartbeats.
         # We use dedupe_key + replace_existing=False so that if a community
         # already has a pending event, we don't duplicate it or override its timestamp.
-        # However, if it exists but is 'completed' or 'failed', we DO want to replace it
-        # to ensure the community boots.
+        # Our updated schedule() logic natively handles replacing terminal rows, so no deletes are needed.
         conn = get_db_connection()
         try:
             # Mark all as active for the UI
             conn.execute("UPDATE communities SET active = 1")
-
-            # Reset any terminal community post events so replace_existing=False works below
-            conn.execute("DELETE FROM simulation_events WHERE event_type = 'COMMUNITY_POST' AND status IN ('completed', 'failed')")
             conn.commit()
             
             cur = conn.cursor()
