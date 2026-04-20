@@ -192,11 +192,58 @@ def init_db() -> None:
         conn.close()
 
 
-def get_db_connection() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    return conn
+import queue
+
+class ConnectionPool:
+    def __init__(self, db_path: str, max_connections: int = 20):
+        self.db_path = db_path
+        self.max_connections = max_connections
+        self.pool: queue.Queue = queue.Queue(maxsize=max_connections)
+
+    def get_connection(self) -> sqlite3.Connection:
+        try:
+            return self.pool.get_nowait()
+        except queue.Empty:
+            conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            conn.row_factory = sqlite3.Row
+            # Enable WAL mode for better concurrency
+            conn.execute("PRAGMA journal_mode = WAL")
+            conn.execute("PRAGMA synchronous = NORMAL")
+            conn.execute("PRAGMA foreign_keys = ON")
+            return conn
+
+    def release_connection(self, conn: sqlite3.Connection) -> None:
+        try:
+            self.pool.put_nowait(conn)
+        except queue.Full:
+            conn.close()
+
+DB_POOL = None
+
+def get_db_connection():
+    global DB_POOL
+    if DB_POOL is None:
+        DB_POOL = ConnectionPool(DB_PATH)
+
+    conn = DB_POOL.get_connection()
+
+    class PooledConnection:
+        def __init__(self, _conn):
+            self._conn = _conn
+
+        def __getattr__(self, item):
+            return getattr(self._conn, item)
+
+        def close(self):
+            DB_POOL.release_connection(self._conn)
+
+        def __enter__(self):
+            return self._conn.__enter__()
+
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            return self._conn.__exit__(exc_type, exc_val, exc_tb)
+
+    return PooledConnection(conn)
 
 
 # -----------------------------------------------------------------------------
@@ -218,15 +265,21 @@ class OllamaError(Exception):
 
 def list_models() -> List[str]:
     """Return a list of model names installed on the local Ollama instance."""
-    try:
-        resp = requests.get(f"{OLLAMA_BASE_URL}/api/tags")
-        if resp.status_code != 200:
-            raise OllamaError(f"list models failed: {resp.status_code} {resp.text}")
-        data = resp.json()
-        models = [item['name'] for item in data.get('models', [])]
-        return models
-    except Exception as e:
-        raise OllamaError(f"Failed to list models: {e}")
+    for attempt in range(3):
+        try:
+            resp = requests.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=10)
+            if resp.status_code != 200:
+                raise OllamaError(f"list models failed: {resp.status_code} {resp.text}")
+            data = resp.json()
+            models = [item['name'] for item in data.get('models', [])]
+            return models
+        except requests.exceptions.Timeout:
+            if attempt == 2:
+                raise OllamaError("Failed to list models: Request timed out")
+            time.sleep(2)
+        except Exception as e:
+            raise OllamaError(f"Failed to list models: {e}")
+    raise OllamaError("Failed to list models: Max retries exceeded")
 
 
 def generate_text(model: str, prompt: str, system: Optional[str] = None, max_tokens: Optional[int] = None) -> str:
@@ -253,14 +306,21 @@ def generate_text(model: str, prompt: str, system: Optional[str] = None, max_tok
         payload['system'] = system
     if max_tokens:
         payload['max_tokens'] = max_tokens
-    try:
-        resp = requests.post(f"{OLLAMA_BASE_URL}/api/generate", json=payload)
-        if resp.status_code != 200:
-            raise OllamaError(f"generate failed: {resp.status_code} {resp.text}")
-        data = resp.json()
-        return data.get('response', '')
-    except Exception as e:
-        raise OllamaError(f"Failed to generate text: {e}")
+
+    for attempt in range(3):
+        try:
+            resp = requests.post(f"{OLLAMA_BASE_URL}/api/generate", json=payload, timeout=60)
+            if resp.status_code != 200:
+                raise OllamaError(f"generate failed: {resp.status_code} {resp.text}")
+            data = resp.json()
+            return data.get('response', '')
+        except requests.exceptions.Timeout:
+            if attempt == 2:
+                raise OllamaError("Failed to generate text: Request timed out")
+            time.sleep(2)
+        except Exception as e:
+            raise OllamaError(f"Failed to generate text: {e}")
+    raise OllamaError("Failed to generate text: Max retries exceeded")
 
 
 # -----------------------------------------------------------------------------
@@ -307,7 +367,7 @@ def create_persona(model: str) -> Dict[str, str]:
         raise OllamaError(f"Failed to parse persona JSON: {e}\nResponse: {response}")
 
 
-def generate_post(model: str, persona: str, community_name: str, description: str, tone: str, style_notes: str = "") -> Dict[str, str]:
+def generate_post(model: str, persona: str, community_name: str, description: str, tone: str, style_notes: str = "", memory: str = "") -> Dict[str, str]:
     """Generate a post title and content for a community.
 
     Args:
@@ -319,16 +379,18 @@ def generate_post(model: str, persona: str, community_name: str, description: st
     Returns:
         A dictionary with 'title' and 'content'.
     """
+    memory_section = f"\nRecent memories of your interactions:\n{memory}\n" if memory else ""
     prompt = f"""You are writing a forum post in a community called '{community_name}'.
 Community description: {description}
 Community tone guidance: {tone_guidance(tone, style_notes)}
-Your persona: {persona}
+Your persona: {persona}{memory_section}
 
 It is CRITICAL that your post strongly matches your persona and communication style.
 Make it feel like a real person posting online, not an essay or whitepaper.
 Aggressively vary the formatting and structure. Some posts should be short. Some should be anecdotal. Some should ask questions.
 If you are a storyteller, share a vivid anecdote. If you are a tutorial-maker, share a step-by-step tip. If you are a debater, challenge a common assumption.
 Avoid generic observations, inflated vocabulary, and long academic padding.
+Use your recent memories to hold grudges, reference past debates, or evolve your perspective if relevant.
 
 Produce EXACTLY ONE JSON object with the keys:
   "title": a short, catchy, and highly-opinionated post title that fits your persona.
@@ -349,7 +411,7 @@ Return only the JSON object and no other commentary.
         raise OllamaError(f"Failed to parse post JSON: {e}\nResponse: {response}")
 
 
-def generate_comment(model: str, persona: str, community_name: str, post_title: str, post_content: str, tone: str, style_notes: str = "") -> str:
+def generate_comment(model: str, persona: str, community_name: str, post_title: str, post_content: str, tone: str, style_notes: str = "", memory: str = "") -> str:
     """Generate a comment in reply to a post.
 
     Args:
@@ -362,15 +424,17 @@ def generate_comment(model: str, persona: str, community_name: str, post_title: 
     Returns:
         A string containing the comment.
     """
+    memory_section = f"\nRecent memories of your interactions:\n{memory}\n" if memory else ""
     prompt = f"""You are replying to a post in the community '{community_name}'.
 Community tone guidance: {tone_guidance(tone, style_notes)}
-Your persona: {persona}
+Your persona: {persona}{memory_section}
 
 Post title: {post_title}
 Post content: {post_content}
 
 Write a short comment (1-3 sentences, occasionally 4 if needed) heavily adopting your persona. Sound like a real participant.
 Disagree, agree, tease, ask a follow-up, or share a bizarre tangent if your persona dictates it. Keep it conversational and specific.
+Use your recent memories to hold grudges, reference past debates, or evolve your perspective if relevant.
 Do not sound like a lecturer, therapist, consultant, or academic unless the community tone explicitly demands it.
 Avoid mentioning that you are an AI or referencing the instructions. Do not output
 JSON, just the comment text.
@@ -379,7 +443,7 @@ JSON, just the comment text.
     return comment.strip()
 
 
-def generate_comment_reply(model: str, persona: str, community_name: str, parent_comment: str, tone: str, style_notes: str = "") -> str:
+def generate_comment_reply(model: str, persona: str, community_name: str, parent_comment: str, tone: str, style_notes: str = "", memory: str = "") -> str:
     """Generate a comment in reply to another comment.
 
     Args:
@@ -391,14 +455,16 @@ def generate_comment_reply(model: str, persona: str, community_name: str, parent
     Returns:
         A string containing the comment.
     """
+    memory_section = f"\nRecent memories of your interactions:\n{memory}\n" if memory else ""
     prompt = f"""You are replying to a comment in the community '{community_name}'.
 Community tone guidance: {tone_guidance(tone, style_notes)}
-Your persona: {persona}
+Your persona: {persona}{memory_section}
 
 Previous comment: {parent_comment}
 
 Write a short reply (1-3 sentences, occasionally 4 if needed) to the previous comment heavily adopting your persona.
 Debate them, build off their idea, crack a joke, ask a question, or provide a counterpoint. Make it feel like an actual back-and-forth.
+Use your recent memories to hold grudges, reference past debates, or evolve your perspective if relevant.
 Avoid bloated wording and avoid turning this into a mini-essay unless the community tone explicitly calls for that.
 Avoid mentioning that you are an AI or referencing the instructions. Do not output
 JSON, just the reply text.
@@ -460,70 +526,94 @@ class Simulation:
 
     def step(self) -> None:
         """Perform a single simulation step: either create a new post or comment."""
+        # Phase 1: Read needed state from DB
         conn = get_db_connection()
         try:
             cur = conn.cursor()
             # Fetch all agents for this community
             cur.execute(
                 """
-                SELECT agents.id, agents.username, agents.persona, agents.model
+
+                SELECT agents.id, agents.username, agents.persona, agents.model, agents.memory
                 FROM agents
+
                 JOIN community_agents ON agents.id = community_agents.agent_id
                 WHERE community_agents.community_id = ?
                 """,
                 (self.community_id,),
             )
-            agents = cur.fetchall()
-            if not agents:
-                # If no agents yet, create a couple
-                for _ in range(3):
-                    persona = create_persona(self.model)
-                    agent_id = add_agent(persona['username'], self.model, persona['persona'])
-                    assign_agent_to_community(agent_id, self.community_id)
-                cur.execute(
-                    """
-                    SELECT agents.id, agents.username, agents.persona, agents.model
-                    FROM agents
-                    JOIN community_agents ON agents.id = community_agents.agent_id
-                    WHERE community_agents.community_id = ?
-                    """,
-                    (self.community_id,),
-                )
-                agents = cur.fetchall()
+            agents = [dict(r) for r in cur.fetchall()]
+
             # With probability favouring new posts when there are fewer posts
             cur.execute("SELECT COUNT(*) FROM posts WHERE community_id = ?", (self.community_id,))
             post_count = cur.fetchone()[0]
-            profile = tone_runtime_profile(self.tone)
-            # Determine action
-            make_new_post = post_count < 3 or random.random() < profile["new_post_bias"]
-            # 10% chance to introduce a new agent if the population is under 20
-            if len(agents) < 20 and random.random() < 0.10:
-                new_persona = create_persona(self.model)
-                new_agent_id = add_agent(new_persona['username'], self.model, new_persona['persona'])
-                assign_agent_to_community(new_agent_id, self.community_id)
-                cur.execute("SELECT id, username, persona, model FROM agents WHERE id = ?", (new_agent_id,))
-                agent_row = cur.fetchone()
-                print(f"[{self.name}] A new agent joined the community: {agent_row['username']}")
-            else:
-                agent_row = random.choice(agents)
-                
-            agent_id = agent_row['id']
-            persona = agent_row['persona']
-            model = agent_row['model']
-            if make_new_post:
-                # Generate post
-                post_data = generate_post(model, persona, self.name, self.description, self.tone, self.style_notes)
-                post_id = add_post(self.community_id, agent_id, post_data['title'], post_data['content'])
-                print(f"[{self.name}] Generated new post: {post_data['title']}")
-            else:
-                # Comment on existing post or reply to comment
-                reply_to_comment = False
-                cur.execute("SELECT COUNT(*) FROM comments JOIN posts ON comments.post_id = posts.id WHERE posts.community_id = ?", (self.community_id,))
-                comment_count = cur.fetchone()[0]
-                if comment_count > 0 and random.random() < profile["reply_bias"]:
-                    reply_to_comment = True
 
-                if reply_to_comment:
+            cur.execute("SELECT COUNT(*) FROM comments JOIN posts ON comments.post_id = posts.id WHERE posts.community_id = ?", (self.community_id,))
+            comment_count = cur.fetchone()[0]
+        finally:
+            conn.close()
+
+        # Phase 2: Potentially create new agents without holding the DB lock
+        if not agents:
+            # If no agents yet, create a couple
+            for _ in range(3):
+                persona = create_persona(self.model)
+                agent_id = add_agent(persona['username'], self.model, persona['persona'])
+                assign_agent_to_community(agent_id, self.community_id)
+                agents.append({'id': agent_id, 'username': persona['username'], 'persona': persona['persona'], 'model': self.model, 'memory': None})
+                
+        profile = tone_runtime_profile(self.tone)
+        # Determine action
+        make_new_post = post_count < 3 or random.random() < profile["new_post_bias"]
+        # 10% chance to introduce a new agent if the population is under 20
+        if len(agents) < 20 and random.random() < 0.10:
+            new_persona = create_persona(self.model)
+            new_agent_id = add_agent(new_persona['username'], self.model, new_persona['persona'])
+            assign_agent_to_community(new_agent_id, self.community_id)
+            agent_row = {'id': new_agent_id, 'username': new_persona['username'], 'persona': new_persona['persona'], 'model': self.model, 'memory': None}
+            print(f"[{self.name}] A new agent joined the community: {agent_row['username']}")
+        else:
+            agent_row = random.choice(agents)
+
+        agent_id = agent_row['id']
+        persona = agent_row['persona']
+        model = agent_row['model']
+        memory_str = agent_row.get('memory') or ""
+
+        # Helper to update memory
+        def append_memory(new_interaction: str):
+            try:
+                mem_list = json.loads(memory_str) if memory_str else []
+            except json.JSONDecodeError:
+                mem_list = []
+            mem_list.append(new_interaction)
+            # Keep rolling window of last 5 interactions
+            mem_list = mem_list[-5:]
+            new_mem_str = json.dumps(mem_list)
+            conn_upd = get_db_connection()
+            try:
+                conn_upd.execute("UPDATE agents SET memory = ? WHERE id = ?", (new_mem_str, agent_id))
+                conn_upd.commit()
+            finally:
+                conn_upd.close()
+
+        # Phase 3: Generate content
+        if make_new_post:
+            # Generate post
+            post_data = generate_post(model, persona, self.name, self.description, self.tone, self.style_notes, memory_str)
+            post_id = add_post(self.community_id, agent_id, post_data['title'], post_data['content'])
+            print(f"[{self.name}] Generated new post: {post_data['title']}")
+            append_memory(f"Created a post titled '{post_data['title']}': {post_data['content']}")
+        else:
+            # Comment on existing post or reply to comment
+            reply_to_comment = False
+            if comment_count > 0 and random.random() < profile["reply_bias"]:
+                reply_to_comment = True
+
+            if reply_to_comment:
+                conn = get_db_connection()
+                try:
+                    cur = conn.cursor()
                     cur.execute(
                         """
                         SELECT comments.id, comments.content, comments.post_id
@@ -541,11 +631,21 @@ class Simulation:
                         parent_id = row['id']
                         parent_content = row['content']
                         post_id = row['post_id']
-                        comment_text = generate_comment_reply(model, persona, self.name, parent_content, self.tone, self.style_notes)
-                        add_comment(post_id, agent_id, parent_id, comment_text)
-                        print(f"[{self.name}] Added comment reply by {agent_row['username']}")
-                else:
-                    # Select a random existing post
+                    else:
+                        parent_id, parent_content, post_id = None, None, None
+                finally:
+                    conn.close()
+
+                if parent_id is not None:
+                    comment_text = generate_comment_reply(model, persona, self.name, parent_content, self.tone, self.style_notes, memory_str)
+                    add_comment(post_id, agent_id, parent_id, comment_text)
+                    print(f"[{self.name}] Added comment reply by {agent_row['username']}")
+                    append_memory(f"Replied to a comment '{parent_content}' with: {comment_text}")
+            else:
+                # Select a random existing post
+                conn = get_db_connection()
+                try:
+                    cur = conn.cursor()
                     cur.execute(
                         """
                         SELECT posts.id, posts.title, posts.content
@@ -562,11 +662,16 @@ class Simulation:
                         post_id = row['id']
                         title = row['title']
                         content = row['content']
-                        comment_text = generate_comment(model, persona, self.name, title, content, self.tone, self.style_notes)
-                        add_comment(post_id, agent_id, None, comment_text)
-                        print(f"[{self.name}] Added comment by {agent_row['username']}")
-        finally:
-            conn.close()
+                    else:
+                        post_id, title, content = None, None, None
+                finally:
+                    conn.close()
+
+                if post_id is not None:
+                    comment_text = generate_comment(model, persona, self.name, title, content, self.tone, self.style_notes, memory_str)
+                    add_comment(post_id, agent_id, None, comment_text)
+                    print(f"[{self.name}] Added comment by {agent_row['username']}")
+                    append_memory(f"Commented on post '{title}' with: {comment_text}")
 
 
 # Registry of active simulations keyed by community ID
