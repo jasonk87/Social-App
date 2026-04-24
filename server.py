@@ -183,6 +183,19 @@ def init_db() -> None:
             )
             """
         )
+        # Inter-agent relationships
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS agent_relationships (
+                agent1_id INTEGER NOT NULL,
+                agent2_id INTEGER NOT NULL,
+                relationship_score REAL DEFAULT 0.0,
+                PRIMARY KEY (agent1_id, agent2_id),
+                FOREIGN KEY (agent1_id) REFERENCES agents(id) ON DELETE CASCADE,
+                FOREIGN KEY (agent2_id) REFERENCES agents(id) ON DELETE CASCADE
+            )
+            """
+        )
         community_columns = {row[1] for row in cur.execute("PRAGMA table_info(communities)").fetchall()}
         if "tone" not in community_columns:
             cur.execute("ALTER TABLE communities ADD COLUMN tone TEXT DEFAULT 'casual'")
@@ -617,6 +630,73 @@ Return only the JSON object and no other commentary. Do not return a list.
         raise OllamaError(f"Failed to parse persona JSON: {e}\nResponse: {response}")
 
 
+def update_relationship(agent1_id: int, agent2_id: int, is_argumentative: bool) -> None:
+    if agent1_id == agent2_id:
+        return
+
+    # Ensure ordered IDs to prevent duplicate reversed pairs
+    a_id, b_id = min(agent1_id, agent2_id), max(agent1_id, agent2_id)
+
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT relationship_score FROM agent_relationships WHERE agent1_id = ? AND agent2_id = ?", (a_id, b_id))
+        row = cur.fetchone()
+
+        current_score = row['relationship_score'] if row else 0.0
+
+        if is_argumentative:
+            current_score -= 0.2
+        else:
+            current_score += 0.1
+
+        # Clamp between -1.0 and 1.0
+        current_score = max(-1.0, min(1.0, current_score))
+
+        if row:
+            cur.execute("UPDATE agent_relationships SET relationship_score = ? WHERE agent1_id = ? AND agent2_id = ?", (current_score, a_id, b_id))
+        else:
+            cur.execute("INSERT INTO agent_relationships (agent1_id, agent2_id, relationship_score) VALUES (?, ?, ?)", (a_id, b_id, current_score))
+
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_relationship_context(agent_id: int, target_agent_id: int) -> str:
+    if agent_id == target_agent_id or not target_agent_id:
+        return ""
+
+    a_id, b_id = min(agent_id, target_agent_id), max(agent_id, target_agent_id)
+
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT relationship_score FROM agent_relationships WHERE agent1_id = ? AND agent2_id = ?", (a_id, b_id))
+        row = cur.fetchone()
+
+        if not row:
+            return ""
+
+        score = row['relationship_score']
+        cur.execute("SELECT username FROM agents WHERE id = ?", (target_agent_id,))
+        target_row = cur.fetchone()
+        target_name = target_row['username'] if target_row else "this user"
+
+        if score > 0.5:
+            return f"You are replying to {target_name}, who is a close friend and ally of yours."
+        elif score > 0.2:
+            return f"You are replying to {target_name}, who you generally agree with and like."
+        elif score < -0.5:
+            return f"You are replying to {target_name}, who you have a bitter rivalry with. You strongly dislike them."
+        elif score < -0.2:
+            return f"You are replying to {target_name}, who you often argue with."
+
+        return ""
+    finally:
+        conn.close()
+
+
 def check_and_update_agent_burnout(agent_id: int, conflict_level: float, memory_str: str, persona: str, model: str) -> None:
     if model == 'none':
         return
@@ -732,7 +812,7 @@ Return only the JSON object and no other commentary.
         raise OllamaError(f"Failed to parse post JSON: {e}\nResponse: {response}")
 
 
-def generate_comment(model: str, persona: str, community_name: str, description: str, post_title: str, post_content: str, tone: str, style_notes: str = "", memory: str = "", state_context: str = "", is_lost_redditor: bool = False) -> str:
+def generate_comment(model: str, persona: str, community_name: str, description: str, post_title: str, post_content: str, tone: str, style_notes: str = "", memory: str = "", state_context: str = "", is_lost_redditor: bool = False, relationship_context: str = "") -> str:
     """Generate a comment in reply to a post.
 
     Args:
@@ -747,6 +827,7 @@ def generate_comment(model: str, persona: str, community_name: str, description:
     """
     memory_section = f"\nRecent memories of your interactions:\n{memory}\n" if memory else ""
     state_section = f"\nCurrent Community State:\n{state_context}\n" if state_context else ""
+    rel_section = f"\nRelationship info: {relationship_context}\n" if relationship_context else ""
     mode = infer_community_mode(community_name, description)
 
     lost_redditor_prompt = ""
@@ -759,7 +840,7 @@ You must COMPLETELY IGNORE the actual subject matter of the post and this commun
     prompt = f"""You are replying to a post in the community '{community_name}'.
 Community mode guidance: {community_mode_prompt(mode)}
 Community tone guidance: {tone_guidance(tone, style_notes)}
-Your persona: {persona}{memory_section}{state_section}
+Your persona: {persona}{memory_section}{state_section}{rel_section}
 {lost_redditor_prompt}
   Post title: {post_title}
   Post content: {post_content}
@@ -776,7 +857,7 @@ Your persona: {persona}{memory_section}{state_section}
     return comment.strip()
 
 
-def generate_comment_reply(model: str, persona: str, community_name: str, description: str, parent_comment: str, tone: str, style_notes: str = "", memory: str = "", state_context: str = "", is_lost_redditor: bool = False) -> str:
+def generate_comment_reply(model: str, persona: str, community_name: str, description: str, parent_comment: str, tone: str, style_notes: str = "", memory: str = "", state_context: str = "", is_lost_redditor: bool = False, relationship_context: str = "") -> str:
     """Generate a comment in reply to another comment.
 
     Args:
@@ -790,6 +871,7 @@ def generate_comment_reply(model: str, persona: str, community_name: str, descri
     """
     memory_section = f"\nRecent memories of your interactions:\n{memory}\n" if memory else ""
     state_section = f"\nCurrent Community State:\n{state_context}\n" if state_context else ""
+    rel_section = f"\nRelationship info: {relationship_context}\n" if relationship_context else ""
     mode = infer_community_mode(community_name, description)
 
     lost_redditor_prompt = ""
@@ -802,7 +884,7 @@ You must COMPLETELY IGNORE the actual subject matter of the previous comment and
     prompt = f"""You are replying to a comment in the community '{community_name}'.
 Community mode guidance: {community_mode_prompt(mode)}
 Community tone guidance: {tone_guidance(tone, style_notes)}
-Your persona: {persona}{memory_section}{state_section}
+Your persona: {persona}{memory_section}{state_section}{rel_section}
 {lost_redditor_prompt}
   Previous comment: {parent_comment}
 
@@ -1171,13 +1253,17 @@ class SimulationEngine:
                     conn.close()
 
                 if parent_id is not None:
-                    comment_text = generate_comment_reply(model, persona, sim.name, sim.description, parent_content, sim.tone, sim.style_notes, memory_str, state_ctx, is_lost_redditor)
+                    rel_context = get_relationship_context(agent_id, parent_agent_id) if parent_agent_id else ""
+                    comment_text = generate_comment_reply(model, persona, sim.name, sim.description, parent_comment_text, sim.tone, sim.style_notes, memory_str, state_ctx, is_lost_redditor, rel_context)
                     new_comment_id = add_comment(post_id, agent_id, parent_id, comment_text)
                     print(f"[{sim.name}] Added comment reply by {agent_row['username']}")
                     append_memory(f"Replied to a comment '{parent_content}' with: {comment_text}")
                     is_argumentative = sim.conflict_level > 0.4 and random.random() < 0.6
                     update_community_state(community_id, comment_text, is_argumentative=is_argumentative, is_new_post=False)
                     check_and_update_agent_burnout(agent_id, sim.conflict_level, memory_str, persona, model)
+
+                    if parent_agent_id:
+                        update_relationship(agent_id, parent_agent_id, is_argumentative)
 
                     # If parent author is an AI, schedule an agent reply event!
                     if parent_agent_id:
@@ -1224,13 +1310,17 @@ class SimulationEngine:
                     conn.close()
 
                 if post_id is not None:
-                    comment_text = generate_comment(model, persona, sim.name, sim.description, title, content, sim.tone, sim.style_notes, memory_str, state_ctx, is_lost_redditor)
+                    rel_context = get_relationship_context(agent_id, post_agent_id) if post_agent_id else ""
+                    comment_text = generate_comment(model, persona, sim.name, sim.description, title, content, sim.tone, sim.style_notes, memory_str, state_ctx, is_lost_redditor, rel_context)
                     new_comment_id = add_comment(post_id, agent_id, None, comment_text)
                     print(f"[{sim.name}] Added comment by {agent_row['username']}")
                     append_memory(f"Commented on post '{title}' with: {comment_text}")
                     is_argumentative = sim.conflict_level > 0.4 and random.random() < 0.6
                     update_community_state(community_id, comment_text, is_argumentative=is_argumentative, is_new_post=False)
                     check_and_update_agent_burnout(agent_id, sim.conflict_level, memory_str, persona, model)
+
+                    if post_agent_id:
+                        update_relationship(agent_id, post_agent_id, is_argumentative)
 
                     if post_agent_id:
                         conn = get_db_connection()
@@ -1266,7 +1356,7 @@ class SimulationEngine:
             cur = conn.cursor()
             cur.execute("SELECT username, persona, model, memory FROM agents WHERE id = ?", (agent_id,))
             agent_row = cur.fetchone()
-            if not agent_row:
+            if not agent_row or agent_row['model'] == 'none':
                 return
 
             cur.execute("SELECT 1 FROM community_agents WHERE agent_id = ? AND community_id = ?", (agent_id, community_id))
@@ -1308,7 +1398,23 @@ class SimulationEngine:
 
         state_ctx = _get_state_context()
 
-        reply_text = generate_comment_reply(model, persona, sim.name, sim.description, parent_comment_text, sim.tone, sim.style_notes, memory_str, state_ctx, is_lost_redditor)
+        conn = get_db_connection()
+        r_agent_id = None
+        try:
+            cur = conn.cursor()
+            if reply_to_comment_id:
+                cur.execute("SELECT agent_id FROM comments WHERE id = ?", (reply_to_comment_id,))
+            else:
+                cur.execute("SELECT agent_id FROM posts WHERE id = ?", (post_id,))
+            r_row = cur.fetchone()
+            if r_row:
+                r_agent_id = r_row['agent_id']
+        finally:
+            conn.close()
+
+        rel_context = get_relationship_context(agent_id, r_agent_id) if r_agent_id else ""
+
+        reply_text = generate_comment_reply(model, persona, sim.name, sim.description, parent_comment_text, sim.tone, sim.style_notes, memory_str, state_ctx, is_lost_redditor, rel_context)
         new_comment_id = add_comment(post_id, agent_id, reply_to_comment_id, reply_text)
         print(f"[{sim.name}] Added priority comment reply by {agent_row['username']}")
         append_memory(f"Replied to a comment '{parent_comment_text}' with: {reply_text}")
@@ -1316,6 +1422,9 @@ class SimulationEngine:
         is_argumentative = sim.conflict_level > 0.4 and random.random() < 0.6
         update_community_state(community_id, reply_text, is_argumentative=is_argumentative, is_new_post=False)
         check_and_update_agent_burnout(agent_id, sim.conflict_level, memory_str, persona, model)
+
+        if r_agent_id:
+            update_relationship(agent_id, r_agent_id, is_argumentative)
 
     def _do_community_drift(self, data: dict):
         community_id = data['community_id']
