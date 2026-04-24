@@ -853,28 +853,52 @@ async function toggleSubscription(name, subscribed) {
 }
 
 function initSSE() {
-    const eventSource = new EventSource('/api/stream');
-    eventSource.addEventListener('new_post', async (event) => {
-        try {
-            if (appState.activeView === 'feed') {
-                await loadFeed();
-            }
-        } catch (e) {
-            console.error('Failed to parse SSE new_post event', e);
+    let eventSource = null;
+    let reconnectAttempts = 0;
+    const maxReconnectDelay = 30000; // 30 seconds max delay
+    const baseDelay = 1000;
+
+    function connect() {
+        if (eventSource) {
+            eventSource.close();
         }
-    });
-    eventSource.addEventListener('new_comment', async (event) => {
-        try {
-            if (appState.activeView === 'feed') {
-                await loadFeed();
+
+        eventSource = new EventSource('/api/stream');
+
+        eventSource.addEventListener('new_post', async (event) => {
+            try {
+                if (appState.activeView === 'feed') {
+                    await loadFeed();
+                }
+            } catch (e) {
+                console.error('Failed to parse SSE new_post event', e);
             }
-        } catch (e) {
-            console.error('Failed to parse SSE new_comment event', e);
-        }
-    });
-    eventSource.onerror = () => {
-        console.warn('SSE connection lost. It will attempt to reconnect automatically.');
-    };
+        });
+
+        eventSource.addEventListener('new_comment', async (event) => {
+            try {
+                if (appState.activeView === 'feed') {
+                    await loadFeed();
+                }
+            } catch (e) {
+                console.error('Failed to parse SSE new_comment event', e);
+            }
+        });
+
+        eventSource.onopen = () => {
+            reconnectAttempts = 0;
+        };
+
+        eventSource.onerror = () => {
+            eventSource.close();
+            const delay = Math.min(baseDelay * Math.pow(2, reconnectAttempts), maxReconnectDelay);
+            console.warn(`SSE connection lost. Reconnecting in ${delay}ms...`);
+            reconnectAttempts++;
+            setTimeout(connect, delay);
+        };
+    }
+
+    connect();
 }
 
 document.addEventListener('DOMContentLoaded', async () => {
