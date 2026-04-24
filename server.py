@@ -614,7 +614,7 @@ Return only the JSON object and no other commentary. Do not return a list.
         raise OllamaError(f"Failed to parse persona JSON: {e}\nResponse: {response}")
 
 
-def generate_post(model: str, persona: str, community_name: str, description: str, tone: str, style_notes: str = "", memory: str = "", state_context: str = "") -> dict:
+def generate_post(model: str, persona: str, community_name: str, description: str, tone: str, style_notes: str = "", memory: str = "", state_context: str = "", is_lost_redditor: bool = False) -> dict:
     """Generate a post title and content for a community.
 
     Args:
@@ -630,15 +630,23 @@ def generate_post(model: str, persona: str, community_name: str, description: st
     state_section = f"\nCurrent Community State:\n{state_context}\n" if state_context else ""
     subject_anchors = format_subject_anchor_text(community_name, description)
     mode = infer_community_mode(community_name, description)
+
+    lost_redditor_prompt = ""
+    if is_lost_redditor:
+        lost_redditor_prompt = """
+CRITICAL: You are a "Lost Redditor". You have accidentally wandered into this community and mistakenly believe you are posting in a community related to YOUR persona's interests.
+You must COMPLETELY IGNORE the actual subject matter of this community. Instead, write a post heavily leaning into your persona's niche, using terminology, questions, or complaints that make sense to YOU but will confuse the members of this current community. Do not acknowledge that you are lost.
+"""
+
     prompt = f"""You are writing a forum post in a community called '{community_name}'.
 Community description: {description}
 Core subject anchors: {subject_anchors}
 Community mode guidance: {community_mode_prompt(mode)}
 Community tone guidance: {tone_guidance(tone, style_notes)}
 Your persona: {persona}{memory_section}{state_section}
-
+{lost_redditor_prompt}
 It is CRITICAL that your post strongly matches your persona and communication style.
-Make it feel like a real person posting on Reddit, focused heavily on the actual subject matter of the community.
+Make it feel like a real person posting on Reddit, focused heavily on the actual subject matter of the community (unless you are a lost redditor, in which case focus on your own niche).
 Use the community subject anchors above. Talk about specific people, events, mechanics, moments, storylines, items,
 characters, features, factions, matches, rumors, strategies, or opinions that actually belong in this room.
 If this is a fandom/sports/history room, name concrete subjects instead of drifting into abstractions.
@@ -670,7 +678,7 @@ Return only the JSON object and no other commentary.
         raise OllamaError(f"Failed to parse post JSON: {e}\nResponse: {response}")
 
 
-def generate_comment(model: str, persona: str, community_name: str, description: str, post_title: str, post_content: str, tone: str, style_notes: str = "", memory: str = "", state_context: str = "") -> str:
+def generate_comment(model: str, persona: str, community_name: str, description: str, post_title: str, post_content: str, tone: str, style_notes: str = "", memory: str = "", state_context: str = "", is_lost_redditor: bool = False) -> str:
     """Generate a comment in reply to a post.
 
     Args:
@@ -686,16 +694,24 @@ def generate_comment(model: str, persona: str, community_name: str, description:
     memory_section = f"\nRecent memories of your interactions:\n{memory}\n" if memory else ""
     state_section = f"\nCurrent Community State:\n{state_context}\n" if state_context else ""
     mode = infer_community_mode(community_name, description)
+
+    lost_redditor_prompt = ""
+    if is_lost_redditor:
+        lost_redditor_prompt = """
+CRITICAL: You are a "Lost Redditor". You have accidentally wandered into this community and mistakenly believe you are replying to a post in a community related to YOUR persona's interests.
+You must COMPLETELY IGNORE the actual subject matter of the post and this community. Instead, write a reply heavily leaning into your persona's niche, using terminology, arguments, or jokes that make sense to YOU but will completely confuse everyone else. Do not acknowledge that you are lost.
+"""
+
     prompt = f"""You are replying to a post in the community '{community_name}'.
 Community mode guidance: {community_mode_prompt(mode)}
 Community tone guidance: {tone_guidance(tone, style_notes)}
 Your persona: {persona}{memory_section}{state_section}
-
+{lost_redditor_prompt}
   Post title: {post_title}
   Post content: {post_content}
 
   Write a short comment (1-3 sentences, occasionally 4 if needed) heavily adopting your persona. Sound like a real Reddit user participating in the community.
-  Disagree, agree, tease, ask a follow-up, or share a bizarre tangent if your persona dictates it. Keep it conversational and specific to the community topic.
+  Disagree, agree, tease, ask a follow-up, or share a bizarre tangent if your persona dictates it. Keep it conversational and specific to the community topic (unless you are a lost redditor, in which case focus on your own niche).
   Do NOT talk about buffer overflows, non-Euclidean geometry, simulations, memory allocation, algorithms, latency, bugs in reality, or any computer science jargon unless the community is specifically about computer programming.
   Do NOT drift into vague philosophy, cosmic metaphors, or generic abstract language.
   Do not sound like a lecturer, therapist, consultant, or academic unless the community tone explicitly demands it.
@@ -706,7 +722,7 @@ Your persona: {persona}{memory_section}{state_section}
     return comment.strip()
 
 
-def generate_comment_reply(model: str, persona: str, community_name: str, description: str, parent_comment: str, tone: str, style_notes: str = "", memory: str = "", state_context: str = "") -> str:
+def generate_comment_reply(model: str, persona: str, community_name: str, description: str, parent_comment: str, tone: str, style_notes: str = "", memory: str = "", state_context: str = "", is_lost_redditor: bool = False) -> str:
     """Generate a comment in reply to another comment.
 
     Args:
@@ -721,11 +737,19 @@ def generate_comment_reply(model: str, persona: str, community_name: str, descri
     memory_section = f"\nRecent memories of your interactions:\n{memory}\n" if memory else ""
     state_section = f"\nCurrent Community State:\n{state_context}\n" if state_context else ""
     mode = infer_community_mode(community_name, description)
+
+    lost_redditor_prompt = ""
+    if is_lost_redditor:
+        lost_redditor_prompt = """
+CRITICAL: You are a "Lost Redditor". You have accidentally wandered into this community and mistakenly believe you are replying to a comment in a community related to YOUR persona's interests.
+You must COMPLETELY IGNORE the actual subject matter of the previous comment and this community. Instead, write a reply heavily leaning into your persona's niche, using terminology, arguments, or jokes that make sense to YOU but will completely confuse the person you are replying to. Do not acknowledge that you are lost.
+"""
+
     prompt = f"""You are replying to a comment in the community '{community_name}'.
 Community mode guidance: {community_mode_prompt(mode)}
 Community tone guidance: {tone_guidance(tone, style_notes)}
 Your persona: {persona}{memory_section}{state_section}
-
+{lost_redditor_prompt}
   Previous comment: {parent_comment}
 
   Write a short reply (1-3 sentences, occasionally 4 if needed) to the previous comment heavily adopting your persona.
@@ -961,27 +985,53 @@ class SimulationEngine:
         profile = tone_runtime_profile(sim.tone)
         # Determine action
         make_new_post = post_count < 3 or random.random() < profile["new_post_bias"]
-        # 10% chance to introduce a new agent if the population is under 20
-        if len(agents) < 20 and random.random() < 0.10:
-            new_persona = create_persona(sim.model, sim.name, sim.description)
-            new_agent_id = add_agent(new_persona['username'], sim.model, new_persona['persona'])
-            assign_agent_to_community(new_agent_id, community_id)
-            agent_row = {'id': new_agent_id, 'username': new_persona['username'], 'persona': new_persona['persona'], 'model': sim.model, 'memory': None}
-            print(f"[{sim.name}] A new agent joined the community: {agent_row['username']}")
-        else:
-            agent_row = random.choice(agents)
+        is_lost_redditor = False
+        # 5% chance to be a lost redditor, if there are agents in other communities
+        if random.random() < 0.05:
+            conn = get_db_connection()
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    SELECT agents.id, agents.username, agents.persona, agents.model, agents.memory
+                    FROM agents
+                    JOIN community_agents ON agents.id = community_agents.agent_id
+                    WHERE community_agents.community_id != ? AND agents.model != 'none'
+                    ORDER BY RANDOM() LIMIT 1
+                    """,
+                    (community_id,)
+                )
+                lost_row = cur.fetchone()
+                if lost_row:
+                    agent_row = dict(lost_row)
+                    is_lost_redditor = True
+            finally:
+                conn.close()
+
+        if not is_lost_redditor:
+            # 10% chance to introduce a new agent if the population is under 20
+            if len(agents) < 20 and random.random() < 0.10:
+                new_persona = create_persona(sim.model, sim.name, sim.description)
+                new_agent_id = add_agent(new_persona['username'], sim.model, new_persona['persona'])
+                assign_agent_to_community(new_agent_id, community_id)
+                agent_row = {'id': new_agent_id, 'username': new_persona['username'], 'persona': new_persona['persona'], 'model': sim.model, 'memory': None}
+                print(f"[{sim.name}] A new agent joined the community: {agent_row['username']}")
+            else:
+                agent_row = random.choice(agents)
 
         agent_id = agent_row['id']
-        refreshed = refresh_agent_persona_if_needed(
-            agent_id,
-            agent_row['username'],
-            agent_row['persona'],
-            agent_row['model'],
-            sim.name,
-            sim.description,
-        )
-        agent_row['username'] = refreshed['username']
-        agent_row['persona'] = refreshed['persona']
+        if not is_lost_redditor:
+            refreshed = refresh_agent_persona_if_needed(
+                agent_id,
+                agent_row['username'],
+                agent_row['persona'],
+                agent_row['model'],
+                sim.name,
+                sim.description,
+            )
+            agent_row['username'] = refreshed['username']
+            agent_row['persona'] = refreshed['persona']
+
         persona = agent_row['persona']
         model = agent_row['model']
         memory_str = agent_row.get('memory') or ""
@@ -1023,7 +1073,7 @@ class SimulationEngine:
         # Phase 3: Generate content
         if make_new_post:
             # Generate post
-            post_data = generate_post(model, persona, sim.name, sim.description, sim.tone, sim.style_notes, memory_str, state_ctx)
+            post_data = generate_post(model, persona, sim.name, sim.description, sim.tone, sim.style_notes, memory_str, state_ctx, is_lost_redditor)
             post_id = add_post(community_id, agent_id, post_data['title'], post_data['content'])
             print(f"[{sim.name}] Generated new post: {post_data['title']}")
             append_memory(f"Created a post titled '{post_data['title']}': {post_data['content']}")
@@ -1064,7 +1114,7 @@ class SimulationEngine:
                     conn.close()
 
                 if parent_id is not None:
-                    comment_text = generate_comment_reply(model, persona, sim.name, sim.description, parent_content, sim.tone, sim.style_notes, memory_str, state_ctx)
+                    comment_text = generate_comment_reply(model, persona, sim.name, sim.description, parent_content, sim.tone, sim.style_notes, memory_str, state_ctx, is_lost_redditor)
                     new_comment_id = add_comment(post_id, agent_id, parent_id, comment_text)
                     print(f"[{sim.name}] Added comment reply by {agent_row['username']}")
                     append_memory(f"Replied to a comment '{parent_content}' with: {comment_text}")
@@ -1116,7 +1166,7 @@ class SimulationEngine:
                     conn.close()
 
                 if post_id is not None:
-                    comment_text = generate_comment(model, persona, sim.name, sim.description, title, content, sim.tone, sim.style_notes, memory_str, state_ctx)
+                    comment_text = generate_comment(model, persona, sim.name, sim.description, title, content, sim.tone, sim.style_notes, memory_str, state_ctx, is_lost_redditor)
                     new_comment_id = add_comment(post_id, agent_id, None, comment_text)
                     print(f"[{sim.name}] Added comment by {agent_row['username']}")
                     append_memory(f"Commented on post '{title}' with: {comment_text}")
@@ -1152,12 +1202,17 @@ class SimulationEngine:
         reply_to_comment_id = data.get('reply_to_comment_id')
 
         conn = get_db_connection()
+        is_lost_redditor = False
         try:
             cur = conn.cursor()
             cur.execute("SELECT username, persona, model, memory FROM agents WHERE id = ?", (agent_id,))
             agent_row = cur.fetchone()
             if not agent_row:
                 return
+
+            cur.execute("SELECT 1 FROM community_agents WHERE agent_id = ? AND community_id = ?", (agent_id, community_id))
+            if not cur.fetchone():
+                is_lost_redditor = True
         finally:
             conn.close()
 
@@ -1194,7 +1249,7 @@ class SimulationEngine:
 
         state_ctx = _get_state_context()
 
-        reply_text = generate_comment_reply(model, persona, sim.name, sim.description, parent_comment_text, sim.tone, sim.style_notes, memory_str, state_ctx)
+        reply_text = generate_comment_reply(model, persona, sim.name, sim.description, parent_comment_text, sim.tone, sim.style_notes, memory_str, state_ctx, is_lost_redditor)
         new_comment_id = add_comment(post_id, agent_id, reply_to_comment_id, reply_text)
         print(f"[{sim.name}] Added priority comment reply by {agent_row['username']}")
         append_memory(f"Replied to a comment '{parent_comment_text}' with: {reply_text}")
