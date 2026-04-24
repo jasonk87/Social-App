@@ -213,13 +213,16 @@ def init_db() -> None:
                 username TEXT NOT NULL,
                 model TEXT NOT NULL,
                 persona TEXT NOT NULL,
-                memory TEXT
+                memory TEXT,
+                burnout REAL DEFAULT 0.0
             )
             """
         )
         agent_columns = {row[1] for row in cur.execute("PRAGMA table_info(agents)").fetchall()}
         if "memory" not in agent_columns:
             cur.execute("ALTER TABLE agents ADD COLUMN memory TEXT")
+        if "burnout" not in agent_columns:
+            cur.execute("ALTER TABLE agents ADD COLUMN burnout REAL DEFAULT 0.0")
         # Association table between agents and communities
         cur.execute(
             """
@@ -614,6 +617,57 @@ Return only the JSON object and no other commentary. Do not return a list.
         raise OllamaError(f"Failed to parse persona JSON: {e}\nResponse: {response}")
 
 
+def check_and_update_agent_burnout(agent_id: int, conflict_level: float, memory_str: str, persona: str, model: str) -> None:
+    if model == 'none':
+        return
+
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT burnout, username FROM agents WHERE id = ?", (agent_id,))
+        row = cur.fetchone()
+        if not row:
+            return
+
+        burnout = float(row['burnout'])
+        username = row['username']
+
+        # Adjust burnout: increases when conflict is high, decreases slightly otherwise
+        if conflict_level > 0.6:
+            burnout += 0.15
+        elif conflict_level > 0.3:
+            burnout += 0.05
+        else:
+            burnout = max(0.0, burnout - 0.05)
+
+        old_burnout = float(row['burnout'])
+
+        if burnout >= 1.0:
+            # Agent deletes account
+            cur.execute(
+                "UPDATE agents SET username = '[deleted]', model = 'none', persona = 'Deleted account.', burnout = 1.0 WHERE id = ?",
+                (agent_id,)
+            )
+            # Remove from all communities
+            cur.execute("DELETE FROM community_agents WHERE agent_id = ?", (agent_id,))
+            print(f"Agent {username} reached max burnout and deleted their account.")
+        else:
+            cur.execute("UPDATE agents SET burnout = ? WHERE id = ?", (burnout, agent_id))
+
+            # Evolve if crossing threshold
+            if old_burnout < 0.6 and burnout >= 0.6:
+                print(f"Agent {username} is approaching burnout! Evolving persona.")
+                ENGINE.schedule(5, EventPriority.HIGH, 'AGENT_EVOLVE', {
+                    'agent_id': agent_id,
+                    'memory': memory_str,
+                    'persona': persona,
+                    'model': model
+                })
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def generate_post(model: str, persona: str, community_name: str, description: str, tone: str, style_notes: str = "", memory: str = "", state_context: str = "", is_lost_redditor: bool = False) -> dict:
     """Generate a post title and content for a community.
 
@@ -912,6 +966,8 @@ class SimulationEngine:
                         self._do_agent_reply(event.data)
                     elif event.event_type == 'COMMUNITY_DRIFT':
                         self._do_community_drift(event.data)
+                    elif event.event_type == 'AGENT_EVOLVE':
+                        self._do_agent_evolve(event.data)
 
                     # Mark completed *only* if the event isn't already re-scheduled by its own execution.
                     # e.g., if a community post replaces its own dedupe_key row, marking it completed here
@@ -1080,6 +1136,7 @@ class SimulationEngine:
 
             is_argumentative = sim.conflict_level > 0.5 and random.random() < 0.5
             update_community_state(community_id, f"{post_data['title']} {post_data['content']}", is_argumentative=is_argumentative, is_new_post=True)
+            check_and_update_agent_burnout(agent_id, sim.conflict_level, memory_str, persona, model)
         else:
             # Comment on existing post or reply to comment
             reply_to_comment = False
@@ -1120,6 +1177,7 @@ class SimulationEngine:
                     append_memory(f"Replied to a comment '{parent_content}' with: {comment_text}")
                     is_argumentative = sim.conflict_level > 0.4 and random.random() < 0.6
                     update_community_state(community_id, comment_text, is_argumentative=is_argumentative, is_new_post=False)
+                    check_and_update_agent_burnout(agent_id, sim.conflict_level, memory_str, persona, model)
 
                     # If parent author is an AI, schedule an agent reply event!
                     if parent_agent_id:
@@ -1172,6 +1230,7 @@ class SimulationEngine:
                     append_memory(f"Commented on post '{title}' with: {comment_text}")
                     is_argumentative = sim.conflict_level > 0.4 and random.random() < 0.6
                     update_community_state(community_id, comment_text, is_argumentative=is_argumentative, is_new_post=False)
+                    check_and_update_agent_burnout(agent_id, sim.conflict_level, memory_str, persona, model)
 
                     if post_agent_id:
                         conn = get_db_connection()
@@ -1256,6 +1315,7 @@ class SimulationEngine:
 
         is_argumentative = sim.conflict_level > 0.4 and random.random() < 0.6
         update_community_state(community_id, reply_text, is_argumentative=is_argumentative, is_new_post=False)
+        check_and_update_agent_burnout(agent_id, sim.conflict_level, memory_str, persona, model)
 
     def _do_community_drift(self, data: dict):
         community_id = data['community_id']
@@ -1317,6 +1377,34 @@ class SimulationEngine:
             conn.commit()
         finally:
             conn.close()
+
+    def _do_agent_evolve(self, data: dict):
+        agent_id = data['agent_id']
+        memory_str = data['memory']
+        persona = data['persona']
+        model = data['model']
+
+        prompt = f"""You are rewriting a persona for an AI agent who has become burnt out and cynical from participating in too many high-conflict arguments.
+Current persona: {persona}
+Recent memories: {memory_str}
+
+Rewrite their persona description to reflect this burnout. Keep it to 2 sentences. They should sound exhausted, cynical, easily irritated, or pessimistic, but they still retain their core interests.
+Respond with ONLY the new persona string and no other commentary or JSON.
+"""
+        new_persona = generate_text(model, prompt).strip()
+
+        conn = get_db_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT username FROM agents WHERE id = ?", (agent_id,))
+            row = cur.fetchone()
+            if row:
+                print(f"Agent {row['username']} evolved: {new_persona}")
+            cur.execute("UPDATE agents SET persona = ? WHERE id = ?", (new_persona, agent_id))
+            conn.commit()
+        finally:
+            conn.close()
+
 
 ENGINE = SimulationEngine()
 
