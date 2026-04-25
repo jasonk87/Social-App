@@ -1050,6 +1050,8 @@ class SimulationEngine:
                         self._do_community_drift(event.data)
                     elif event.event_type == 'AGENT_EVOLVE':
                         self._do_agent_evolve(event.data)
+                    elif event.event_type == 'COMMUNITY_SCHISM':
+                        self._do_community_schism(event.data)
 
                     # Mark completed *only* if the event isn't already re-scheduled by its own execution.
                     # e.g., if a community post replaces its own dedupe_key row, marking it completed here
@@ -1454,6 +1456,17 @@ class SimulationEngine:
         elif sim.mood < 0.0:
             sim.mood = min(0.0, sim.mood + 0.1)
 
+        # If conflict level is extreme, potentially trigger a schism
+        if sim.conflict_level >= 0.9 and not sim.name.startswith("True") and not sim.name.startswith("Real"):
+            self.schedule(
+                10,
+                EventPriority.HIGH,
+                'COMMUNITY_SCHISM',
+                {'community_id': community_id},
+                dedupe_key=f"COMMUNITY_SCHISM_{community_id}",
+                replace_existing=False
+            )
+
         # Decay conflict level towards 0.0
         if sim.conflict_level > 0.0:
             sim.conflict_level = max(0.0, sim.conflict_level - 0.1)
@@ -1513,6 +1526,101 @@ Respond with ONLY the new persona string and no other commentary or JSON.
             conn.commit()
         finally:
             conn.close()
+
+    def _do_community_schism(self, data: dict):
+        community_id = data['community_id']
+        sim = SIMULATIONS.get(community_id)
+        if not sim:
+            return
+
+        if sim.name.startswith("True") or sim.name.startswith("Real"):
+            return
+
+        prefix = random.choice(["True", "Real"])
+        new_name = f"{prefix}{sim.name}"
+
+        # Ensure name doesn't already exist
+        conn = get_db_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT 1 FROM communities WHERE name = ?", (new_name,))
+            if cur.fetchone():
+                return
+        finally:
+            conn.close()
+
+        print(f"Community {sim.name} is schisming! Creating {new_name}...")
+
+        # Create the new community
+        new_community_id = add_community(
+            new_name,
+            f"The true, authentic discussion place for {sim.name} refugees.",
+            sim.model,
+            sim.posting_rate,
+            sim.tone,
+            sim.style_notes
+        )
+
+        conn = get_db_connection()
+        try:
+            cur = conn.cursor()
+            # Fetch existing agents
+            cur.execute("SELECT agent_id FROM community_agents WHERE community_id = ?", (community_id,))
+            agents = [row['agent_id'] for row in cur.fetchall()]
+
+            if len(agents) > 1:
+                # Randomly select half the agents
+                k = max(1, len(agents) // 2)
+                schism_agents = random.sample(agents, k)
+
+                for a_id in schism_agents:
+                    # Move to new community
+                    cur.execute("DELETE FROM community_agents WHERE agent_id = ? AND community_id = ?", (a_id, community_id))
+                    cur.execute("INSERT OR IGNORE INTO community_agents (community_id, agent_id) VALUES (?, ?)", (new_community_id, a_id))
+
+                    # Update persona with resentment
+                    cur.execute("SELECT persona FROM agents WHERE id = ?", (a_id,))
+                    row = cur.fetchone()
+                    if row:
+                        new_persona = row['persona'] + f" You are highly resentful about the recent split from {sim.name} and believe {new_name} is the only authentic place for discussion."
+                        cur.execute("UPDATE agents SET persona = ? WHERE id = ?", (new_persona, a_id))
+
+            # Mark as active
+            cur.execute("UPDATE communities SET active = 1 WHERE id = ?", (new_community_id,))
+            conn.commit()
+        finally:
+            conn.close()
+
+        # Register the new simulation and schedule its startup
+        new_sim = Simulation(
+            new_community_id,
+            new_name,
+            f"The true, authentic discussion place for {sim.name} refugees.",
+            sim.model,
+            sim.posting_rate,
+            sim.tone,
+            sim.style_notes,
+            conflict_level=0.5, # Start with some inherent tension
+            mood=-0.5 # Start slightly negative
+        )
+        SIMULATIONS[new_community_id] = new_sim
+
+        self.schedule(
+            5,
+            EventPriority.LOW,
+            'COMMUNITY_POST',
+            {'community_id': new_community_id},
+            dedupe_key=f"COMMUNITY_POST_{new_community_id}",
+            replace_existing=False
+        )
+        self.schedule(
+            60,
+            EventPriority.LOW,
+            'COMMUNITY_DRIFT',
+            {'community_id': new_community_id},
+            dedupe_key=f"COMMUNITY_DRIFT_{new_community_id}",
+            replace_existing=False
+        )
 
 
 ENGINE = SimulationEngine()
