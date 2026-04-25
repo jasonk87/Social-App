@@ -7,27 +7,8 @@ async function fetchJSON(url, options = {}) {
     return data;
 }
 
-function escapeHTML(value = '') {
-    return value.replace(/[&<>"']/g, (char) => ({
-        '&': '&amp;',
-        '<': '&lt;',
-        '>': '&gt;',
-        '"': '&quot;',
-        "'": '&#39;',
-    }[char]));
-}
 
-function getQueryParam(param) {
-    const params = new URLSearchParams(window.location.search);
-    return params.get(param);
-}
 
-function formatTimestamp(value) {
-    return new Date(value * 1000).toLocaleString([], {
-        dateStyle: 'medium',
-        timeStyle: 'short',
-    });
-}
 
 function createStat(value, label) {
     return `
