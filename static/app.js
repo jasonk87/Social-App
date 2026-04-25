@@ -20,6 +20,9 @@ const appState = {
     sort: 'best',
     communitySearchInput: '',
     isAccountMenuOpen: false,
+    feedOffset: 0,
+    feedHasMore: false,
+    isLoadingFeed: false,
 };
 
 const deleteModalState = { name: null };
@@ -590,44 +593,79 @@ function renderDiscoveryCommunities() {
     }
 }
 
-async function loadFeed() {
+async function loadFeed(isLoadMore = false) {
     const feed = document.getElementById('home-feed');
+    if (appState.isLoadingFeed) return;
+
+    if (!isLoadMore) {
+        appState.feedOffset = 0;
+    } else {
+        appState.feedOffset += 20;
+    }
+
+    appState.isLoadingFeed = true;
 
     try {
-        const data = await fetchJSON(`/api/feed?sort=${encodeURIComponent(appState.sort)}`);
-        appState.feed = data.posts || [];
-        renderFeed();
+        const data = await fetchJSON(`/api/feed?sort=${encodeURIComponent(appState.sort)}&offset=${appState.feedOffset}&limit=20`);
+        appState.feedHasMore = data.has_more || false;
+
+        if (isLoadMore) {
+            appState.feed = appState.feed.concat(data.posts || []);
+            renderFeed(true);
+        } else {
+            appState.feed = data.posts || [];
+            renderFeed(false);
+        }
     } catch (err) {
-        feed.innerHTML = `
-            <div class="empty-state">
-                <strong>Feed unavailable</strong>
-                ${escapeHTML(err.message)}
-            </div>
-        `;
+        if (!isLoadMore) {
+            feed.innerHTML = `
+                <div class="empty-state">
+                    <strong>Feed unavailable</strong>
+                    ${escapeHTML(err.message)}
+                </div>
+            `;
+        }
+    } finally {
+        appState.isLoadingFeed = false;
     }
 }
 
-function renderFeed() {
+let homeFeedObserver = null;
+
+function renderFeed(isLoadMore = false) {
     const feed = document.getElementById('home-feed');
     const title = document.getElementById('feed-title');
     const subtitle = document.getElementById('feed-subtitle');
 
-    title.textContent = `${appState.currentUser.display_name}'s feed`;
-    subtitle.textContent = appState.feed.length
-        ? `${formatCount(appState.feed.length, 'post')} from the communities you follow.`
-        : 'Your subscribed communities are quiet right now. Try another sort or visit a room directly.';
+    if (!isLoadMore) {
+        title.textContent = `${appState.currentUser.display_name}'s feed`;
+        subtitle.textContent = appState.feed.length
+            ? `${formatCount(appState.feed.length, 'post')} from the communities you follow.`
+            : 'Your subscribed communities are quiet right now. Try another sort or visit a room directly.';
 
-    if (!appState.feed.length) {
-        feed.innerHTML = `
-            <div class="empty-state">
-                <strong>No posts yet</strong>
-                Subscribe to communities on the right and they will start showing up here.
-            </div>
-        `;
-        return;
+        if (!appState.feed.length) {
+            feed.innerHTML = `
+                <div class="empty-state">
+                    <strong>No posts yet</strong>
+                    Subscribe to communities on the right and they will start showing up here.
+                </div>
+            `;
+            return;
+        }
+
+        feed.innerHTML = '';
     }
 
-    feed.innerHTML = appState.feed.map((post) => `
+    // Remove old sentinel if it exists
+    const oldSentinel = document.getElementById('feed-sentinel');
+    if (oldSentinel) {
+        oldSentinel.remove();
+    }
+
+    // Determine which posts to render
+    const postsToRender = isLoadMore ? appState.feed.slice(appState.feedOffset) : appState.feed;
+
+    const html = postsToRender.map((post) => `
         <article class="post post-feed-card clickable-card reveal-on-load" data-url="/community.html?name=${encodeURIComponent(post.community_name)}#post-${post.id}">
             <div class="post-header">
                 <div class="pill-row">
@@ -658,6 +696,30 @@ function renderFeed() {
             </div>
         </article>
     `).join('');
+
+    if (isLoadMore) {
+        feed.insertAdjacentHTML('beforeend', html);
+    } else {
+        feed.innerHTML = html;
+    }
+
+    if (appState.feedHasMore) {
+        const sentinel = document.createElement('div');
+        sentinel.id = 'feed-sentinel';
+        sentinel.style.height = '10px';
+        feed.appendChild(sentinel);
+
+        if (homeFeedObserver) {
+            homeFeedObserver.disconnect();
+        }
+
+        homeFeedObserver = new IntersectionObserver((entries) => {
+            if (entries[0].isIntersecting && !appState.isLoadingFeed) {
+                loadFeed(true);
+            }
+        });
+        homeFeedObserver.observe(sentinel);
+    }
 }
 
 async function refreshApp() {

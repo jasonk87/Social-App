@@ -421,9 +421,13 @@ button:not(.btn-primary, .btn-danger) {
     .home-layout {
         grid-template-columns: 1fr;
     }
+
+    .home-sidebar-stack {
+        display: none !important;
+    }
     
     /* Reposition sidebar as an overlay on mobile */
-    .home-sidebar {
+    .home-sidebar-left {
         position: fixed;
         inset: 0 auto 0 0;
         z-index: 100;
@@ -437,7 +441,7 @@ button:not(.btn-primary, .btn-danger) {
         overflow-y: auto;
     }
 
-    .is-sidebar-open .home-sidebar {
+    .is-sidebar-open .home-sidebar-left {
         transform: translateX(0);
         box-shadow: 20px 0 50px rgb(0 0 0 / 50%);
     }
@@ -873,7 +877,7 @@ body[data-view="create"] .feed-shell {
     display: none !important;
 }
 
-body[data-view="feed"] .home-sidebar {
+body[data-view="feed"] .home-sidebar-left {
     position: sticky;
     top: 5.7rem;
     align-self: start;
@@ -1674,7 +1678,7 @@ body[data-view="feed"] .home-sidebar {
         grid-template-columns: 1fr;
     }
 
-    body[data-view="feed"] .home-sidebar {
+    body[data-view="feed"] .home-sidebar-left {
         position: static;
     }
 

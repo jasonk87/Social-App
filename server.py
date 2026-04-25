@@ -2099,7 +2099,7 @@ def build_comments_tree(comments_rows: List[sqlite3.Row]) -> List[Dict[str, Any]
     return comments_tree
 
 
-def fetch_community_feed(community_id: int, target_post_id: Optional[int] = None) -> List[Dict[str, Any]]:
+def fetch_community_feed(community_id: int, target_post_id: Optional[int] = None, offset: int = 0, limit: int = 50) -> tuple[List[Dict[str, Any]], bool]:
     """Return a list of posts with nested comments for a community."""
     conn = get_db_connection()
     try:
@@ -2143,9 +2143,9 @@ def fetch_community_feed(community_id: int, target_post_id: Optional[int] = None
             JOIN agents ON posts.agent_id = agents.id
             WHERE posts.community_id = ?
             ORDER BY posts.created_at DESC
-            LIMIT 50
+            LIMIT ? OFFSET ?
             """,
-            (community_id,),
+            (community_id, limit + 1, offset),
         )
         append_posts(cur.fetchall())
 
@@ -2166,12 +2166,16 @@ def fetch_community_feed(community_id: int, target_post_id: Optional[int] = None
 
         posts = list(post_map.values())
         posts.sort(key=lambda post: post['created_at'], reverse=True)
-        return posts
+        has_more = False
+        if target_post_id is None and len(posts) > limit:
+            has_more = True
+            posts = posts[:limit]
+        return posts, has_more
     finally:
         conn.close()
 
 
-def fetch_home_feed(user_id: int, sort: str = "latest") -> List[Dict[str, Any]]:
+def fetch_home_feed(user_id: int, sort: str = "latest", offset: int = 0, limit: int = 20) -> tuple[List[Dict[str, Any]], bool]:
     conn = get_db_connection()
     try:
         cur = conn.cursor()
@@ -2224,7 +2228,9 @@ def fetch_home_feed(user_id: int, sort: str = "latest") -> List[Dict[str, Any]]:
             posts.sort(key=lambda post: (post["best_score"], post["created_at"]), reverse=True)
         else:
             posts.sort(key=lambda post: post["created_at"], reverse=True)
-        return posts[:120]
+
+        has_more = len(posts) > offset + limit
+        return posts[offset:offset+limit], has_more
     finally:
         conn.close()
 
@@ -2444,10 +2450,13 @@ class RequestHandler(BaseHTTPRequestHandler):
                 sort = (query.get('sort', ['latest'])[0] or 'latest').lower()
                 if sort not in ('latest', 'best'):
                     sort = 'latest'
-                posts = fetch_home_feed(current_user['id'], sort)
+                offset = int(query.get('offset', ['0'])[0] or '0')
+                limit = int(query.get('limit', ['20'])[0] or '20')
+                posts, has_more = fetch_home_feed(current_user['id'], sort, offset=offset, limit=limit)
                 self.respond_json({
                     'sort': sort,
                     'posts': posts,
+                    'has_more': has_more,
                     'current_user': {
                         'id': current_user['id'],
                         'display_name': current_user['display_name'],
@@ -2469,9 +2478,12 @@ class RequestHandler(BaseHTTPRequestHandler):
                         return
                     target_post_id_raw = (query.get('target_post_id', [''])[0] or '').strip()
                     target_post_id = int(target_post_id_raw) if target_post_id_raw.isdigit() else None
-                    posts = fetch_community_feed(row['id'], target_post_id=target_post_id)
+                    offset = int(query.get('offset', ['0'])[0] or '0')
+                    limit = int(query.get('limit', ['50'])[0] or '50')
+                    posts, has_more = fetch_community_feed(row['id'], target_post_id=target_post_id, offset=offset, limit=limit)
                     self.respond_json({
                         'posts': posts,
+                        'has_more': has_more,
                         'community': {
                             'id': row['id'],
                             'name': row['name'],

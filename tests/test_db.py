@@ -34,7 +34,7 @@ def test_add_post_and_comment():
     assert comment_id is not None
 
     # Verify feed retrieval
-    feed = server.fetch_community_feed(comm_id)
+    feed, has_more = server.fetch_community_feed(comm_id)
     assert len(feed) == 1
     assert feed[0]['title'] == "Test Title"
     assert len(feed[0]['comments']) == 1

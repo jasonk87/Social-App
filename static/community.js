@@ -79,6 +79,9 @@ const toneOptions = [
 const communityPageState = {
     name: null,
     community: null,
+    feedOffset: 0,
+    feedHasMore: false,
+    isLoadingFeed: false,
     currentUser: null,
 };
 
@@ -495,18 +498,28 @@ function renderComments(comments, container, depth = 0, postId = null) {
     });
 }
 
-function renderFeed(posts) {
+let communityFeedObserver = null;
+
+function renderFeed(posts, isLoadMore = false) {
     const feed = document.getElementById('feed');
     const unread = communityPageState.name ? getUnreadNotifications(communityPageState.name) : new Set();
 
-    syncCommunityHeader();
+    if (!isLoadMore) {
+        syncCommunityHeader();
 
-    if (!posts.length) {
-        feed.innerHTML = createEmptyState('No posts yet', 'Publish a thread or wait for the simulation to begin posting.');
-        return;
+        if (!posts.length) {
+            feed.innerHTML = createEmptyState('No posts yet', 'Publish a thread or wait for the simulation to begin posting.');
+            return;
+        }
+
+        feed.innerHTML = '';
     }
 
-    feed.innerHTML = '';
+    // Remove old sentinel
+    const oldSentinel = document.getElementById('feed-sentinel');
+    if (oldSentinel) {
+        oldSentinel.remove();
+    }
 
     posts.forEach((post) => {
         const article = document.createElement('article');
@@ -547,6 +560,24 @@ function renderFeed(posts) {
         feed.appendChild(article);
     });
 
+    if (communityPageState.feedHasMore) {
+        const sentinel = document.createElement('div');
+        sentinel.id = 'feed-sentinel';
+        sentinel.style.height = '10px';
+        feed.appendChild(sentinel);
+
+        if (communityFeedObserver) {
+            communityFeedObserver.disconnect();
+        }
+
+        communityFeedObserver = new IntersectionObserver((entries) => {
+            if (entries[0].isIntersecting && !communityPageState.isLoadingFeed) {
+                loadFeed(communityPageState.name, { isLoadMore: true });
+            }
+        });
+        communityFeedObserver.observe(sentinel);
+    }
+
     if (window.lucide) {
         lucide.createIcons();
     }
@@ -554,30 +585,47 @@ function renderFeed(posts) {
 
 async function loadFeed(name, options = {}) {
     const feed = document.getElementById('feed');
+    if (communityPageState.isLoadingFeed) return;
+
     const {
         silentNotifications = false,
         preserveScroll = false,
         focusTarget = false,
         renderDOM = true,
+        isLoadMore = false,
     } = options;
+
+    if (!isLoadMore) {
+        communityPageState.feedOffset = 0;
+    } else {
+        communityPageState.feedOffset += 50;
+    }
+
+    communityPageState.isLoadingFeed = true;
+
     const previousScrollY = preserveScroll ? window.scrollY : null;
     const hash = window.location.hash.replace('#', '').trim();
     const targetPostMatch = hash.match(/^post-(\d+)$/);
     const targetPostId = targetPostMatch ? targetPostMatch[1] : '';
-    const requestUrl = targetPostId
+
+    let requestUrl = targetPostId && !isLoadMore
         ? `/api/community/${encodeURIComponent(name)}/feed?target_post_id=${encodeURIComponent(targetPostId)}`
         : `/api/community/${encodeURIComponent(name)}/feed`;
+
+    requestUrl += `${requestUrl.includes('?') ? '&' : '?'}offset=${communityPageState.feedOffset}&limit=50`;
 
     try {
         const data = await fetchJSON(requestUrl);
         const posts = data.posts || [];
+        communityPageState.feedHasMore = data.has_more || false;
+
         if (data.community) {
             communityPageState.community = data.community;
         }
         communityPageState.currentUser = data.current_user || communityPageState.currentUser;
 
         if (renderDOM) {
-            renderFeed(posts);
+            renderFeed(posts, isLoadMore);
         }
 
         const notifications = collectUserReplyNotifications(posts, name);
@@ -600,9 +648,11 @@ async function loadFeed(name, options = {}) {
             focusTargetFromHash();
         }
     } catch (err) {
-        if (renderDOM) {
+        if (renderDOM && !isLoadMore) {
             feed.innerHTML = createEmptyState('Feed unavailable', err.message);
         }
+    } finally {
+        communityPageState.isLoadingFeed = false;
     }
 }
 
