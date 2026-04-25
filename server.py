@@ -1056,6 +1056,8 @@ class SimulationEngine:
                         self._do_community_schism(event.data)
                     elif event.event_type == 'AGENT_FOUND_COMMUNITY':
                         self._do_agent_found_community(event.data)
+                    elif event.event_type == 'COMMUNITY_MERGER':
+                        self._do_community_merger(event.data)
 
                     # Mark completed *only* if the event isn't already re-scheduled by its own execution.
                     # e.g., if a community post replaces its own dedupe_key row, marking it completed here
@@ -1432,6 +1434,72 @@ class SimulationEngine:
         if r_agent_id:
             update_relationship(agent_id, r_agent_id, is_argumentative)
 
+    def _do_community_merger(self, data: dict):
+        c1 = data['community_id_1']
+        c2 = data['community_id_2']
+
+        sim1 = SIMULATIONS.get(c1)
+        sim2 = SIMULATIONS.get(c2)
+
+        if not sim1 or not sim2:
+            return
+
+        # Pick dominant randomly
+        if random.random() < 0.5:
+            dominant_id, dom_sim = c1, sim1
+            sub_id, sub_sim = c2, sim2
+        else:
+            dominant_id, dom_sim = c2, sim2
+            sub_id, sub_sim = c1, sim1
+
+        print(f"MERGER: Community {sub_sim.name} is merging into {dom_sim.name}!")
+
+        conn = get_db_connection()
+        try:
+            cur = conn.cursor()
+            # Fetch agents from sub community
+            cur.execute("SELECT agent_id FROM community_agents WHERE community_id = ?", (sub_id,))
+            agents = [row['agent_id'] for row in cur.fetchall()]
+
+            for a_id in agents:
+                # Move to new community
+                cur.execute("DELETE FROM community_agents WHERE agent_id = ? AND community_id = ?", (a_id, sub_id))
+                cur.execute("INSERT OR IGNORE INTO community_agents (community_id, agent_id) VALUES (?, ?)", (dominant_id, a_id))
+
+                # Update persona with confusion/refugee status
+                cur.execute("SELECT persona FROM agents WHERE id = ?", (a_id,))
+                row = cur.fetchone()
+                if row:
+                    new_persona = row['persona'] + f" Your old community '{sub_sim.name}' was recently shut down and merged into '{dom_sim.name}'. You are initially confused and slightly defensive about this forced migration."
+                    cur.execute("UPDATE agents SET persona = ? WHERE id = ?", (new_persona, a_id))
+
+            # Deactivate subordinate community
+            cur.execute("UPDATE communities SET active = 0 WHERE id = ?", (sub_id,))
+
+            # Post a system message in dominant community (optional, using Human or system agent logic)
+            cur.execute("SELECT id FROM agents WHERE username = 'You'")
+            you_row = cur.fetchone()
+            sys_id = you_row['id'] if you_row else 1
+            cur.execute(
+                "INSERT INTO posts (community_id, agent_id, title, content, created_at) VALUES (?, ?, ?, ?, ?)",
+                (dominant_id, sys_id, f"System Notice: {sub_sim.name} has merged with us", f"Due to overlapping topics and low activity, {sub_sim.name} has been merged into this community. Please welcome the new members.", time.time())
+            )
+
+            conn.commit()
+
+            # Remove from SIMULATIONS
+            del SIMULATIONS[sub_id]
+
+            # Bump energy in dominant community due to influx
+            dom_sim.energy = min(3.0, dom_sim.energy + 1.0)
+            dom_sim.conflict_level = min(1.0, dom_sim.conflict_level + 0.3)
+
+            # Broadcast update
+            broadcast_sse('new_post', {'post_id': cur.lastrowid, 'community_id': dominant_id})
+
+        finally:
+            conn.close()
+
     def _do_community_drift(self, data: dict):
         community_id = data['community_id']
         sim = SIMULATIONS.get(community_id)
@@ -1482,6 +1550,24 @@ class SimulationEngine:
                 dedupe_key=f"AGENT_FOUND_COMMUNITY_{community_id}",
                 replace_existing=False
             )
+
+        # Community Merger Logic: Low energy and shared topics
+        if sim.energy < 0.5 and sim.current_topics:
+            sim_topic_names = {t['topic'] for t in sim.current_topics}
+            for other_id, other_sim in SIMULATIONS.items():
+                if other_id != community_id and other_sim.energy < 0.5 and other_sim.current_topics:
+                    other_topic_names = {t['topic'] for t in other_sim.current_topics}
+                    if sim_topic_names & other_topic_names:
+                        # Found a match, trigger merger
+                        self.schedule(
+                            10,
+                            EventPriority.HIGH,
+                            'COMMUNITY_MERGER',
+                            {'community_id_1': community_id, 'community_id_2': other_id},
+                            dedupe_key=f"COMMUNITY_MERGER_{min(community_id, other_id)}_{max(community_id, other_id)}",
+                            replace_existing=False
+                        )
+                        break
 
         # Decay conflict level towards 0.0
         if sim.conflict_level > 0.0:
