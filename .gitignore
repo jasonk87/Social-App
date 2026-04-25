@@ -3,6 +3,7 @@ social.db-shm
 social.db-wal
 server.err.log
 server.out.log
+server.log
 __pycache__/
 .playwright-cli/
 output/

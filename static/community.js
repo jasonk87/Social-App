@@ -794,12 +794,17 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     // Live updates via SSE
     function initSSE() {
-        const eventSource = new EventSource('/api/stream');
+        let eventSource = null;
+        let reconnectAttempts = 0;
+        const maxReconnectDelay = 30000; // 30 seconds max delay
+        const baseDelay = 1000;
         let sseRefreshTimeout = null;
+
         const shouldRefreshForEvent = (eventData) => (
             communityPageState.community
             && Number(communityPageState.community.id) === Number(eventData.community_id)
         );
+
         const scheduleSseRefresh = () => {
             if (sseRefreshTimeout) {
                 return;
@@ -809,29 +814,50 @@ document.addEventListener('DOMContentLoaded', async () => {
                 await window.loadCommunityData();
             }, 120);
         };
-        eventSource.addEventListener('new_post', async (event) => {
-            try {
-                const data = JSON.parse(event.data);
-                if (shouldRefreshForEvent(data)) {
-                    scheduleSseRefresh();
-                }
-            } catch (e) {
-                console.error('Failed to parse SSE new_post event', e);
+
+        function connect() {
+            if (eventSource) {
+                eventSource.close();
             }
-        });
-        eventSource.addEventListener('new_comment', async (event) => {
-            try {
-                const data = JSON.parse(event.data);
-                if (shouldRefreshForEvent(data)) {
-                    scheduleSseRefresh();
+
+            eventSource = new EventSource('/api/stream');
+
+            eventSource.addEventListener('new_post', async (event) => {
+                try {
+                    const data = JSON.parse(event.data);
+                    if (shouldRefreshForEvent(data)) {
+                        scheduleSseRefresh();
+                    }
+                } catch (e) {
+                    console.error('Failed to parse SSE new_post event', e);
                 }
-            } catch (e) {
-                console.error('Failed to parse SSE new_comment event', e);
-            }
-        });
-        eventSource.onerror = () => {
-            console.warn('SSE connection lost. Reconnecting...');
-        };
+            });
+
+            eventSource.addEventListener('new_comment', async (event) => {
+                try {
+                    const data = JSON.parse(event.data);
+                    if (shouldRefreshForEvent(data)) {
+                        scheduleSseRefresh();
+                    }
+                } catch (e) {
+                    console.error('Failed to parse SSE new_comment event', e);
+                }
+            });
+
+            eventSource.onopen = () => {
+                reconnectAttempts = 0;
+            };
+
+            eventSource.onerror = () => {
+                eventSource.close();
+                const delay = Math.min(baseDelay * Math.pow(2, reconnectAttempts), maxReconnectDelay);
+                console.warn(`SSE connection lost. Reconnecting in ${delay}ms...`);
+                reconnectAttempts++;
+                setTimeout(connect, delay);
+            };
+        }
+
+        connect();
     }
 
     initSSE();
