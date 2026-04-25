@@ -23,7 +23,7 @@
     --radius-md: 8px;
     --radius-lg: 8px;
     --max-width: 1180px;
-    --transition: 180ms ease;
+    --transition: 180ms cubic-bezier(0.16, 1, 0.3, 1);
 }
 
 * {
@@ -1373,7 +1373,7 @@ body[data-view="feed"] .home-sidebar {
     padding: 1rem;
     transform: translateY(10px);
     opacity: 0;
-    animation: toast-in 240ms ease forwards;
+    animation: toast-in 240ms cubic-bezier(0.16, 1, 0.3, 1) forwards;
 }
 
 .toast-title {
@@ -1506,7 +1506,7 @@ body[data-view="feed"] .home-sidebar {
 .reveal-on-load {
     opacity: 0;
     transform: translateY(16px);
-    animation: fade-up 520ms ease forwards;
+    animation: fade-up 520ms cubic-bezier(0.16, 1, 0.3, 1) forwards;
 }
 
 .reveal-on-load:nth-child(2) {

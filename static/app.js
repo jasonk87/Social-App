@@ -7,22 +7,7 @@ async function fetchJSON(url, options = {}) {
     return data;
 }
 
-function escapeHTML(value = '') {
-    return value.replace(/[&<>"']/g, (char) => ({
-        '&': '&amp;',
-        '<': '&lt;',
-        '>': '&gt;',
-        '"': '&quot;',
-        "'": '&#39;',
-    }[char]));
-}
 
-function formatTimestamp(value) {
-    return new Date(value * 1000).toLocaleString([], {
-        dateStyle: 'medium',
-        timeStyle: 'short',
-    });
-}
 
 function formatCount(count, singular, plural = `${singular}s`) {
     return `${count} ${count === 1 ? singular : plural}`;
@@ -535,7 +520,7 @@ function renderSidebarCommunities() {
     }
 
     grid.innerHTML = subscribedCommunities.map((community) => `
-        <article class="community-card community-list-item" data-url="/community.html?name=${encodeURIComponent(community.name)}">
+        <article class="community-card community-list-item reveal-on-load" data-url="/community.html?name=${encodeURIComponent(community.name)}">
             <div class="community-list-main">
                 <div class="community-list-header">
                     <h3 class="community-list-title">${escapeHTML(community.name)}</h3>
@@ -570,7 +555,7 @@ function renderDiscoveryCommunities() {
     }
 
     grid.innerHTML = filtered.map((community) => `
-        <article class="post clickable-card community-discovery-card" data-url="/community.html?name=${encodeURIComponent(community.name)}">
+        <article class="post clickable-card community-discovery-card reveal-on-load" data-url="/community.html?name=${encodeURIComponent(community.name)}">
             <div class="post-header">
                 <div class="pill-row">
                     <span class="pill pill-accent">${escapeHTML(community.model)}</span>
@@ -643,7 +628,7 @@ function renderFeed() {
     }
 
     feed.innerHTML = appState.feed.map((post) => `
-        <article class="post post-feed-card clickable-card" data-url="/community.html?name=${encodeURIComponent(post.community_name)}#post-${post.id}">
+        <article class="post post-feed-card clickable-card reveal-on-load" data-url="/community.html?name=${encodeURIComponent(post.community_name)}#post-${post.id}">
             <div class="post-header">
                 <div class="pill-row">
                     <a class="pill pill-accent" href="/community.html?name=${encodeURIComponent(post.community_name)}">${escapeHTML(post.community_name)}</a>
