@@ -56,6 +56,7 @@ from collections import Counter
 #
 
 DB_PATH = os.path.join(os.path.dirname(__file__), 'social.db')
+MAX_COMMUNITIES = 20
 SESSION_COOKIE_NAME = "social_session"
 
 DEFAULT_COMMUNITY_TONE = "casual"
@@ -604,9 +605,7 @@ It is CRITICAL that you wildly vary the personalities you generate. Make this sp
 a casual fan, hardcore enthusiast, newcomer asking for help, salty veteran, stats nerd,
 storyline obsessive, collector, contrarian, helpful guide, joke poster, or lore/history head.
 
-The persona must be deeply rooted in this exact community subject. If the room is about wrestling,
-the persona should care about wrestlers, matches, promos, booking, eras, feuds, factions, title runs,
-backstage stories, or fan arguments. If the room is about a game, the persona should care about that game.
+The persona must care about highly specific, deep-cut topics within this niche. For example, if it's about wrestling, they should obsess over specific obscure matches, individual moves, or backstage politics, not generic statements. If it's a game, they should focus on obscure mechanics, specific items, or complex strategies, rather than surface-level 'glitches', one mushroom island, or basic gameplay.
 Do NOT make them sound like a computer program, philosopher, cosmic poet, software engineer, or abstract systems theorist
 unless the community itself is explicitly about those things.
 
@@ -789,6 +788,7 @@ Do NOT drift into vague cosmic language, generic philosophy, or abstract "timeli
 Aggressively vary the formatting and structure. Some posts should be short. Some should be anecdotal. Some should ask questions.
 If you are a storyteller, share a vivid anecdote. If you are a helpful guide, share a step-by-step tip. If you are a debater, challenge a common assumption.
 Avoid generic observations, inflated vocabulary, and long academic padding.
+DO NOT make generic, surface-level observations. Dive deep into specific, intricate details. Avoid broad summaries or complaining about generic 'glitches' or 'one mushroom island'. Be hyper-specific.
 Bad example for a wrestling room: "Are we even looking at the right timeline?"
 Good example for a wrestling room: strong opinions about Goldberg's streak, Macho Man promos, Sting in WCW, nWo angles, Bret vs Shawn, or old WWF/WCW booking.
 Good example for a dad jokes room: a short pun, groaner, or setup/punchline that would make people roll their eyes.
@@ -849,6 +849,7 @@ Your persona: {persona}{memory_section}{state_section}{rel_section}
   Disagree, agree, tease, ask a follow-up, or share a bizarre tangent if your persona dictates it. Keep it conversational and specific to the community topic (unless you are a lost redditor, in which case focus on your own niche).
   Do NOT talk about buffer overflows, non-Euclidean geometry, simulations, memory allocation, algorithms, latency, bugs in reality, or any computer science jargon unless the community is specifically about computer programming.
   Do NOT drift into vague philosophy, cosmic metaphors, or generic abstract language.
+  DO NOT make generic, surface-level observations. Dive deep into specific, intricate details. Avoid broad summaries or complaining about generic 'glitches'. Be hyper-specific.
   Do not sound like a lecturer, therapist, consultant, or academic unless the community tone explicitly demands it.
   Avoid mentioning that you are an AI or referencing the instructions. Do not output
   JSON, just the comment text.
@@ -892,6 +893,7 @@ Your persona: {persona}{memory_section}{state_section}{rel_section}
   Debate them, build off their idea, crack a joke, ask a question, or provide a counterpoint. Make it feel like an actual Reddit back-and-forth.
   Do NOT talk about buffer overflows, non-Euclidean geometry, simulations, memory allocation, algorithms, latency, bugs in reality, or any computer science jargon unless the community is specifically about computer programming.
   Do NOT drift into vague philosophy, cosmic metaphors, or generic abstract language.
+  DO NOT make generic, surface-level observations. Dive deep into specific, intricate details. Avoid broad summaries or complaining about generic 'glitches'. Be hyper-specific.
   Avoid bloated wording and avoid turning this into a mini-essay unless the community tone explicitly calls for that.
   Avoid mentioning that you are an AI or referencing the instructions. Do not output
   JSON, just the reply text.
@@ -1052,6 +1054,8 @@ class SimulationEngine:
                         self._do_agent_evolve(event.data)
                     elif event.event_type == 'COMMUNITY_SCHISM':
                         self._do_community_schism(event.data)
+                    elif event.event_type == 'AGENT_FOUND_COMMUNITY':
+                        self._do_agent_found_community(event.data)
 
                     # Mark completed *only* if the event isn't already re-scheduled by its own execution.
                     # e.g., if a community post replaces its own dedupe_key row, marking it completed here
@@ -1467,6 +1471,18 @@ class SimulationEngine:
                 replace_existing=False
             )
 
+        # Agent Community Creation Spin-off
+        if sim.energy > 1.5 and sim.current_topics and random.random() < 0.05:
+            top_topic = sim.current_topics[0]['topic']
+            self.schedule(
+                10,
+                EventPriority.HIGH,
+                'AGENT_FOUND_COMMUNITY',
+                {'community_id': community_id, 'topic': top_topic},
+                dedupe_key=f"AGENT_FOUND_COMMUNITY_{community_id}",
+                replace_existing=False
+            )
+
         # Decay conflict level towards 0.0
         if sim.conflict_level > 0.0:
             sim.conflict_level = max(0.0, sim.conflict_level - 0.1)
@@ -1526,6 +1542,117 @@ Respond with ONLY the new persona string and no other commentary or JSON.
             conn.commit()
         finally:
             conn.close()
+
+    def _do_agent_found_community(self, data: dict):
+        source_community_id = data['community_id']
+        topic = data['topic']
+
+        conn = get_db_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT COUNT(*) FROM communities")
+            if cur.fetchone()[0] >= MAX_COMMUNITIES:
+                return
+
+            cur.execute(
+                """
+                SELECT agents.id, agents.username, agents.persona, agents.model
+                FROM agents
+                JOIN community_agents ON agents.id = community_agents.agent_id
+                WHERE community_agents.community_id = ? AND agents.model != 'none'
+                ORDER BY RANDOM() LIMIT 1
+                """,
+                (source_community_id,)
+            )
+            row = cur.fetchone()
+            if not row:
+                return
+            agent = dict(row)
+        finally:
+            conn.close()
+
+        prompt = f"""You are {agent['persona']}. You are heavily invested in the topic of '{topic}' and have decided to start your own spin-off community dedicated entirely to this hyper-specific subject.
+Respond with ONLY ONE JSON object with the keys:
+  "name": A catchy, short name for your new community (e.g., "MachoManPromos" or "RedstoneLogic"). Do not use spaces.
+  "description": A 1-2 sentence description explaining the highly specific focus of this new community.
+Return only the JSON object and no other commentary."""
+
+        try:
+            response = generate_text(agent['model'], prompt)
+            start = response.find("{")
+            end = response.rfind("}")
+            if start != -1 and end != -1:
+                response = response[start:end+1]
+            result = json.loads(response)
+            new_name = result['name'].replace(' ', '')
+            description = result['description']
+        except Exception as e:
+            print(f"Failed to generate community from agent: {e}")
+            return
+
+        # Ensure name doesn't already exist
+        conn = get_db_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT 1 FROM communities WHERE name = ?", (new_name,))
+            if cur.fetchone():
+                return
+        finally:
+            conn.close()
+
+        print(f"Agent {agent['username']} is founding a new community: {new_name} about {topic}!")
+
+        sim = SIMULATIONS.get(source_community_id)
+        if not sim:
+            return
+
+        new_community_id = add_community(
+            new_name,
+            description,
+            sim.model,
+            sim.posting_rate,
+            sim.tone,
+            sim.style_notes
+        )
+
+        assign_agent_to_community(agent['id'], new_community_id)
+
+        conn = get_db_connection()
+        try:
+            conn.execute("UPDATE communities SET active = 1 WHERE id = ?", (new_community_id,))
+            conn.commit()
+        finally:
+            conn.close()
+
+        new_sim = Simulation(
+            new_community_id,
+            new_name,
+            description,
+            sim.model,
+            sim.posting_rate,
+            sim.tone,
+            sim.style_notes,
+            conflict_level=0.0,
+            mood=0.0
+        )
+        SIMULATIONS[new_community_id] = new_sim
+
+        self.schedule(
+            5,
+            EventPriority.LOW,
+            'COMMUNITY_POST',
+            {'community_id': new_community_id},
+            dedupe_key=f"COMMUNITY_POST_{new_community_id}",
+            replace_existing=False
+        )
+        self.schedule(
+            60,
+            EventPriority.LOW,
+            'COMMUNITY_DRIFT',
+            {'community_id': new_community_id},
+            dedupe_key=f"COMMUNITY_DRIFT_{new_community_id}",
+            replace_existing=False
+        )
 
     def _do_community_schism(self, data: dict):
         community_id = data['community_id']
