@@ -1625,7 +1625,7 @@ Do not apologize, just state that the thread is locked. Do not output JSON, just
             )
 
         # Agent Community Creation Spin-off
-        if sim.energy > 1.5 and sim.current_topics and random.random() < 0.05:
+        if sim.energy > 1.5 and sim.current_topics and sim.current_topics[0]['weight'] >= 2.0 and random.random() < 0.05:
             top_topic = sim.current_topics[0]['topic']
             self.schedule(
                 10,
@@ -1742,9 +1742,9 @@ Respond with ONLY the new persona string and no other commentary or JSON.
         finally:
             conn.close()
 
-        prompt = f"""You are {agent['persona']}. You are heavily invested in the topic of '{topic}' and have decided to start your own spin-off community dedicated entirely to this hyper-specific subject.
+        prompt = f"""You are {agent['persona']}. You are heavily invested in the specific niche topic of '{topic}' and have decided to start your own spin-off community dedicated entirely to this hyper-specific sub-category. DO NOT make it a broad community. If the topic is 'mushroom island', the community must be specifically about mushroom islands, not general Minecraft.
 Respond with ONLY ONE JSON object with the keys:
-  "name": A catchy, short name for your new community (e.g., "MachoManPromos" or "RedstoneLogic"). Do not use spaces.
+  "name": A catchy, short name for your new niche community (e.g., "MachoManPromos" or "RedstoneLogic"). Do not use spaces.
   "description": A 1-2 sentence description explaining the highly specific focus of this new community.
 Return only the JSON object and no other commentary."""
 
@@ -1957,7 +1957,7 @@ SIMULATIONS: Dict[int, Simulation] = {}
 
 
 def extract_topics(text: str) -> List[str]:
-    """Lightweight keyword extraction using basic heuristic."""
+    """Lightweight keyword/bigram extraction using basic heuristic."""
     # Remove basic punctuation
     text = re.sub(r'[^\w\s]', '', text.lower())
     words = text.split()
@@ -1972,7 +1972,8 @@ def extract_topics(text: str) -> List[str]:
         "right", "wrong", "maybe", "though", "those", "these", "make", "made", "making", "gets", "getting", "got",
         "good", "bad", "great", "better", "best", "worst", "feel", "feels", "felt"
     }
-    keywords = [
+
+    valid_words = [
         w for w in words
         if len(w) > 3
         and w not in stopwords
@@ -1980,8 +1981,15 @@ def extract_topics(text: str) -> List[str]:
         and re.search(r'[a-z]', w)
     ]
 
-    # Return top 3 most common keywords
-    counts = Counter(keywords)
+    # Extract bigrams
+    bigrams = []
+    for i in range(len(valid_words) - 1):
+        bigrams.append(f"{valid_words[i]} {valid_words[i+1]}")
+
+    all_topics = valid_words + bigrams
+
+    # Return top 3 most common topics
+    counts = Counter(all_topics)
     return [word for word, count in counts.most_common(3)]
 
 
