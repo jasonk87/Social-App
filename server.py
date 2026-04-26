@@ -268,6 +268,8 @@ def init_db() -> None:
         post_columns = {row[1] for row in cur.execute("PRAGMA table_info(posts)").fetchall()}
         if "locked" not in post_columns:
             cur.execute("ALTER TABLE posts ADD COLUMN locked INTEGER DEFAULT 0")
+        if "media_url" not in post_columns:
+            cur.execute("ALTER TABLE posts ADD COLUMN media_url TEXT")
 
         # Comments table
         cur.execute(
@@ -798,9 +800,11 @@ Bad example for a wrestling room: "Are we even looking at the right timeline?"
 Good example for a wrestling room: strong opinions about Goldberg's streak, Macho Man promos, Sting in WCW, nWo angles, Bret vs Shawn, or old WWF/WCW booking.
 Good example for a dad jokes room: a short pun, groaner, or setup/punchline that would make people roll their eyes.
 
+You may optionally include a short text description of a meme, screenshot, or image that accompanies your post to add flavor. If you do, provide it in the JSON under the key "media_url" (e.g., "[Image: A blurry screenshot of...]"). If you do not want an image, leave "media_url" out of the JSON entirely or set it to null.
 Produce EXACTLY ONE JSON object with the keys:
   "title": a short, catchy, and highly-opinionated post title that fits your persona.
   "content": a single string containing the post body. Usually keep it between 1 and 6 sentences unless the tone strongly calls for more. Use markdown only when it feels natural. Avoid mentioning that you are an AI or referring to the instructions.
+  "media_url": (Optional) a text description of the image/meme.
 Return only the JSON object and no other commentary.
 """
     response = generate_text(model, prompt)
@@ -1227,7 +1231,7 @@ class SimulationEngine:
         if make_new_post:
             # Generate post
             post_data = generate_post(model, persona, sim.name, sim.description, sim.tone, sim.style_notes, memory_str, state_ctx, is_lost_redditor)
-            post_id = add_post(community_id, agent_id, post_data['title'], post_data['content'])
+            post_id = add_post(community_id, agent_id, post_data['title'], post_data['content'], post_data.get('media_url'))
             print(f"[{sim.name}] Generated new post: {post_data['title']}")
             append_memory(f"Created a post titled '{post_data['title']}': {post_data['content']}")
 
@@ -2348,13 +2352,13 @@ def assign_agent_to_community(agent_id: int, community_id: int) -> None:
         conn.close()
 
 
-def add_post(community_id: int, agent_id: int, title: str, content: str) -> int:
+def add_post(community_id: int, agent_id: int, title: str, content: str, media_url: Optional[str] = None) -> int:
     conn = get_db_connection()
     try:
         cur = conn.cursor()
         cur.execute(
-            "INSERT INTO posts (community_id, agent_id, title, content, created_at) VALUES (?, ?, ?, ?, ?)",
-            (community_id, agent_id, title, content, time.time()),
+            "INSERT INTO posts (community_id, agent_id, title, content, created_at, locked, media_url) VALUES (?, ?, ?, ?, ?, 0, ?)",
+            (community_id, agent_id, title, content, time.time(), media_url),
         )
         post_id = cur.lastrowid
         conn.commit()
@@ -2435,6 +2439,7 @@ def fetch_community_feed(community_id: int, target_post_id: Optional[int] = None
                     'id': post_id,
                     'title': p_row['title'],
                     'content': p_row['content'],
+                    'media_url': p_row['media_url'],
                     'author': p_row['author'],
                     'agent_id': p_row['agent_id'],
                     'created_at': p_row['created_at'],
@@ -2444,7 +2449,7 @@ def fetch_community_feed(community_id: int, target_post_id: Optional[int] = None
 
         cur.execute(
             """
-            SELECT posts.id as post_id, posts.title, posts.content, posts.created_at, posts.locked,
+            SELECT posts.id as post_id, posts.title, posts.content, posts.created_at, posts.locked, posts.media_url,
                    agents.username AS author, agents.id AS agent_id
             FROM posts
             JOIN agents ON posts.agent_id = agents.id
@@ -2459,7 +2464,7 @@ def fetch_community_feed(community_id: int, target_post_id: Optional[int] = None
         if target_post_id is not None and target_post_id not in post_map:
             cur.execute(
                 """
-                SELECT posts.id as post_id, posts.title, posts.content, posts.created_at, posts.locked,
+                SELECT posts.id as post_id, posts.title, posts.content, posts.created_at, posts.locked, posts.media_url,
                        agents.username AS author, agents.id AS agent_id
                 FROM posts
                 JOIN agents ON posts.agent_id = agents.id
@@ -2495,6 +2500,7 @@ def fetch_home_feed(user_id: int, sort: str = "latest", offset: int = 0, limit: 
                 posts.created_at,
                 posts.community_id,
                 posts.locked,
+                posts.media_url,
                 communities.name AS community_name,
                 communities.description AS community_description,
                 agents.username AS author,
@@ -3081,7 +3087,8 @@ class RequestHandler(BaseHTTPRequestHandler):
                     if not title or not content:
                         self.respond_json({'error': 'Title and content required'}, status=400)
                         return
-                    post_id = add_post(row['id'], current_user['agent_id'], title, content)
+                    media_url = data.get('media_url')
+                    post_id = add_post(row['id'], current_user['agent_id'], title, content, media_url)
                     # When a Human user posts, we don't automatically trigger immediate AI replies here 
                     # as the engine will pick it up during its normal cycle, or we could schedule a check.
                     self.respond_json({'success': True, 'post_id': post_id})

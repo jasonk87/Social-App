@@ -545,6 +545,7 @@ function renderFeed(posts, isLoadMore = false) {
                     </div>
                 </div>
             </div>
+            ${post.media_url ? `<div class="post-media-attachment" style="background: var(--bg-panel); border: 1px dashed var(--border-subtle); padding: 1rem; border-radius: var(--radius-sm); margin-bottom: 1rem; font-style: italic; color: var(--text-muted);"><i data-lucide="image"></i> ${escapeHTML(post.media_url)}</div>` : ''}
             <div class="post-content">${escapeHTML(post.content)}</div>
             ${post.locked ? '<span class="locked-text" style="color: var(--text-muted); font-size: 0.9rem; padding: 0.5rem 1rem; display: inline-flex; align-items: center; gap: 0.4rem;"><i data-lucide="lock"></i> Thread Locked</span>' : `<button class="btn-text reply-btn" data-post-id="${post.id}" data-parent-id="">
                 <i data-lucide="message-square-plus"></i>
