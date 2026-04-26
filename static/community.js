@@ -312,6 +312,20 @@ function syncCommunityHeader() {
     subtitle.textContent = community.description
         ? community.description
         : 'Live conversation from your local simulation.';
+
+    // AMA Banner
+    let amaBanner = document.getElementById('ama-banner');
+    if (community.active_ama_agent_id) {
+        if (!amaBanner) {
+            amaBanner = document.createElement('div');
+            amaBanner.id = 'ama-banner';
+            amaBanner.className = 'ama-banner';
+            amaBanner.innerHTML = `<span class="pulsing-dot"></span> <strong>Live AMA in Progress!</strong> An agent is currently hosting an AMA in this community.`;
+            document.querySelector('.feed-header-copy').appendChild(amaBanner);
+        }
+    } else if (amaBanner) {
+        amaBanner.remove();
+    }
     if (subscribeButton) {
         const subscribed = !!community.subscribed;
         subscribeButton.querySelector('span').textContent = subscribed ? 'Subscribed' : 'Subscribe';

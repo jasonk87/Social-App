@@ -271,6 +271,10 @@ def init_db() -> None:
         if "media_url" not in post_columns:
             cur.execute("ALTER TABLE posts ADD COLUMN media_url TEXT")
 
+        community_columns = {row[1] for row in cur.execute("PRAGMA table_info(communities)").fetchall()}
+        if "active_ama_agent_id" not in community_columns:
+            cur.execute("ALTER TABLE communities ADD COLUMN active_ama_agent_id INTEGER DEFAULT NULL")
+
         # Comments table
         cur.execute(
             """
@@ -1069,6 +1073,10 @@ class SimulationEngine:
                         self._do_community_merger(event.data)
                     elif event.event_type == 'AGENT_MODERATE':
                         self._do_agent_moderate(event.data)
+                    elif event.event_type == 'AMA_START':
+                        self._do_ama_start(event.data)
+                    elif event.event_type == 'AMA_END':
+                        self._do_ama_end(event.data)
 
                     # Mark completed *only* if the event isn't already re-scheduled by its own execution.
                     # e.g., if a community post replaces its own dedupe_key row, marking it completed here
@@ -1226,8 +1234,25 @@ class SimulationEngine:
             return f"Mood: {mood_str}. Conflict level: {conflict_str}. Currently discussing: {topic_str}."
 
         state_ctx = _get_state_context()
+        if sim.active_ama_agent_id:
+            if agent_id == sim.active_ama_agent_id:
+                state_ctx += " Note: You are currently hosting an AMA. Please answer questions directed at you."
+            else:
+                state_ctx += " Note: There is currently a live AMA happening. You should direct a question to the host."
+
 
         # Phase 3: Generate content
+
+        # Override for AMA Event prioritizing
+        if sim.active_ama_agent_id:
+            if agent_id == sim.active_ama_agent_id:
+                # The AMA host must always reply to questions
+                make_new_post = False
+            else:
+                # Regular users should mostly ask questions
+                if random.random() < 0.8:
+                    make_new_post = False
+
         if make_new_post:
             # Generate post
             post_data = generate_post(model, persona, sim.name, sim.description, sim.tone, sim.style_notes, memory_str, state_ctx, is_lost_redditor)
@@ -1248,18 +1273,36 @@ class SimulationEngine:
                 conn = get_db_connection()
                 try:
                     cur = conn.cursor()
-                    cur.execute(
-                        """
-                        SELECT comments.id, comments.content, comments.post_id, comments.agent_id
-                        FROM comments
-                        JOIN posts ON comments.post_id = posts.id
-                        JOIN agents ON comments.agent_id = agents.id
-                        WHERE posts.community_id = ? AND (posts.locked = 0 OR posts.locked IS NULL)
-                        ORDER BY CASE WHEN agents.username = 'You' THEN 0 ELSE 1 END, RANDOM()
-                        LIMIT 1
-                        """,
-                        (community_id,),
-                    )
+                    if sim.active_ama_agent_id and agent_id == sim.active_ama_agent_id:
+                        # AMA host replies to comments directed at them or their post
+                        cur.execute(
+                            """
+                            SELECT comments.id, comments.content, comments.post_id, comments.agent_id
+                            FROM comments
+                            JOIN posts ON comments.post_id = posts.id
+                            JOIN agents ON comments.agent_id = agents.id
+                            WHERE posts.community_id = ? AND (posts.locked = 0 OR posts.locked IS NULL)
+                              AND (comments.parent_id IN (SELECT id FROM comments WHERE agent_id = ?)
+                                   OR posts.agent_id = ?)
+                              AND comments.agent_id != ?
+                            ORDER BY RANDOM()
+                            LIMIT 1
+                            """,
+                            (community_id, agent_id, agent_id, agent_id)
+                        )
+                    else:
+                        cur.execute(
+                            """
+                            SELECT comments.id, comments.content, comments.post_id, comments.agent_id
+                            FROM comments
+                            JOIN posts ON comments.post_id = posts.id
+                            JOIN agents ON comments.agent_id = agents.id
+                            WHERE posts.community_id = ? AND (posts.locked = 0 OR posts.locked IS NULL)
+                            ORDER BY CASE WHEN agents.username = 'You' THEN 0 ELSE 1 END, RANDOM()
+                            LIMIT 1
+                            """,
+                            (community_id,),
+                        )
                     row = cur.fetchone()
                     if row:
                         parent_id = row['id']
@@ -1312,18 +1355,45 @@ class SimulationEngine:
                 conn = get_db_connection()
                 try:
                     cur = conn.cursor()
-                    cur.execute(
-                        """
-                        SELECT posts.id, posts.title, posts.content, posts.agent_id
-                        FROM posts
-                        JOIN agents ON posts.agent_id = agents.id
-                        WHERE posts.community_id = ? AND (posts.locked = 0 OR posts.locked IS NULL)
-                        ORDER BY CASE WHEN agents.username = 'You' THEN 0 ELSE 1 END, RANDOM()
-                        LIMIT 1
-                        """,
-                        (community_id,),
-                    )
-                    row = cur.fetchone()
+                    if sim.active_ama_agent_id and agent_id != sim.active_ama_agent_id:
+                        # Regular agent forces reply to the AMA post
+                        cur.execute(
+                            """
+                            SELECT posts.id, posts.title, posts.content, posts.agent_id
+                            FROM posts
+                            WHERE posts.community_id = ? AND posts.agent_id = ? AND (posts.locked = 0 OR posts.locked IS NULL)
+                            ORDER BY created_at ASC
+                            LIMIT 1
+                            """,
+                            (community_id, sim.active_ama_agent_id)
+                        )
+                        row = cur.fetchone()
+                        if not row:
+                            cur.execute(
+                                """
+                                SELECT posts.id, posts.title, posts.content, posts.agent_id
+                                FROM posts
+                                JOIN agents ON posts.agent_id = agents.id
+                                WHERE posts.community_id = ? AND (posts.locked = 0 OR posts.locked IS NULL)
+                                ORDER BY CASE WHEN agents.username = 'You' THEN 0 ELSE 1 END, RANDOM()
+                                LIMIT 1
+                                """,
+                                (community_id,),
+                            )
+                            row = cur.fetchone()
+                    else:
+                        cur.execute(
+                            """
+                            SELECT posts.id, posts.title, posts.content, posts.agent_id
+                            FROM posts
+                            JOIN agents ON posts.agent_id = agents.id
+                            WHERE posts.community_id = ? AND (posts.locked = 0 OR posts.locked IS NULL)
+                            ORDER BY CASE WHEN agents.username = 'You' THEN 0 ELSE 1 END, RANDOM()
+                            LIMIT 1
+                            """,
+                            (community_id,),
+                        )
+                        row = cur.fetchone()
                     if row:
                         post_id = row['id']
                         title = row['title']
@@ -1428,6 +1498,12 @@ class SimulationEngine:
             return f"Mood: {mood_str}. Conflict level: {conflict_str}. Currently discussing: {topic_str}."
 
         state_ctx = _get_state_context()
+        if sim.active_ama_agent_id:
+            if agent_id == sim.active_ama_agent_id:
+                state_ctx += " Note: You are currently hosting an AMA. Please answer questions directed at you."
+            else:
+                state_ctx += " Note: There is currently a live AMA happening. You should direct a question to the host."
+
 
         conn = get_db_connection()
         r_agent_id = None
@@ -1462,6 +1538,99 @@ class SimulationEngine:
                 'community_id': community_id,
                 'post_id': post_id
             })
+
+    def _do_ama_start(self, data: dict):
+        community_id = data['community_id']
+        sim = SIMULATIONS.get(community_id)
+        if not sim or sim.active_ama_agent_id:
+            return
+
+        print(f"[{sim.name}] Starting AMA event!")
+
+        # 1. Ask LLM to generate a historical persona based on community topics
+        topics_str = ", ".join([t['topic'] for t in sim.current_topics]) if sim.current_topics else sim.description
+
+        prompt = f"""Generate a JSON profile for a famous historical figure or well-known celebrity who would be extremely relevant to the topics: {topics_str}.
+Respond with ONLY ONE JSON object with the keys:
+  "username": A catchy alias (e.g., "AbeLincoln", "CleopatraTheQueen"). No spaces.
+  "persona": A short 2-sentence description of who they are and why they are hosting an AMA in this community.
+Return only the JSON object."""
+
+        try:
+            response = generate_text(sim.model, prompt)
+            start = response.find("{")
+            end = response.rfind("}")
+            if start != -1 and end != -1:
+                response = response[start:end+1]
+            result = json.loads(response)
+            username = result['username'].replace(' ', '')
+            persona_desc = result['persona']
+        except Exception as e:
+            print(f"Failed to generate AMA persona: {e}")
+            return
+
+        # 2. Create the agent
+        agent_id = add_agent(username, sim.model, persona_desc)
+        assign_agent_to_community(agent_id, community_id)
+
+        # 3. Mark as active
+        sim.active_ama_agent_id = agent_id
+        conn = get_db_connection()
+        try:
+            conn.execute("UPDATE communities SET active_ama_agent_id = ? WHERE id = ?", (agent_id, community_id))
+            conn.commit()
+        finally:
+            conn.close()
+
+        # 4. Generate top level post
+        post_title = f"I am {username}. Ask Me Anything!"
+        post_content = f"Greetings! I am hosting an AMA here today. {persona_desc} Please drop your questions below!"
+
+        post_id = add_post(community_id, agent_id, post_title, post_content)
+
+        # 5. Schedule end
+        self.schedule(
+            180,  # 3 minutes for simulation
+            EventPriority.HIGH,
+            'AMA_END',
+            {'community_id': community_id, 'agent_id': agent_id},
+            dedupe_key=f"AMA_END_{community_id}",
+            replace_existing=True
+        )
+
+    def _do_ama_end(self, data: dict):
+        community_id = data['community_id']
+        agent_id = data['agent_id']
+
+        sim = SIMULATIONS.get(community_id)
+        if not sim or sim.active_ama_agent_id != agent_id:
+            return
+
+        print(f"[{sim.name}] Ending AMA event.")
+
+        # Clear state
+        sim.active_ama_agent_id = None
+        conn = get_db_connection()
+        try:
+            conn.execute("UPDATE communities SET active_ama_agent_id = NULL WHERE id = ?", (community_id,))
+
+            # Update the agent so they know it's over, or basically 'deactivate' them
+            cur = conn.cursor()
+            cur.execute("SELECT persona FROM agents WHERE id = ?", (agent_id,))
+            row = cur.fetchone()
+            if row:
+                new_persona = row['persona'] + " My AMA has ended. I am no longer actively answering questions and have returned to the past."
+                cur.execute("UPDATE agents SET persona = ? WHERE id = ?", (new_persona, agent_id))
+
+            # Optional: Add a final comment to their top post
+            cur.execute("SELECT id FROM posts WHERE agent_id = ? AND community_id = ? ORDER BY created_at ASC LIMIT 1", (agent_id, community_id))
+            post_row = cur.fetchone()
+            if post_row:
+                add_comment(post_row['id'], agent_id, None, "Thank you for all your wonderful questions! My time here has ended. Farewell!")
+
+            conn.commit()
+        finally:
+            conn.close()
 
     def _do_agent_moderate(self, data: dict):
         community_id = data['community_id']
@@ -1625,6 +1794,17 @@ Do not apologize, just state that the thread is locked. Do not output JSON, just
                 'COMMUNITY_SCHISM',
                 {'community_id': community_id},
                 dedupe_key=f"COMMUNITY_SCHISM_{community_id}",
+                replace_existing=False
+            )
+
+        # AMA Event Trigger
+        if not sim.active_ama_agent_id and sim.energy > 1.0 and random.random() < 0.01:
+            self.schedule(
+                10,
+                EventPriority.HIGH,
+                'AMA_START',
+                {'community_id': community_id},
+                dedupe_key=f"AMA_START_{community_id}",
                 replace_existing=False
             )
 
@@ -1943,6 +2123,7 @@ class Simulation:
         self.energy = float(energy) if energy is not None else 1.0
         self.trendiness = float(trendiness) if trendiness is not None else 0.5
         self.novelty_pressure = float(novelty_pressure) if novelty_pressure is not None else 0.5
+        self.active_ama_agent_id = None
         try:
             self.current_topics = prune_topic_list(json.loads(current_topics) if current_topics else [])
         except:
@@ -2684,7 +2865,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                         conn = get_db_connection()
                         try:
                             cur = conn.cursor()
-                            cur.execute("SELECT mood, conflict_level, energy, current_topics FROM communities WHERE id = ?", (c_id,))
+                            cur.execute("SELECT mood, conflict_level, energy, current_topics, active_ama_agent_id FROM communities WHERE id = ?", (c_id,))
                             row = cur.fetchone()
                             if row:
                                 try:
@@ -2695,7 +2876,8 @@ class RequestHandler(BaseHTTPRequestHandler):
                                     'mood': row['mood'],
                                     'conflict_level': row['conflict_level'],
                                     'energy': row['energy'],
-                                    'top_topics': topics
+                                    'top_topics': topics,
+                                    'active_ama_agent_id': row['active_ama_agent_id']
                                 })
                             else:
                                 self.respond_json({'error': 'Community not found'}, status=404)
@@ -2808,6 +2990,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                             'tone': normalize_tone(row['tone']),
                             'style_notes': row['style_notes'] or '',
                             'subscribed': bool(current_user and is_user_subscribed(current_user['id'], row['id'])),
+                            'active_ama_agent_id': row.get('active_ama_agent_id'),
                         },
                         'current_user': (
                             {
@@ -3280,6 +3463,8 @@ def run_server(host: str = 'localhost', port: int = 8080) -> None:
                     row['novelty_pressure'],
                     row['current_topics']
                 )
+                if 'active_ama_agent_id' in row.keys():
+                    sim.active_ama_agent_id = row['active_ama_agent_id']
                 SIMULATIONS[comm_id] = sim
                 ENGINE.schedule(
                     start_delay,
