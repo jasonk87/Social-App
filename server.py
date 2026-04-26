@@ -264,6 +264,11 @@ def init_db() -> None:
             )
             """
         )
+        # Add locked column to posts if missing
+        post_columns = {row[1] for row in cur.execute("PRAGMA table_info(posts)").fetchall()}
+        if "locked" not in post_columns:
+            cur.execute("ALTER TABLE posts ADD COLUMN locked INTEGER DEFAULT 0")
+
         # Comments table
         cur.execute(
             """
@@ -1058,6 +1063,8 @@ class SimulationEngine:
                         self._do_agent_found_community(event.data)
                     elif event.event_type == 'COMMUNITY_MERGER':
                         self._do_community_merger(event.data)
+                    elif event.event_type == 'AGENT_MODERATE':
+                        self._do_agent_moderate(event.data)
 
                     # Mark completed *only* if the event isn't already re-scheduled by its own execution.
                     # e.g., if a community post replaces its own dedupe_key row, marking it completed here
@@ -1243,7 +1250,7 @@ class SimulationEngine:
                         FROM comments
                         JOIN posts ON comments.post_id = posts.id
                         JOIN agents ON comments.agent_id = agents.id
-                        WHERE posts.community_id = ?
+                        WHERE posts.community_id = ? AND (posts.locked = 0 OR posts.locked IS NULL)
                         ORDER BY CASE WHEN agents.username = 'You' THEN 0 ELSE 1 END, RANDOM()
                         LIMIT 1
                         """,
@@ -1273,6 +1280,12 @@ class SimulationEngine:
                     if parent_agent_id:
                         update_relationship(agent_id, parent_agent_id, is_argumentative)
 
+                    if sim.conflict_level > 0.8:
+                        ENGINE.schedule(random.randint(5, 15), EventPriority.HIGH, 'AGENT_MODERATE', {
+                            'community_id': community_id,
+                            'post_id': post_id
+                        })
+
                     # If parent author is an AI, schedule an agent reply event!
                     if parent_agent_id:
                         conn = get_db_connection()
@@ -1300,7 +1313,7 @@ class SimulationEngine:
                         SELECT posts.id, posts.title, posts.content, posts.agent_id
                         FROM posts
                         JOIN agents ON posts.agent_id = agents.id
-                        WHERE posts.community_id = ?
+                        WHERE posts.community_id = ? AND (posts.locked = 0 OR posts.locked IS NULL)
                         ORDER BY CASE WHEN agents.username = 'You' THEN 0 ELSE 1 END, RANDOM()
                         LIMIT 1
                         """,
@@ -1329,6 +1342,12 @@ class SimulationEngine:
 
                     if post_agent_id:
                         update_relationship(agent_id, post_agent_id, is_argumentative)
+
+                    if sim.conflict_level > 0.8:
+                        ENGINE.schedule(random.randint(5, 15), EventPriority.HIGH, 'AGENT_MODERATE', {
+                            'community_id': community_id,
+                            'post_id': post_id
+                        })
 
                     if post_agent_id:
                         conn = get_db_connection()
@@ -1433,6 +1452,72 @@ class SimulationEngine:
 
         if r_agent_id:
             update_relationship(agent_id, r_agent_id, is_argumentative)
+
+        if sim.conflict_level > 0.8:
+            ENGINE.schedule(random.randint(5, 15), EventPriority.HIGH, 'AGENT_MODERATE', {
+                'community_id': community_id,
+                'post_id': post_id
+            })
+
+    def _do_agent_moderate(self, data: dict):
+        community_id = data['community_id']
+        post_id = data['post_id']
+
+        sim = SIMULATIONS.get(community_id)
+        if not sim:
+            return
+
+        conn = get_db_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT locked FROM posts WHERE id = ?", (post_id,))
+            row = cur.fetchone()
+            if not row or row['locked'] == 1:
+                return
+
+            cur.execute("UPDATE posts SET locked = 1 WHERE id = ?", (post_id,))
+
+            # Find an active AI agent or fallback to You
+            cur.execute(
+                """
+                SELECT agents.id, agents.username, agents.model, agents.persona
+                FROM agents
+                JOIN community_agents ON agents.id = community_agents.agent_id
+                WHERE community_agents.community_id = ? AND agents.model != 'none'
+                ORDER BY RANDOM() LIMIT 1
+                """,
+                (community_id,)
+            )
+            mod_row = cur.fetchone()
+
+            if not mod_row:
+                cur.execute("SELECT id FROM agents WHERE username = 'You'")
+                you_row = cur.fetchone()
+                mod_agent_id = you_row['id'] if you_row else 1
+                mod_message = "System: This thread has become too heated and is now locked for moderation."
+            else:
+                mod_agent_id = mod_row['id']
+                prompt = f"""You are {mod_row['persona']}. You are stepping in to moderate this thread because it has become too heated and hostile.
+Write a very short, firm, but fair message announcing that you are locking the thread.
+Do not apologize, just state that the thread is locked. Do not output JSON, just the text."""
+                mod_message = generate_text(mod_row['model'], prompt).strip()
+
+            conn.commit()
+
+            # Add moderation comment
+            add_comment(post_id, mod_agent_id, None, mod_message)
+
+            # Cool down community
+            sim.conflict_level = max(0.0, sim.conflict_level - 0.4)
+            conn.execute("UPDATE communities SET conflict_level = ? WHERE id = ?", (sim.conflict_level, community_id))
+            conn.commit()
+
+            # Feed will refresh naturally, or client will see lock on refresh,
+            # add_comment already broadcasts SSE. We also broadcast a generic refresh
+            broadcast_sse('new_post', {'post_id': post_id, 'community_id': community_id})
+
+        finally:
+            conn.close()
 
     def _do_community_merger(self, data: dict):
         c1 = data['community_id_1']
@@ -2345,12 +2430,13 @@ def fetch_community_feed(community_id: int, target_post_id: Optional[int] = None
                     'author': p_row['author'],
                     'agent_id': p_row['agent_id'],
                     'created_at': p_row['created_at'],
+                    'locked': bool(p_row['locked']),
                     'comments': comments_tree,
                 }
 
         cur.execute(
             """
-            SELECT posts.id as post_id, posts.title, posts.content, posts.created_at,
+            SELECT posts.id as post_id, posts.title, posts.content, posts.created_at, posts.locked,
                    agents.username AS author, agents.id AS agent_id
             FROM posts
             JOIN agents ON posts.agent_id = agents.id
@@ -2365,7 +2451,7 @@ def fetch_community_feed(community_id: int, target_post_id: Optional[int] = None
         if target_post_id is not None and target_post_id not in post_map:
             cur.execute(
                 """
-                SELECT posts.id as post_id, posts.title, posts.content, posts.created_at,
+                SELECT posts.id as post_id, posts.title, posts.content, posts.created_at, posts.locked,
                        agents.username AS author, agents.id AS agent_id
                 FROM posts
                 JOIN agents ON posts.agent_id = agents.id
@@ -2400,6 +2486,7 @@ def fetch_home_feed(user_id: int, sort: str = "latest", offset: int = 0, limit: 
                 posts.content,
                 posts.created_at,
                 posts.community_id,
+                posts.locked,
                 communities.name AS community_name,
                 communities.description AS community_description,
                 agents.username AS author,
@@ -2428,6 +2515,7 @@ def fetch_home_feed(user_id: int, sort: str = "latest", offset: int = 0, limit: 
                 "content": row["content"],
                 "created_at": row["created_at"],
                 "community_id": row["community_id"],
+                "locked": bool(row["locked"]),
                 "community_name": row["community_name"],
                 "community_description": row["community_description"] or "",
                 "author": row["author"],
@@ -3008,6 +3096,18 @@ class RequestHandler(BaseHTTPRequestHandler):
                     if not content:
                         self.respond_json({'error': 'Content required'}, status=400)
                         return
+
+                    conn = get_db_connection()
+                    try:
+                        cur = conn.cursor()
+                        cur.execute("SELECT locked FROM posts WHERE id = ?", (post_id,))
+                        row = cur.fetchone()
+                        if row and row['locked'] == 1:
+                            self.respond_json({'error': 'This thread is locked.'}, status=403)
+                            return
+                    finally:
+                        conn.close()
+
                     comment_id = add_comment(post_id, current_user['agent_id'], parent_id, content)
                     
                     # Trigger an AI reply if human is replying to an AI agent

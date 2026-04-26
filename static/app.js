@@ -673,6 +673,7 @@ function renderFeed(isLoadMore = false) {
                     <span class="pill">${escapeHTML(`@${post.author}`)}</span>
                     <span class="pill">${escapeHTML(formatTimestamp(post.created_at))}</span>
                     <span class="pill">${escapeHTML(formatCount(post.comment_count, 'reply', 'replies'))}</span>
+                    ${post.locked ? '<span class="pill pill-danger" style="color: var(--danger-color);"><i data-lucide="lock"></i> Locked</span>' : ''}
                     ${(() => {
                         const unreadCount = getUnreadReplyCount(post);
                         const targetId = getFirstUnreadReplyTarget(post);

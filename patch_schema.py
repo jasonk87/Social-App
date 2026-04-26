@@ -1,29 +1,105 @@
-import server
-import sqlite3
+import re
 
-def patch_schema():
-    conn = server.get_db_connection()
-    try:
-        cur = conn.cursor()
-        columns = {row[1] for row in cur.execute("PRAGMA table_info(simulation_events)").fetchall()}
+with open("server.py", "r") as f:
+    content = f.read()
 
-        if "status" not in columns:
-            cur.execute("ALTER TABLE simulation_events ADD COLUMN status TEXT DEFAULT 'pending'")
-        if "attempts" not in columns:
-            cur.execute("ALTER TABLE simulation_events ADD COLUMN attempts INTEGER DEFAULT 0")
-        if "claimed_at" not in columns:
-            cur.execute("ALTER TABLE simulation_events ADD COLUMN claimed_at REAL")
-        if "last_error" not in columns:
-            cur.execute("ALTER TABLE simulation_events ADD COLUMN last_error TEXT")
-        if "dedupe_key" not in columns:
-            cur.execute("ALTER TABLE simulation_events ADD COLUMN dedupe_key TEXT")
+# 1. Update init_db
+init_db_search = """        # Comments table"""
+init_db_replace = """        # Add locked column to posts if missing
+        post_columns = {row[1] for row in cur.execute("PRAGMA table_info(posts)").fetchall()}
+        if "locked" not in post_columns:
+            cur.execute("ALTER TABLE posts ADD COLUMN locked INTEGER DEFAULT 0")
 
-        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_sim_events_dedupe ON simulation_events (dedupe_key) WHERE dedupe_key IS NOT NULL")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_sim_events_status_time ON simulation_events (status, timestamp, priority)")
+        # Comments table"""
 
-        conn.commit()
-    finally:
-        conn.close()
+content = content.replace(init_db_search, init_db_replace)
 
-if __name__ == "__main__":
-    patch_schema()
+
+# 2. Update fetch_home_feed
+home_feed_search = """            SELECT
+                posts.id AS post_id,
+                posts.title,
+                posts.content,
+                posts.created_at,
+                posts.community_id,"""
+
+home_feed_replace = """            SELECT
+                posts.id AS post_id,
+                posts.title,
+                posts.content,
+                posts.created_at,
+                posts.community_id,
+                posts.locked,"""
+
+content = content.replace(home_feed_search, home_feed_replace)
+
+home_feed_append_search = """            posts.append({
+                "id": row["post_id"],
+                "title": row["title"],
+                "content": row["content"],
+                "created_at": row["created_at"],
+                "community_id": row["community_id"],"""
+
+home_feed_append_replace = """            posts.append({
+                "id": row["post_id"],
+                "title": row["title"],
+                "content": row["content"],
+                "created_at": row["created_at"],
+                "community_id": row["community_id"],
+                "locked": bool(row["locked"]),"""
+
+content = content.replace(home_feed_append_search, home_feed_append_replace)
+
+
+# 3. Update fetch_community_feed
+comm_feed_search = """        cur.execute(
+            \"\"\"
+            SELECT posts.id as post_id, posts.title, posts.content, posts.created_at,
+                   agents.username AS author, agents.id AS agent_id
+            FROM posts"""
+
+comm_feed_replace = """        cur.execute(
+            \"\"\"
+            SELECT posts.id as post_id, posts.title, posts.content, posts.created_at, posts.locked,
+                   agents.username AS author, agents.id AS agent_id
+            FROM posts"""
+
+content = content.replace(comm_feed_search, comm_feed_replace)
+
+comm_feed_target_search = """        if target_post_id is not None and target_post_id not in post_map:
+            cur.execute(
+                \"\"\"
+                SELECT posts.id as post_id, posts.title, posts.content, posts.created_at,
+                       agents.username AS author, agents.id AS agent_id
+                FROM posts"""
+
+comm_feed_target_replace = """        if target_post_id is not None and target_post_id not in post_map:
+            cur.execute(
+                \"\"\"
+                SELECT posts.id as post_id, posts.title, posts.content, posts.created_at, posts.locked,
+                       agents.username AS author, agents.id AS agent_id
+                FROM posts"""
+
+content = content.replace(comm_feed_target_search, comm_feed_target_replace)
+
+comm_feed_append_search = """                post_map[post_id] = {
+                    'id': post_id,
+                    'title': p_row['title'],
+                    'content': p_row['content'],
+                    'author': p_row['author'],
+                    'agent_id': p_row['agent_id'],
+                    'created_at': p_row['created_at'],"""
+
+comm_feed_append_replace = """                post_map[post_id] = {
+                    'id': post_id,
+                    'title': p_row['title'],
+                    'content': p_row['content'],
+                    'author': p_row['author'],
+                    'agent_id': p_row['agent_id'],
+                    'created_at': p_row['created_at'],
+                    'locked': bool(p_row['locked']),"""
+
+content = content.replace(comm_feed_append_search, comm_feed_append_replace)
+
+with open("server.py", "w") as f:
+    f.write(content)

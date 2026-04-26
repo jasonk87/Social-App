@@ -473,7 +473,7 @@ function createEmptyState(title, message) {
     `;
 }
 
-function renderComments(comments, container, depth = 0, postId = null) {
+function renderComments(comments, container, depth = 0, postId = null, isLocked = false) {
     comments.forEach((comment) => {
         const div = document.createElement('div');
         div.className = 'comment';
@@ -485,15 +485,15 @@ function renderComments(comments, container, depth = 0, postId = null) {
                 <span>${escapeHTML(formatTimestamp(comment.created_at))}</span>
             </div>
             <div class="post-content">${escapeHTML(comment.content)}</div>
-            <button class="btn-text reply-btn" data-post-id="${postId}" data-parent-id="${comment.id}">
+            ${isLocked ? '' : `<button class="btn-text reply-btn" data-post-id="${postId}" data-parent-id="${comment.id}">
                 <i data-lucide="message-square-plus"></i>
                 <span>Reply</span>
-            </button>
+            </button>`}
         `;
         container.appendChild(div);
 
         if (comment.children && comment.children.length > 0) {
-            renderComments(comment.children, container, depth + 1, postId);
+            renderComments(comment.children, container, depth + 1, postId, isLocked);
         }
     });
 }
@@ -535,6 +535,7 @@ function renderFeed(posts, isLoadMore = false) {
                     <span class="pill pill-accent">${escapeHTML(`@${post.author}`)}</span>
                     <span class="pill">${escapeHTML(formatTimestamp(post.created_at))}</span>
                     <span class="pill">${escapeHTML(`${totalComments} repl${totalComments === 1 ? 'y' : 'ies'}`)}</span>
+                    ${post.locked ? '<span class="pill pill-danger" style="color: var(--danger-color);"><i data-lucide="lock"></i> Locked</span>' : ''}
                     ${unreadTargets.length ? `<button type="button" class="reply-badge" data-target-id="${unreadTargets[0]}">${escapeHTML(`${unreadTargets.length} ${unreadLabel}`)}</button>` : ''}
                 </div>
                 <div>
@@ -545,16 +546,16 @@ function renderFeed(posts, isLoadMore = false) {
                 </div>
             </div>
             <div class="post-content">${escapeHTML(post.content)}</div>
-            <button class="btn-text reply-btn" data-post-id="${post.id}" data-parent-id="">
+            ${post.locked ? '<span class="locked-text" style="color: var(--text-muted); font-size: 0.9rem; padding: 0.5rem 1rem; display: inline-flex; align-items: center; gap: 0.4rem;"><i data-lucide="lock"></i> Thread Locked</span>' : `<button class="btn-text reply-btn" data-post-id="${post.id}" data-parent-id="">
                 <i data-lucide="message-square-plus"></i>
                 <span>Reply</span>
-            </button>
+            </button>`}
             <div class="comments"></div>
         `;
 
         const commentsContainer = article.querySelector('.comments');
         if (post.comments && post.comments.length > 0) {
-            renderComments(post.comments, commentsContainer, 0, post.id);
+            renderComments(post.comments, commentsContainer, 0, post.id, post.locked);
         }
 
         feed.appendChild(article);
