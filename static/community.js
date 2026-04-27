@@ -579,8 +579,12 @@ function renderFeed(posts, isLoadMore = false) {
     if (communityPageState.feedHasMore) {
         const sentinel = document.createElement('div');
         sentinel.id = 'feed-sentinel';
-        sentinel.style.height = '10px';
+        sentinel.className = 'feed-loader';
+        sentinel.innerHTML = `<i data-lucide="loader-2" class="spin"></i> Loading more posts...`;
         feed.appendChild(sentinel);
+        if (window.lucide) {
+            lucide.createIcons({ root: sentinel });
+        }
 
         if (communityFeedObserver) {
             communityFeedObserver.disconnect();
