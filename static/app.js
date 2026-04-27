@@ -1,10 +1,22 @@
 async function fetchJSON(url, options = {}) {
-    const res = await fetch(url, options);
-    const data = await res.json();
-    if (!res.ok) {
-        throw new Error(data.error || res.statusText);
+    let res;
+    try {
+        res = await fetch(url, options);
+    } catch (err) {
+        throw new Error('Network error. Check your connection and try again.');
     }
-    return data;
+
+    let data = null;
+    try {
+        data = await res.json();
+    } catch (err) {
+        data = null;
+    }
+
+    if (!res.ok) {
+        throw new Error(data?.error || `Request failed (${res.status})`);
+    }
+    return data || {};
 }
 
 
@@ -350,13 +362,23 @@ async function loadSession() {
 
 function renderAuthOptions(users) {
     const select = document.getElementById('login-user');
+    const loginButton = document.getElementById('login-btn');
     if (!select) {
         return;
     }
 
     if (!users.length) {
         select.innerHTML = '<option value="">No accounts yet</option>';
+        select.disabled = true;
+        if (loginButton) {
+            loginButton.disabled = true;
+        }
         return;
+    }
+
+    select.disabled = false;
+    if (loginButton) {
+        loginButton.disabled = false;
     }
 
     select.innerHTML = users.map((user) => `
@@ -515,8 +537,8 @@ function renderSidebarCommunities() {
     if (!subscribedCommunities.length) {
         grid.innerHTML = `
             <div class="empty-state">
-                <strong>No communities yet</strong>
-                Join a room and it will immediately show up here.
+                <strong>No subscriptions yet</strong>
+                Join a community and it will immediately show up here.
             </div>
         `;
         return;
@@ -806,7 +828,10 @@ async function handleLogout() {
         writeCachedSession(null);
         window.location.reload();
     } catch (err) {
-        alert(err.message);
+        const loginError = document.getElementById('login-error');
+        if (loginError) {
+            loginError.textContent = err.message;
+        }
     }
 }
 
@@ -861,7 +886,10 @@ async function handleDelete(name) {
         closeDeleteModal();
         await refreshApp();
     } catch (err) {
-        alert(err.message);
+        const createError = document.getElementById('create-error');
+        if (createError) {
+            createError.textContent = err.message;
+        }
     }
 }
 
@@ -897,12 +925,35 @@ async function handleEditSave(event) {
 }
 
 async function toggleSubscription(name, subscribed) {
-    await fetchJSON(`/api/community/${encodeURIComponent(name)}/subscribe`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ subscribed }),
-    });
-    await refreshApp();
+    const existing = appState.communities.find((community) => community.name === name);
+    const previous = existing ? !!existing.subscribed : null;
+
+    if (existing) {
+        existing.subscribed = subscribed;
+        renderCommunities();
+    }
+
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+        try {
+            await fetchJSON(`/api/community/${encodeURIComponent(name)}/subscribe`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ subscribed }),
+            });
+            await refreshApp();
+            return;
+        } catch (err) {
+            if (attempt === 0) {
+                await new Promise((resolve) => setTimeout(resolve, 600));
+                continue;
+            }
+            if (existing && previous !== null) {
+                existing.subscribed = previous;
+                renderCommunities();
+            }
+            throw err;
+        }
+    }
 }
 
 function initSSE() {
@@ -1055,7 +1106,14 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (subscribeButton) {
             const name = subscribeButton.getAttribute('data-name');
             const subscribed = subscribeButton.getAttribute('data-subscribed') !== 'true';
-            await toggleSubscription(name, subscribed);
+            try {
+                await toggleSubscription(name, subscribed);
+            } catch (err) {
+                const createError = document.getElementById('create-error');
+                if (createError) {
+                    createError.textContent = err.message;
+                }
+            }
             return;
         }
 
@@ -1092,7 +1150,14 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (subscribeButton) {
             const name = subscribeButton.getAttribute('data-name');
             const subscribed = subscribeButton.getAttribute('data-subscribed') !== 'true';
-            await toggleSubscription(name, subscribed);
+            try {
+                await toggleSubscription(name, subscribed);
+            } catch (err) {
+                const createError = document.getElementById('create-error');
+                if (createError) {
+                    createError.textContent = err.message;
+                }
+            }
             return;
         }
 

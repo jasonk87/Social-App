@@ -1,10 +1,22 @@
 async function fetchJSON(url, options = {}) {
-    const res = await fetch(url, options);
-    const data = await res.json();
-    if (!res.ok) {
-        throw new Error(data.error || res.statusText);
+    let res;
+    try {
+        res = await fetch(url, options);
+    } catch (err) {
+        throw new Error('Network error. Check your connection and try again.');
     }
-    return data;
+
+    let data = null;
+    try {
+        data = await res.json();
+    } catch (err) {
+        data = null;
+    }
+
+    if (!res.ok) {
+        throw new Error(data?.error || `Request failed (${res.status})`);
+    }
+    return data || {};
 }
 
 
