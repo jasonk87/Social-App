@@ -1,10 +1,22 @@
 async function fetchJSON(url, options = {}) {
-    const res = await fetch(url, options);
-    const data = await res.json();
-    if (!res.ok) {
-        throw new Error(data.error || res.statusText);
+    let res;
+    try {
+        res = await fetch(url, options);
+    } catch (err) {
+        throw new Error('Network error. Check your connection and try again.');
     }
-    return data;
+
+    let data = null;
+    try {
+        data = await res.json();
+    } catch (err) {
+        data = null;
+    }
+
+    if (!res.ok) {
+        throw new Error(data?.error || `Request failed (${res.status})`);
+    }
+    return data || {};
 }
 
 
@@ -21,7 +33,8 @@ function getUnreadNotificationStorageKey(name) {
 }
 
 function getNotificationPreferenceKey(name, kind) {
-    return `user-notification-pref:${kind}`;
+    const actor = communityPageState.currentUser?.agent_username || 'guest';
+    return `user-notification-pref:${actor}:${name}:${kind}`;
 }
 
 function getNotificationPreference(name, kind) {
@@ -715,15 +728,35 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
 
         const nextSubscribed = !communityPageState.community.subscribed;
+        const previous = !!communityPageState.community.subscribed;
+        communityPageState.community.subscribed = nextSubscribed;
+        syncCommunityHeader();
+
         try {
-            await fetchJSON(`/api/community/${encodeURIComponent(name)}/subscribe`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ subscribed: nextSubscribed }),
-            });
-            communityPageState.community.subscribed = nextSubscribed;
-            syncCommunityHeader();
+            let succeeded = false;
+            for (let attempt = 0; attempt < 2; attempt += 1) {
+                try {
+                    await fetchJSON(`/api/community/${encodeURIComponent(name)}/subscribe`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ subscribed: nextSubscribed }),
+                    });
+                    succeeded = true;
+                    break;
+                } catch (err) {
+                    if (attempt === 0) {
+                        await new Promise((resolve) => setTimeout(resolve, 600));
+                        continue;
+                    }
+                    throw err;
+                }
+            }
+            if (!succeeded) {
+                throw new Error('Subscription request failed.');
+            }
         } catch (err) {
+            communityPageState.community.subscribed = previous;
+            syncCommunityHeader();
             showToast('Subscription update failed', err.message);
         }
     });
@@ -903,7 +936,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             document.getElementById('new-post-content').value = '';
             await refreshCommunityAfterLocalAction({ focusTarget: true });
         } catch (err) {
-            alert(err.message);
+            showToast('Unable to publish post', err.message);
         } finally {
             button.disabled = false;
             button.classList.remove('is-busy');
@@ -971,7 +1004,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                 });
                 await refreshCommunityAfterLocalAction({ preserveScroll: true });
             } catch (err) {
-                alert(err.message);
+                showToast('Unable to publish reply', err.message);
             } finally {
                 submitButton.disabled = false;
                 submitButton.classList.remove('is-busy');

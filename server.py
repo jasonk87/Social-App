@@ -2505,6 +2505,38 @@ def update_community(community_id: int, description: str, model: str, posting_ra
         conn.close()
 
 
+def parse_posting_rate(raw_value: Any, fallback: int = 60) -> int:
+    """Parse user-supplied posting rate and return a validated integer."""
+    try:
+        posting_rate = int(raw_value if raw_value not in (None, "") else fallback)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Posting rate must be a whole number.") from exc
+    if posting_rate < 30:
+        raise ValueError("Posting rate must be at least 30 seconds.")
+    return posting_rate
+
+
+def coerce_string(value: Any, field_name: str, *, required: bool = False, max_length: int = 1000) -> str:
+    if value is None:
+        if required:
+            raise ValueError(f"{field_name} is required.")
+        return ""
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name} must be a string.")
+    cleaned = value.strip()
+    if required and not cleaned:
+        raise ValueError(f"{field_name} is required.")
+    if len(cleaned) > max_length:
+        raise ValueError(f"{field_name} must be {max_length} characters or fewer.")
+    return cleaned
+
+
+def parse_bool(value: Any, field_name: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    raise ValueError(f"{field_name} must be true or false.")
+
+
 def add_agent(username: str, model: str, persona: str) -> int:
     conn = get_db_connection()
     try:
@@ -2797,6 +2829,12 @@ class RequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def respond_error(self, message: str, *, status: int, code: str, details: Optional[Dict[str, Any]] = None) -> None:
+        payload: Dict[str, Any] = {'error': message, 'code': code}
+        if details:
+            payload['details'] = details
+        self.respond_json(payload, status=status)
+
     def get_session_token(self) -> Optional[str]:
         raw_cookie = self.headers.get('Cookie')
         if not raw_cookie:
@@ -2815,7 +2853,7 @@ class RequestHandler(BaseHTTPRequestHandler):
     def require_current_user(self) -> Optional[sqlite3.Row]:
         user = self.get_current_user()
         if user is None:
-            self.respond_json({'error': 'Sign in required'}, status=401)
+            self.respond_error('Sign in required', status=401, code='auth_required')
             return None
         return user
 
@@ -2942,7 +2980,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self.respond_json({'communities': communities})
             elif path == 'feed':
                 if current_user is None:
-                    self.respond_json({'error': 'Sign in required'}, status=401)
+                    self.respond_error('Sign in required', status=401, code='auth_required')
                     return
                 sort = (query.get('sort', ['latest'])[0] or 'latest').lower()
                 if sort not in ('latest', 'best'):
@@ -3055,15 +3093,15 @@ class RequestHandler(BaseHTTPRequestHandler):
                 else:
                     self.respond_json({'error': 'Invalid agent path'}, status=400)
             else:
-                self.respond_json({'error': 'Unknown API path'}, status=404)
+                self.respond_error('Unknown API path', status=404, code='not_found')
         except OllamaError as e:
             try:
-                self.respond_json({'error': str(e)}, status=500)
+                self.respond_error(str(e), status=500, code='ollama_error')
             except Exception:
                 pass
         except Exception as e:
             try:
-                self.respond_json({'error': f"Internal server error: {e}"}, status=500)
+                self.respond_error('Internal server error.', status=500, code='internal_error', details={'message': str(e)})
             except Exception:
                 pass
 
@@ -3071,17 +3109,27 @@ class RequestHandler(BaseHTTPRequestHandler):
         path = parsed.path[len('/api/'):]  # strip '/api/'
         content_length = int(self.headers.get('Content-Length', 0))
         body = self.rfile.read(content_length) if content_length > 0 else b''
-        try:
-            data = json.loads(body.decode('utf-8') or '{}')
-        except Exception:
-            data = {}
+        data = {}
+        if body:
+            try:
+                data = json.loads(body.decode('utf-8'))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                self.respond_error('Invalid JSON payload.', status=400, code='invalid_json')
+                return
+            if not isinstance(data, dict):
+                self.respond_error('JSON body must be an object.', status=400, code='invalid_payload')
+                return
         try:
             if path == 'login':
-                display_name = (data.get('display_name') or '').strip()
-                pin = (data.get('pin') or '').strip()
+                try:
+                    display_name = coerce_string(data.get('display_name'), 'display_name', required=True, max_length=80)
+                    pin = coerce_string(data.get('pin'), 'pin', required=True, max_length=32)
+                except ValueError as err:
+                    self.respond_error(str(err), status=400, code='validation_error')
+                    return
                 user = authenticate_user(display_name, pin)
                 if user is None:
-                    self.respond_json({'error': 'Invalid name or PIN'}, status=401)
+                    self.respond_error('Invalid name or PIN', status=401, code='invalid_credentials')
                     return
                 token = create_session(user['id'])
                 self.respond_json(
@@ -3102,7 +3150,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                 try:
                     user = create_household_user(display_name, pin)
                 except ValueError as err:
-                    self.respond_json({'error': str(err)}, status=400)
+                    self.respond_error(str(err), status=400, code='validation_error')
                     return
                 token = create_session(user['id'])
                 self.respond_json(
@@ -3130,18 +3178,23 @@ class RequestHandler(BaseHTTPRequestHandler):
                 if current_user is None:
                     return
                 # Create a new community
-                name = data.get('name')
-                description = data.get('description') or ''
-                model = data.get('model')
-                posting_rate = int(data.get('posting_rate') or 60)
-                tone = normalize_tone(data.get('tone'))
-                style_notes = data.get('style_notes') or ''
-                if not name or not model:
-                    self.respond_json({'error': 'Missing name or model'}, status=400)
+                try:
+                    name = coerce_string(data.get('name'), 'name', required=True, max_length=80)
+                    description = coerce_string(data.get('description'), 'description', required=False, max_length=600)
+                    model = coerce_string(data.get('model'), 'model', required=True, max_length=120)
+                    style_notes = coerce_string(data.get('style_notes'), 'style_notes', required=False, max_length=600)
+                except ValueError as err:
+                    self.respond_error(str(err), status=400, code='validation_error')
                     return
+                try:
+                    posting_rate = parse_posting_rate(data.get('posting_rate'), fallback=60)
+                except ValueError as err:
+                    self.respond_error(str(err), status=400, code='validation_error')
+                    return
+                tone = normalize_tone(data.get('tone'))
                 # Insert into DB
                 if get_community_by_name(name):
-                    self.respond_json({'error': 'Community already exists'}, status=400)
+                    self.respond_error('Community already exists', status=400, code='already_exists')
                     return
                 community_id = add_community(name, description, model, posting_rate, tone, style_notes)
                 # Mark as active in DB so UI reflects it
@@ -3183,17 +3236,22 @@ class RequestHandler(BaseHTTPRequestHandler):
                     name = unquote(name)
                     row = get_community_by_name(name)
                     if row is None:
-                        self.respond_json({'error': 'Community not found'}, status=404)
+                        self.respond_error('Community not found', status=404, code='not_found')
                         return
 
-                    description = data.get('description') or ''
-                    model = data.get('model')
-                    posting_rate = int(data.get('posting_rate') or row['posting_rate'] or 60)
-                    tone = normalize_tone(data.get('tone') or row['tone'])
-                    style_notes = data.get('style_notes') or ''
-                    if not model:
-                        self.respond_json({'error': 'Model is required'}, status=400)
+                    try:
+                        description = coerce_string(data.get('description'), 'description', required=False, max_length=600)
+                        model = coerce_string(data.get('model'), 'model', required=True, max_length=120)
+                        style_notes = coerce_string(data.get('style_notes'), 'style_notes', required=False, max_length=600)
+                    except ValueError as err:
+                        self.respond_error(str(err), status=400, code='validation_error')
                         return
+                    try:
+                        posting_rate = parse_posting_rate(data.get('posting_rate'), fallback=row['posting_rate'] or 60)
+                    except ValueError as err:
+                        self.respond_error(str(err), status=400, code='validation_error')
+                        return
+                    tone = normalize_tone(data.get('tone') or row['tone'])
 
                     update_community(row['id'], description, model, posting_rate, tone, style_notes)
                     sim = SIMULATIONS.get(row['id'])
@@ -3206,7 +3264,7 @@ class RequestHandler(BaseHTTPRequestHandler):
 
                     self.respond_json({'success': True})
                 else:
-                    self.respond_json({'error': 'Invalid update path'}, status=400)
+                    self.respond_error('Invalid update path', status=400, code='invalid_path')
             elif path.startswith('community/') and path.endswith('/delete'):
                 current_user = self.require_current_user()
                 if current_user is None:
@@ -3217,7 +3275,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                     name = unquote(name)
                     row = get_community_by_name(name)
                     if row is None:
-                        self.respond_json({'error': 'Community not found'}, status=404)
+                        self.respond_error('Community not found', status=404, code='not_found')
                         return
                     comm_id = row['id']
                     sim = SIMULATIONS.get(comm_id)
@@ -3232,7 +3290,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                         conn.close()
                     self.respond_json({'success': True, 'message': 'Community deleted'})
                 else:
-                    self.respond_json({'error': 'Invalid delete path'}, status=400)
+                    self.respond_error('Invalid delete path', status=400, code='invalid_path')
             elif path.startswith('community/') and path.endswith('/subscribe'):
                 current_user = self.require_current_user()
                 if current_user is None:
@@ -3243,16 +3301,20 @@ class RequestHandler(BaseHTTPRequestHandler):
                     name = unquote(name)
                     row = get_community_by_name(name)
                     if row is None:
-                        self.respond_json({'error': 'Community not found'}, status=404)
+                        self.respond_error('Community not found', status=404, code='not_found')
                         return
-                    subscribed = bool(data.get('subscribed'))
+                    try:
+                        subscribed = parse_bool(data.get('subscribed'), 'subscribed')
+                    except ValueError as err:
+                        self.respond_error(str(err), status=400, code='validation_error')
+                        return
                     if subscribed:
                         subscribe_user_to_community(current_user['id'], row['id'])
                     else:
                         unsubscribe_user_from_community(current_user['id'], row['id'])
                     self.respond_json({'success': True, 'subscribed': subscribed})
                 else:
-                    self.respond_json({'error': 'Invalid subscribe path'}, status=400)
+                    self.respond_error('Invalid subscribe path', status=400, code='invalid_path')
             elif path.startswith('community/') and path.endswith('/post'):
                 current_user = self.require_current_user()
                 if current_user is None:
@@ -3263,20 +3325,21 @@ class RequestHandler(BaseHTTPRequestHandler):
                     name = unquote(name)
                     row = get_community_by_name(name)
                     if row is None:
-                        self.respond_json({'error': 'Community not found'}, status=404)
+                        self.respond_error('Community not found', status=404, code='not_found')
                         return
-                    title = data.get('title')
-                    content = data.get('content')
-                    if not title or not content:
-                        self.respond_json({'error': 'Title and content required'}, status=400)
+                    try:
+                        title = coerce_string(data.get('title'), 'title', required=True, max_length=180)
+                        content = coerce_string(data.get('content'), 'content', required=True, max_length=5000)
+                        media_url = coerce_string(data.get('media_url'), 'media_url', required=False, max_length=2048)
+                    except ValueError as err:
+                        self.respond_error(str(err), status=400, code='validation_error')
                         return
-                    media_url = data.get('media_url')
                     post_id = add_post(row['id'], current_user['agent_id'], title, content, media_url)
                     # When a Human user posts, we don't automatically trigger immediate AI replies here 
                     # as the engine will pick it up during its normal cycle, or we could schedule a check.
                     self.respond_json({'success': True, 'post_id': post_id})
                 else:
-                    self.respond_json({'error': 'Invalid post path'}, status=400)
+                    self.respond_error('Invalid post path', status=400, code='invalid_path')
             elif path.startswith('post/') and path.endswith('/comment'):
                 current_user = self.require_current_user()
                 if current_user is None:
@@ -3287,13 +3350,26 @@ class RequestHandler(BaseHTTPRequestHandler):
                     try:
                         post_id = int(post_id_str)
                     except ValueError:
-                        self.respond_json({'error': 'Invalid post ID'}, status=400)
+                        self.respond_error('Invalid post ID', status=400, code='validation_error')
                         return
-                    content = data.get('content')
+                    if post_id <= 0:
+                        self.respond_error('Invalid post ID', status=400, code='validation_error')
+                        return
+                    try:
+                        content = coerce_string(data.get('content'), 'content', required=True, max_length=5000)
+                    except ValueError as err:
+                        self.respond_error(str(err), status=400, code='validation_error')
+                        return
                     parent_id = data.get('parent_id')
-                    if not content:
-                        self.respond_json({'error': 'Content required'}, status=400)
-                        return
+                    if parent_id is not None:
+                        try:
+                            parent_id = int(parent_id)
+                        except (TypeError, ValueError):
+                            self.respond_error('parent_id must be an integer or null.', status=400, code='validation_error')
+                            return
+                        if parent_id <= 0:
+                            self.respond_error('parent_id must be an integer or null.', status=400, code='validation_error')
+                            return
 
                     conn = get_db_connection()
                     try:
@@ -3301,7 +3377,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                         cur.execute("SELECT locked FROM posts WHERE id = ?", (post_id,))
                         row = cur.fetchone()
                         if row and row['locked'] == 1:
-                            self.respond_json({'error': 'This thread is locked.'}, status=403)
+                            self.respond_error('This thread is locked.', status=403, code='thread_locked')
                             return
                     finally:
                         conn.close()
@@ -3340,17 +3416,17 @@ class RequestHandler(BaseHTTPRequestHandler):
 
                     self.respond_json({'success': True, 'comment_id': comment_id})
                 else:
-                    self.respond_json({'error': 'Invalid comment path'}, status=400)
+                    self.respond_error('Invalid comment path', status=400, code='invalid_path')
             else:
-                self.respond_json({'error': 'Unknown API path'}, status=404)
+                self.respond_error('Unknown API path', status=404, code='not_found')
         except OllamaError as e:
             try:
-                self.respond_json({'error': str(e)}, status=500)
+                self.respond_error(str(e), status=500, code='ollama_error')
             except Exception:
                 pass
         except Exception as e:
             try:
-                self.respond_json({'error': f"Internal server error: {e}"}, status=500)
+                self.respond_error('Internal server error.', status=500, code='internal_error', details={'message': str(e)})
             except Exception:
                 pass
 
