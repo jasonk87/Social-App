@@ -56,6 +56,7 @@ from collections import Counter
 #
 
 DB_PATH = os.path.join(os.path.dirname(__file__), 'social.db')
+MAX_COMMUNITIES = 20
 SESSION_COOKIE_NAME = "social_session"
 
 DEFAULT_COMMUNITY_TONE = "casual"
@@ -263,6 +264,17 @@ def init_db() -> None:
             )
             """
         )
+        # Add locked column to posts if missing
+        post_columns = {row[1] for row in cur.execute("PRAGMA table_info(posts)").fetchall()}
+        if "locked" not in post_columns:
+            cur.execute("ALTER TABLE posts ADD COLUMN locked INTEGER DEFAULT 0")
+        if "media_url" not in post_columns:
+            cur.execute("ALTER TABLE posts ADD COLUMN media_url TEXT")
+
+        community_columns = {row[1] for row in cur.execute("PRAGMA table_info(communities)").fetchall()}
+        if "active_ama_agent_id" not in community_columns:
+            cur.execute("ALTER TABLE communities ADD COLUMN active_ama_agent_id INTEGER DEFAULT NULL")
+
         # Comments table
         cur.execute(
             """
@@ -604,9 +616,7 @@ It is CRITICAL that you wildly vary the personalities you generate. Make this sp
 a casual fan, hardcore enthusiast, newcomer asking for help, salty veteran, stats nerd,
 storyline obsessive, collector, contrarian, helpful guide, joke poster, or lore/history head.
 
-The persona must be deeply rooted in this exact community subject. If the room is about wrestling,
-the persona should care about wrestlers, matches, promos, booking, eras, feuds, factions, title runs,
-backstage stories, or fan arguments. If the room is about a game, the persona should care about that game.
+The persona must care about highly specific, deep-cut topics within this niche. For example, if it's about wrestling, they should obsess over specific obscure matches, individual moves, or backstage politics, not generic statements. If it's a game, they should focus on obscure mechanics, specific items, or complex strategies, rather than surface-level 'glitches', one mushroom island, or basic gameplay.
 Do NOT make them sound like a computer program, philosopher, cosmic poet, software engineer, or abstract systems theorist
 unless the community itself is explicitly about those things.
 
@@ -789,13 +799,16 @@ Do NOT drift into vague cosmic language, generic philosophy, or abstract "timeli
 Aggressively vary the formatting and structure. Some posts should be short. Some should be anecdotal. Some should ask questions.
 If you are a storyteller, share a vivid anecdote. If you are a helpful guide, share a step-by-step tip. If you are a debater, challenge a common assumption.
 Avoid generic observations, inflated vocabulary, and long academic padding.
+DO NOT make generic, surface-level observations. Dive deep into specific, intricate details. Avoid broad summaries or complaining about generic 'glitches' or 'one mushroom island'. Be hyper-specific.
 Bad example for a wrestling room: "Are we even looking at the right timeline?"
 Good example for a wrestling room: strong opinions about Goldberg's streak, Macho Man promos, Sting in WCW, nWo angles, Bret vs Shawn, or old WWF/WCW booking.
 Good example for a dad jokes room: a short pun, groaner, or setup/punchline that would make people roll their eyes.
 
+You may optionally include a short text description of a meme, screenshot, or image that accompanies your post to add flavor. If you do, provide it in the JSON under the key "media_url" (e.g., "[Image: A blurry screenshot of...]"). If you do not want an image, leave "media_url" out of the JSON entirely or set it to null.
 Produce EXACTLY ONE JSON object with the keys:
   "title": a short, catchy, and highly-opinionated post title that fits your persona.
   "content": a single string containing the post body. Usually keep it between 1 and 6 sentences unless the tone strongly calls for more. Use markdown only when it feels natural. Avoid mentioning that you are an AI or referring to the instructions.
+  "media_url": (Optional) a text description of the image/meme.
 Return only the JSON object and no other commentary.
 """
     response = generate_text(model, prompt)
@@ -849,6 +862,7 @@ Your persona: {persona}{memory_section}{state_section}{rel_section}
   Disagree, agree, tease, ask a follow-up, or share a bizarre tangent if your persona dictates it. Keep it conversational and specific to the community topic (unless you are a lost redditor, in which case focus on your own niche).
   Do NOT talk about buffer overflows, non-Euclidean geometry, simulations, memory allocation, algorithms, latency, bugs in reality, or any computer science jargon unless the community is specifically about computer programming.
   Do NOT drift into vague philosophy, cosmic metaphors, or generic abstract language.
+  DO NOT make generic, surface-level observations. Dive deep into specific, intricate details. Avoid broad summaries or complaining about generic 'glitches'. Be hyper-specific.
   Do not sound like a lecturer, therapist, consultant, or academic unless the community tone explicitly demands it.
   Avoid mentioning that you are an AI or referencing the instructions. Do not output
   JSON, just the comment text.
@@ -892,6 +906,7 @@ Your persona: {persona}{memory_section}{state_section}{rel_section}
   Debate them, build off their idea, crack a joke, ask a question, or provide a counterpoint. Make it feel like an actual Reddit back-and-forth.
   Do NOT talk about buffer overflows, non-Euclidean geometry, simulations, memory allocation, algorithms, latency, bugs in reality, or any computer science jargon unless the community is specifically about computer programming.
   Do NOT drift into vague philosophy, cosmic metaphors, or generic abstract language.
+  DO NOT make generic, surface-level observations. Dive deep into specific, intricate details. Avoid broad summaries or complaining about generic 'glitches'. Be hyper-specific.
   Avoid bloated wording and avoid turning this into a mini-essay unless the community tone explicitly calls for that.
   Avoid mentioning that you are an AI or referencing the instructions. Do not output
   JSON, just the reply text.
@@ -1052,6 +1067,16 @@ class SimulationEngine:
                         self._do_agent_evolve(event.data)
                     elif event.event_type == 'COMMUNITY_SCHISM':
                         self._do_community_schism(event.data)
+                    elif event.event_type == 'AGENT_FOUND_COMMUNITY':
+                        self._do_agent_found_community(event.data)
+                    elif event.event_type == 'COMMUNITY_MERGER':
+                        self._do_community_merger(event.data)
+                    elif event.event_type == 'AGENT_MODERATE':
+                        self._do_agent_moderate(event.data)
+                    elif event.event_type == 'AMA_START':
+                        self._do_ama_start(event.data)
+                    elif event.event_type == 'AMA_END':
+                        self._do_ama_end(event.data)
 
                     # Mark completed *only* if the event isn't already re-scheduled by its own execution.
                     # e.g., if a community post replaces its own dedupe_key row, marking it completed here
@@ -1209,12 +1234,29 @@ class SimulationEngine:
             return f"Mood: {mood_str}. Conflict level: {conflict_str}. Currently discussing: {topic_str}."
 
         state_ctx = _get_state_context()
+        if sim.active_ama_agent_id:
+            if agent_id == sim.active_ama_agent_id:
+                state_ctx += " Note: You are currently hosting an AMA. Please answer questions directed at you."
+            else:
+                state_ctx += " Note: There is currently a live AMA happening. You should direct a question to the host."
+
 
         # Phase 3: Generate content
+
+        # Override for AMA Event prioritizing
+        if sim.active_ama_agent_id:
+            if agent_id == sim.active_ama_agent_id:
+                # The AMA host must always reply to questions
+                make_new_post = False
+            else:
+                # Regular users should mostly ask questions
+                if random.random() < 0.8:
+                    make_new_post = False
+
         if make_new_post:
             # Generate post
             post_data = generate_post(model, persona, sim.name, sim.description, sim.tone, sim.style_notes, memory_str, state_ctx, is_lost_redditor)
-            post_id = add_post(community_id, agent_id, post_data['title'], post_data['content'])
+            post_id = add_post(community_id, agent_id, post_data['title'], post_data['content'], post_data.get('media_url'))
             print(f"[{sim.name}] Generated new post: {post_data['title']}")
             append_memory(f"Created a post titled '{post_data['title']}': {post_data['content']}")
 
@@ -1231,18 +1273,36 @@ class SimulationEngine:
                 conn = get_db_connection()
                 try:
                     cur = conn.cursor()
-                    cur.execute(
-                        """
-                        SELECT comments.id, comments.content, comments.post_id, comments.agent_id
-                        FROM comments
-                        JOIN posts ON comments.post_id = posts.id
-                        JOIN agents ON comments.agent_id = agents.id
-                        WHERE posts.community_id = ?
-                        ORDER BY CASE WHEN agents.username = 'You' THEN 0 ELSE 1 END, RANDOM()
-                        LIMIT 1
-                        """,
-                        (community_id,),
-                    )
+                    if sim.active_ama_agent_id and agent_id == sim.active_ama_agent_id:
+                        # AMA host replies to comments directed at them or their post
+                        cur.execute(
+                            """
+                            SELECT comments.id, comments.content, comments.post_id, comments.agent_id
+                            FROM comments
+                            JOIN posts ON comments.post_id = posts.id
+                            JOIN agents ON comments.agent_id = agents.id
+                            WHERE posts.community_id = ? AND (posts.locked = 0 OR posts.locked IS NULL)
+                              AND (comments.parent_id IN (SELECT id FROM comments WHERE agent_id = ?)
+                                   OR posts.agent_id = ?)
+                              AND comments.agent_id != ?
+                            ORDER BY RANDOM()
+                            LIMIT 1
+                            """,
+                            (community_id, agent_id, agent_id, agent_id)
+                        )
+                    else:
+                        cur.execute(
+                            """
+                            SELECT comments.id, comments.content, comments.post_id, comments.agent_id
+                            FROM comments
+                            JOIN posts ON comments.post_id = posts.id
+                            JOIN agents ON comments.agent_id = agents.id
+                            WHERE posts.community_id = ? AND (posts.locked = 0 OR posts.locked IS NULL)
+                            ORDER BY CASE WHEN agents.username = 'You' THEN 0 ELSE 1 END, RANDOM()
+                            LIMIT 1
+                            """,
+                            (community_id,),
+                        )
                     row = cur.fetchone()
                     if row:
                         parent_id = row['id']
@@ -1267,6 +1327,12 @@ class SimulationEngine:
                     if parent_agent_id:
                         update_relationship(agent_id, parent_agent_id, is_argumentative)
 
+                    if sim.conflict_level > 0.8:
+                        ENGINE.schedule(random.randint(5, 15), EventPriority.HIGH, 'AGENT_MODERATE', {
+                            'community_id': community_id,
+                            'post_id': post_id
+                        })
+
                     # If parent author is an AI, schedule an agent reply event!
                     if parent_agent_id:
                         conn = get_db_connection()
@@ -1289,18 +1355,45 @@ class SimulationEngine:
                 conn = get_db_connection()
                 try:
                     cur = conn.cursor()
-                    cur.execute(
-                        """
-                        SELECT posts.id, posts.title, posts.content, posts.agent_id
-                        FROM posts
-                        JOIN agents ON posts.agent_id = agents.id
-                        WHERE posts.community_id = ?
-                        ORDER BY CASE WHEN agents.username = 'You' THEN 0 ELSE 1 END, RANDOM()
-                        LIMIT 1
-                        """,
-                        (community_id,),
-                    )
-                    row = cur.fetchone()
+                    if sim.active_ama_agent_id and agent_id != sim.active_ama_agent_id:
+                        # Regular agent forces reply to the AMA post
+                        cur.execute(
+                            """
+                            SELECT posts.id, posts.title, posts.content, posts.agent_id
+                            FROM posts
+                            WHERE posts.community_id = ? AND posts.agent_id = ? AND (posts.locked = 0 OR posts.locked IS NULL)
+                            ORDER BY created_at ASC
+                            LIMIT 1
+                            """,
+                            (community_id, sim.active_ama_agent_id)
+                        )
+                        row = cur.fetchone()
+                        if not row:
+                            cur.execute(
+                                """
+                                SELECT posts.id, posts.title, posts.content, posts.agent_id
+                                FROM posts
+                                JOIN agents ON posts.agent_id = agents.id
+                                WHERE posts.community_id = ? AND (posts.locked = 0 OR posts.locked IS NULL)
+                                ORDER BY CASE WHEN agents.username = 'You' THEN 0 ELSE 1 END, RANDOM()
+                                LIMIT 1
+                                """,
+                                (community_id,),
+                            )
+                            row = cur.fetchone()
+                    else:
+                        cur.execute(
+                            """
+                            SELECT posts.id, posts.title, posts.content, posts.agent_id
+                            FROM posts
+                            JOIN agents ON posts.agent_id = agents.id
+                            WHERE posts.community_id = ? AND (posts.locked = 0 OR posts.locked IS NULL)
+                            ORDER BY CASE WHEN agents.username = 'You' THEN 0 ELSE 1 END, RANDOM()
+                            LIMIT 1
+                            """,
+                            (community_id,),
+                        )
+                        row = cur.fetchone()
                     if row:
                         post_id = row['id']
                         title = row['title']
@@ -1323,6 +1416,12 @@ class SimulationEngine:
 
                     if post_agent_id:
                         update_relationship(agent_id, post_agent_id, is_argumentative)
+
+                    if sim.conflict_level > 0.8:
+                        ENGINE.schedule(random.randint(5, 15), EventPriority.HIGH, 'AGENT_MODERATE', {
+                            'community_id': community_id,
+                            'post_id': post_id
+                        })
 
                     if post_agent_id:
                         conn = get_db_connection()
@@ -1399,6 +1498,12 @@ class SimulationEngine:
             return f"Mood: {mood_str}. Conflict level: {conflict_str}. Currently discussing: {topic_str}."
 
         state_ctx = _get_state_context()
+        if sim.active_ama_agent_id:
+            if agent_id == sim.active_ama_agent_id:
+                state_ctx += " Note: You are currently hosting an AMA. Please answer questions directed at you."
+            else:
+                state_ctx += " Note: There is currently a live AMA happening. You should direct a question to the host."
+
 
         conn = get_db_connection()
         r_agent_id = None
@@ -1427,6 +1532,231 @@ class SimulationEngine:
 
         if r_agent_id:
             update_relationship(agent_id, r_agent_id, is_argumentative)
+
+        if sim.conflict_level > 0.8:
+            ENGINE.schedule(random.randint(5, 15), EventPriority.HIGH, 'AGENT_MODERATE', {
+                'community_id': community_id,
+                'post_id': post_id
+            })
+
+    def _do_ama_start(self, data: dict):
+        community_id = data['community_id']
+        sim = SIMULATIONS.get(community_id)
+        if not sim or sim.active_ama_agent_id:
+            return
+
+        print(f"[{sim.name}] Starting AMA event!")
+
+        # 1. Ask LLM to generate a historical persona based on community topics
+        topics_str = ", ".join([t['topic'] for t in sim.current_topics]) if sim.current_topics else sim.description
+
+        prompt = f"""Generate a JSON profile for a famous historical figure or well-known celebrity who would be extremely relevant to the topics: {topics_str}.
+Respond with ONLY ONE JSON object with the keys:
+  "username": A catchy alias (e.g., "AbeLincoln", "CleopatraTheQueen"). No spaces.
+  "persona": A short 2-sentence description of who they are and why they are hosting an AMA in this community.
+Return only the JSON object."""
+
+        try:
+            response = generate_text(sim.model, prompt)
+            start = response.find("{")
+            end = response.rfind("}")
+            if start != -1 and end != -1:
+                response = response[start:end+1]
+            result = json.loads(response)
+            username = result['username'].replace(' ', '')
+            persona_desc = result['persona']
+        except Exception as e:
+            print(f"Failed to generate AMA persona: {e}")
+            return
+
+        # 2. Create the agent
+        agent_id = add_agent(username, sim.model, persona_desc)
+        assign_agent_to_community(agent_id, community_id)
+
+        # 3. Mark as active
+        sim.active_ama_agent_id = agent_id
+        conn = get_db_connection()
+        try:
+            conn.execute("UPDATE communities SET active_ama_agent_id = ? WHERE id = ?", (agent_id, community_id))
+            conn.commit()
+        finally:
+            conn.close()
+
+        # 4. Generate top level post
+        post_title = f"I am {username}. Ask Me Anything!"
+        post_content = f"Greetings! I am hosting an AMA here today. {persona_desc} Please drop your questions below!"
+
+        post_id = add_post(community_id, agent_id, post_title, post_content)
+
+        # 5. Schedule end
+        self.schedule(
+            180,  # 3 minutes for simulation
+            EventPriority.HIGH,
+            'AMA_END',
+            {'community_id': community_id, 'agent_id': agent_id},
+            dedupe_key=f"AMA_END_{community_id}",
+            replace_existing=True
+        )
+
+    def _do_ama_end(self, data: dict):
+        community_id = data['community_id']
+        agent_id = data['agent_id']
+
+        sim = SIMULATIONS.get(community_id)
+        if not sim or sim.active_ama_agent_id != agent_id:
+            return
+
+        print(f"[{sim.name}] Ending AMA event.")
+
+        # Clear state
+        sim.active_ama_agent_id = None
+        conn = get_db_connection()
+        try:
+            conn.execute("UPDATE communities SET active_ama_agent_id = NULL WHERE id = ?", (community_id,))
+
+            # Update the agent so they know it's over, or basically 'deactivate' them
+            cur = conn.cursor()
+            cur.execute("SELECT persona FROM agents WHERE id = ?", (agent_id,))
+            row = cur.fetchone()
+            if row:
+                new_persona = row['persona'] + " My AMA has ended. I am no longer actively answering questions and have returned to the past."
+                cur.execute("UPDATE agents SET persona = ? WHERE id = ?", (new_persona, agent_id))
+
+            # Optional: Add a final comment to their top post
+            cur.execute("SELECT id FROM posts WHERE agent_id = ? AND community_id = ? ORDER BY created_at ASC LIMIT 1", (agent_id, community_id))
+            post_row = cur.fetchone()
+            if post_row:
+                add_comment(post_row['id'], agent_id, None, "Thank you for all your wonderful questions! My time here has ended. Farewell!")
+
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _do_agent_moderate(self, data: dict):
+        community_id = data['community_id']
+        post_id = data['post_id']
+
+        sim = SIMULATIONS.get(community_id)
+        if not sim:
+            return
+
+        conn = get_db_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT locked FROM posts WHERE id = ?", (post_id,))
+            row = cur.fetchone()
+            if not row or row['locked'] == 1:
+                return
+
+            cur.execute("UPDATE posts SET locked = 1 WHERE id = ?", (post_id,))
+
+            # Find an active AI agent or fallback to You
+            cur.execute(
+                """
+                SELECT agents.id, agents.username, agents.model, agents.persona
+                FROM agents
+                JOIN community_agents ON agents.id = community_agents.agent_id
+                WHERE community_agents.community_id = ? AND agents.model != 'none'
+                ORDER BY RANDOM() LIMIT 1
+                """,
+                (community_id,)
+            )
+            mod_row = cur.fetchone()
+
+            if not mod_row:
+                cur.execute("SELECT id FROM agents WHERE username = 'You'")
+                you_row = cur.fetchone()
+                mod_agent_id = you_row['id'] if you_row else 1
+                mod_message = "System: This thread has become too heated and is now locked for moderation."
+            else:
+                mod_agent_id = mod_row['id']
+                prompt = f"""You are {mod_row['persona']}. You are stepping in to moderate this thread because it has become too heated and hostile.
+Write a very short, firm, but fair message announcing that you are locking the thread.
+Do not apologize, just state that the thread is locked. Do not output JSON, just the text."""
+                mod_message = generate_text(mod_row['model'], prompt).strip()
+
+            conn.commit()
+
+            # Add moderation comment
+            add_comment(post_id, mod_agent_id, None, mod_message)
+
+            # Cool down community
+            sim.conflict_level = max(0.0, sim.conflict_level - 0.4)
+            conn.execute("UPDATE communities SET conflict_level = ? WHERE id = ?", (sim.conflict_level, community_id))
+            conn.commit()
+
+            # Feed will refresh naturally, or client will see lock on refresh,
+            # add_comment already broadcasts SSE. We also broadcast a generic refresh
+            broadcast_sse('new_post', {'post_id': post_id, 'community_id': community_id})
+
+        finally:
+            conn.close()
+
+    def _do_community_merger(self, data: dict):
+        c1 = data['community_id_1']
+        c2 = data['community_id_2']
+
+        sim1 = SIMULATIONS.get(c1)
+        sim2 = SIMULATIONS.get(c2)
+
+        if not sim1 or not sim2:
+            return
+
+        # Pick dominant randomly
+        if random.random() < 0.5:
+            dominant_id, dom_sim = c1, sim1
+            sub_id, sub_sim = c2, sim2
+        else:
+            dominant_id, dom_sim = c2, sim2
+            sub_id, sub_sim = c1, sim1
+
+        print(f"MERGER: Community {sub_sim.name} is merging into {dom_sim.name}!")
+
+        conn = get_db_connection()
+        try:
+            cur = conn.cursor()
+            # Fetch agents from sub community
+            cur.execute("SELECT agent_id FROM community_agents WHERE community_id = ?", (sub_id,))
+            agents = [row['agent_id'] for row in cur.fetchall()]
+
+            for a_id in agents:
+                # Move to new community
+                cur.execute("DELETE FROM community_agents WHERE agent_id = ? AND community_id = ?", (a_id, sub_id))
+                cur.execute("INSERT OR IGNORE INTO community_agents (community_id, agent_id) VALUES (?, ?)", (dominant_id, a_id))
+
+                # Update persona with confusion/refugee status
+                cur.execute("SELECT persona FROM agents WHERE id = ?", (a_id,))
+                row = cur.fetchone()
+                if row:
+                    new_persona = row['persona'] + f" Your old community '{sub_sim.name}' was recently shut down and merged into '{dom_sim.name}'. You are initially confused and slightly defensive about this forced migration."
+                    cur.execute("UPDATE agents SET persona = ? WHERE id = ?", (new_persona, a_id))
+
+            # Deactivate subordinate community
+            cur.execute("UPDATE communities SET active = 0 WHERE id = ?", (sub_id,))
+
+            # Post a system message in dominant community (optional, using Human or system agent logic)
+            cur.execute("SELECT id FROM agents WHERE username = 'You'")
+            you_row = cur.fetchone()
+            sys_id = you_row['id'] if you_row else 1
+            cur.execute(
+                "INSERT INTO posts (community_id, agent_id, title, content, created_at) VALUES (?, ?, ?, ?, ?)",
+                (dominant_id, sys_id, f"System Notice: {sub_sim.name} has merged with us", f"Due to overlapping topics and low activity, {sub_sim.name} has been merged into this community. Please welcome the new members.", time.time())
+            )
+
+            conn.commit()
+
+            # Remove from SIMULATIONS
+            del SIMULATIONS[sub_id]
+
+            # Bump energy in dominant community due to influx
+            dom_sim.energy = min(3.0, dom_sim.energy + 1.0)
+            dom_sim.conflict_level = min(1.0, dom_sim.conflict_level + 0.3)
+
+            # Broadcast update
+            broadcast_sse('new_post', {'post_id': cur.lastrowid, 'community_id': dominant_id})
+
+        finally:
+            conn.close()
 
     def _do_community_drift(self, data: dict):
         community_id = data['community_id']
@@ -1466,6 +1796,47 @@ class SimulationEngine:
                 dedupe_key=f"COMMUNITY_SCHISM_{community_id}",
                 replace_existing=False
             )
+
+        # AMA Event Trigger
+        if not sim.active_ama_agent_id and sim.energy > 1.0 and random.random() < 0.01:
+            self.schedule(
+                10,
+                EventPriority.HIGH,
+                'AMA_START',
+                {'community_id': community_id},
+                dedupe_key=f"AMA_START_{community_id}",
+                replace_existing=False
+            )
+
+        # Agent Community Creation Spin-off
+        if sim.energy > 1.5 and sim.current_topics and sim.current_topics[0]['weight'] >= 2.0 and random.random() < 0.05:
+            top_topic = sim.current_topics[0]['topic']
+            self.schedule(
+                10,
+                EventPriority.HIGH,
+                'AGENT_FOUND_COMMUNITY',
+                {'community_id': community_id, 'topic': top_topic},
+                dedupe_key=f"AGENT_FOUND_COMMUNITY_{community_id}",
+                replace_existing=False
+            )
+
+        # Community Merger Logic: Low energy and shared topics
+        if sim.energy < 0.5 and sim.current_topics:
+            sim_topic_names = {t['topic'] for t in sim.current_topics}
+            for other_id, other_sim in SIMULATIONS.items():
+                if other_id != community_id and other_sim.energy < 0.5 and other_sim.current_topics:
+                    other_topic_names = {t['topic'] for t in other_sim.current_topics}
+                    if sim_topic_names & other_topic_names:
+                        # Found a match, trigger merger
+                        self.schedule(
+                            10,
+                            EventPriority.HIGH,
+                            'COMMUNITY_MERGER',
+                            {'community_id_1': community_id, 'community_id_2': other_id},
+                            dedupe_key=f"COMMUNITY_MERGER_{min(community_id, other_id)}_{max(community_id, other_id)}",
+                            replace_existing=False
+                        )
+                        break
 
         # Decay conflict level towards 0.0
         if sim.conflict_level > 0.0:
@@ -1526,6 +1897,117 @@ Respond with ONLY the new persona string and no other commentary or JSON.
             conn.commit()
         finally:
             conn.close()
+
+    def _do_agent_found_community(self, data: dict):
+        source_community_id = data['community_id']
+        topic = data['topic']
+
+        conn = get_db_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT COUNT(*) FROM communities")
+            if cur.fetchone()[0] >= MAX_COMMUNITIES:
+                return
+
+            cur.execute(
+                """
+                SELECT agents.id, agents.username, agents.persona, agents.model
+                FROM agents
+                JOIN community_agents ON agents.id = community_agents.agent_id
+                WHERE community_agents.community_id = ? AND agents.model != 'none'
+                ORDER BY RANDOM() LIMIT 1
+                """,
+                (source_community_id,)
+            )
+            row = cur.fetchone()
+            if not row:
+                return
+            agent = dict(row)
+        finally:
+            conn.close()
+
+        prompt = f"""You are {agent['persona']}. You are heavily invested in the specific niche topic of '{topic}' and have decided to start your own spin-off community dedicated entirely to this hyper-specific sub-category. DO NOT make it a broad community. If the topic is 'mushroom island', the community must be specifically about mushroom islands, not general Minecraft.
+Respond with ONLY ONE JSON object with the keys:
+  "name": A catchy, short name for your new niche community (e.g., "MachoManPromos" or "RedstoneLogic"). Do not use spaces.
+  "description": A 1-2 sentence description explaining the highly specific focus of this new community.
+Return only the JSON object and no other commentary."""
+
+        try:
+            response = generate_text(agent['model'], prompt)
+            start = response.find("{")
+            end = response.rfind("}")
+            if start != -1 and end != -1:
+                response = response[start:end+1]
+            result = json.loads(response)
+            new_name = result['name'].replace(' ', '')
+            description = result['description']
+        except Exception as e:
+            print(f"Failed to generate community from agent: {e}")
+            return
+
+        # Ensure name doesn't already exist
+        conn = get_db_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT 1 FROM communities WHERE name = ?", (new_name,))
+            if cur.fetchone():
+                return
+        finally:
+            conn.close()
+
+        print(f"Agent {agent['username']} is founding a new community: {new_name} about {topic}!")
+
+        sim = SIMULATIONS.get(source_community_id)
+        if not sim:
+            return
+
+        new_community_id = add_community(
+            new_name,
+            description,
+            sim.model,
+            sim.posting_rate,
+            sim.tone,
+            sim.style_notes
+        )
+
+        assign_agent_to_community(agent['id'], new_community_id)
+
+        conn = get_db_connection()
+        try:
+            conn.execute("UPDATE communities SET active = 1 WHERE id = ?", (new_community_id,))
+            conn.commit()
+        finally:
+            conn.close()
+
+        new_sim = Simulation(
+            new_community_id,
+            new_name,
+            description,
+            sim.model,
+            sim.posting_rate,
+            sim.tone,
+            sim.style_notes,
+            conflict_level=0.0,
+            mood=0.0
+        )
+        SIMULATIONS[new_community_id] = new_sim
+
+        self.schedule(
+            5,
+            EventPriority.LOW,
+            'COMMUNITY_POST',
+            {'community_id': new_community_id},
+            dedupe_key=f"COMMUNITY_POST_{new_community_id}",
+            replace_existing=False
+        )
+        self.schedule(
+            60,
+            EventPriority.LOW,
+            'COMMUNITY_DRIFT',
+            {'community_id': new_community_id},
+            dedupe_key=f"COMMUNITY_DRIFT_{new_community_id}",
+            replace_existing=False
+        )
 
     def _do_community_schism(self, data: dict):
         community_id = data['community_id']
@@ -1641,6 +2123,7 @@ class Simulation:
         self.energy = float(energy) if energy is not None else 1.0
         self.trendiness = float(trendiness) if trendiness is not None else 0.5
         self.novelty_pressure = float(novelty_pressure) if novelty_pressure is not None else 0.5
+        self.active_ama_agent_id = None
         try:
             self.current_topics = prune_topic_list(json.loads(current_topics) if current_topics else [])
         except:
@@ -1659,7 +2142,7 @@ SIMULATIONS: Dict[int, Simulation] = {}
 
 
 def extract_topics(text: str) -> List[str]:
-    """Lightweight keyword extraction using basic heuristic."""
+    """Lightweight keyword/bigram extraction using basic heuristic."""
     # Remove basic punctuation
     text = re.sub(r'[^\w\s]', '', text.lower())
     words = text.split()
@@ -1674,7 +2157,8 @@ def extract_topics(text: str) -> List[str]:
         "right", "wrong", "maybe", "though", "those", "these", "make", "made", "making", "gets", "getting", "got",
         "good", "bad", "great", "better", "best", "worst", "feel", "feels", "felt"
     }
-    keywords = [
+
+    valid_words = [
         w for w in words
         if len(w) > 3
         and w not in stopwords
@@ -1682,8 +2166,15 @@ def extract_topics(text: str) -> List[str]:
         and re.search(r'[a-z]', w)
     ]
 
-    # Return top 3 most common keywords
-    counts = Counter(keywords)
+    # Extract bigrams
+    bigrams = []
+    for i in range(len(valid_words) - 1):
+        bigrams.append(f"{valid_words[i]} {valid_words[i+1]}")
+
+    all_topics = valid_words + bigrams
+
+    # Return top 3 most common topics
+    counts = Counter(all_topics)
     return [word for word, count in counts.most_common(3)]
 
 
@@ -2042,13 +2533,13 @@ def assign_agent_to_community(agent_id: int, community_id: int) -> None:
         conn.close()
 
 
-def add_post(community_id: int, agent_id: int, title: str, content: str) -> int:
+def add_post(community_id: int, agent_id: int, title: str, content: str, media_url: Optional[str] = None) -> int:
     conn = get_db_connection()
     try:
         cur = conn.cursor()
         cur.execute(
-            "INSERT INTO posts (community_id, agent_id, title, content, created_at) VALUES (?, ?, ?, ?, ?)",
-            (community_id, agent_id, title, content, time.time()),
+            "INSERT INTO posts (community_id, agent_id, title, content, created_at, locked, media_url) VALUES (?, ?, ?, ?, ?, 0, ?)",
+            (community_id, agent_id, title, content, time.time(), media_url),
         )
         post_id = cur.lastrowid
         conn.commit()
@@ -2099,7 +2590,7 @@ def build_comments_tree(comments_rows: List[sqlite3.Row]) -> List[Dict[str, Any]
     return comments_tree
 
 
-def fetch_community_feed(community_id: int, target_post_id: Optional[int] = None) -> List[Dict[str, Any]]:
+def fetch_community_feed(community_id: int, target_post_id: Optional[int] = None, offset: int = 0, limit: int = 50) -> tuple[List[Dict[str, Any]], bool]:
     """Return a list of posts with nested comments for a community."""
     conn = get_db_connection()
     try:
@@ -2129,30 +2620,32 @@ def fetch_community_feed(community_id: int, target_post_id: Optional[int] = None
                     'id': post_id,
                     'title': p_row['title'],
                     'content': p_row['content'],
+                    'media_url': p_row['media_url'],
                     'author': p_row['author'],
                     'agent_id': p_row['agent_id'],
                     'created_at': p_row['created_at'],
+                    'locked': bool(p_row['locked']),
                     'comments': comments_tree,
                 }
 
         cur.execute(
             """
-            SELECT posts.id as post_id, posts.title, posts.content, posts.created_at,
+            SELECT posts.id as post_id, posts.title, posts.content, posts.created_at, posts.locked, posts.media_url,
                    agents.username AS author, agents.id AS agent_id
             FROM posts
             JOIN agents ON posts.agent_id = agents.id
             WHERE posts.community_id = ?
             ORDER BY posts.created_at DESC
-            LIMIT 50
+            LIMIT ? OFFSET ?
             """,
-            (community_id,),
+            (community_id, limit + 1, offset),
         )
         append_posts(cur.fetchall())
 
         if target_post_id is not None and target_post_id not in post_map:
             cur.execute(
                 """
-                SELECT posts.id as post_id, posts.title, posts.content, posts.created_at,
+                SELECT posts.id as post_id, posts.title, posts.content, posts.created_at, posts.locked, posts.media_url,
                        agents.username AS author, agents.id AS agent_id
                 FROM posts
                 JOIN agents ON posts.agent_id = agents.id
@@ -2166,12 +2659,16 @@ def fetch_community_feed(community_id: int, target_post_id: Optional[int] = None
 
         posts = list(post_map.values())
         posts.sort(key=lambda post: post['created_at'], reverse=True)
-        return posts
+        has_more = False
+        if target_post_id is None and len(posts) > limit:
+            has_more = True
+            posts = posts[:limit]
+        return posts, has_more
     finally:
         conn.close()
 
 
-def fetch_home_feed(user_id: int, sort: str = "latest") -> List[Dict[str, Any]]:
+def fetch_home_feed(user_id: int, sort: str = "latest", offset: int = 0, limit: int = 20) -> tuple[List[Dict[str, Any]], bool]:
     conn = get_db_connection()
     try:
         cur = conn.cursor()
@@ -2183,6 +2680,8 @@ def fetch_home_feed(user_id: int, sort: str = "latest") -> List[Dict[str, Any]]:
                 posts.content,
                 posts.created_at,
                 posts.community_id,
+                posts.locked,
+                posts.media_url,
                 communities.name AS community_name,
                 communities.description AS community_description,
                 agents.username AS author,
@@ -2211,6 +2710,7 @@ def fetch_home_feed(user_id: int, sort: str = "latest") -> List[Dict[str, Any]]:
                 "content": row["content"],
                 "created_at": row["created_at"],
                 "community_id": row["community_id"],
+                "locked": bool(row["locked"]),
                 "community_name": row["community_name"],
                 "community_description": row["community_description"] or "",
                 "author": row["author"],
@@ -2224,7 +2724,9 @@ def fetch_home_feed(user_id: int, sort: str = "latest") -> List[Dict[str, Any]]:
             posts.sort(key=lambda post: (post["best_score"], post["created_at"]), reverse=True)
         else:
             posts.sort(key=lambda post: post["created_at"], reverse=True)
-        return posts[:120]
+
+        has_more = len(posts) > offset + limit
+        return posts[offset:offset+limit], has_more
     finally:
         conn.close()
 
@@ -2363,7 +2865,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                         conn = get_db_connection()
                         try:
                             cur = conn.cursor()
-                            cur.execute("SELECT mood, conflict_level, energy, current_topics FROM communities WHERE id = ?", (c_id,))
+                            cur.execute("SELECT mood, conflict_level, energy, current_topics, active_ama_agent_id FROM communities WHERE id = ?", (c_id,))
                             row = cur.fetchone()
                             if row:
                                 try:
@@ -2374,7 +2876,8 @@ class RequestHandler(BaseHTTPRequestHandler):
                                     'mood': row['mood'],
                                     'conflict_level': row['conflict_level'],
                                     'energy': row['energy'],
-                                    'top_topics': topics
+                                    'top_topics': topics,
+                                    'active_ama_agent_id': row['active_ama_agent_id']
                                 })
                             else:
                                 self.respond_json({'error': 'Community not found'}, status=404)
@@ -2444,10 +2947,13 @@ class RequestHandler(BaseHTTPRequestHandler):
                 sort = (query.get('sort', ['latest'])[0] or 'latest').lower()
                 if sort not in ('latest', 'best'):
                     sort = 'latest'
-                posts = fetch_home_feed(current_user['id'], sort)
+                offset = int(query.get('offset', ['0'])[0] or '0')
+                limit = int(query.get('limit', ['20'])[0] or '20')
+                posts, has_more = fetch_home_feed(current_user['id'], sort, offset=offset, limit=limit)
                 self.respond_json({
                     'sort': sort,
                     'posts': posts,
+                    'has_more': has_more,
                     'current_user': {
                         'id': current_user['id'],
                         'display_name': current_user['display_name'],
@@ -2469,9 +2975,12 @@ class RequestHandler(BaseHTTPRequestHandler):
                         return
                     target_post_id_raw = (query.get('target_post_id', [''])[0] or '').strip()
                     target_post_id = int(target_post_id_raw) if target_post_id_raw.isdigit() else None
-                    posts = fetch_community_feed(row['id'], target_post_id=target_post_id)
+                    offset = int(query.get('offset', ['0'])[0] or '0')
+                    limit = int(query.get('limit', ['50'])[0] or '50')
+                    posts, has_more = fetch_community_feed(row['id'], target_post_id=target_post_id, offset=offset, limit=limit)
                     self.respond_json({
                         'posts': posts,
+                        'has_more': has_more,
                         'community': {
                             'id': row['id'],
                             'name': row['name'],
@@ -2481,6 +2990,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                             'tone': normalize_tone(row['tone']),
                             'style_notes': row['style_notes'] or '',
                             'subscribed': bool(current_user and is_user_subscribed(current_user['id'], row['id'])),
+                            'active_ama_agent_id': row.get('active_ama_agent_id'),
                         },
                         'current_user': (
                             {
@@ -2760,7 +3270,8 @@ class RequestHandler(BaseHTTPRequestHandler):
                     if not title or not content:
                         self.respond_json({'error': 'Title and content required'}, status=400)
                         return
-                    post_id = add_post(row['id'], current_user['agent_id'], title, content)
+                    media_url = data.get('media_url')
+                    post_id = add_post(row['id'], current_user['agent_id'], title, content, media_url)
                     # When a Human user posts, we don't automatically trigger immediate AI replies here 
                     # as the engine will pick it up during its normal cycle, or we could schedule a check.
                     self.respond_json({'success': True, 'post_id': post_id})
@@ -2783,6 +3294,18 @@ class RequestHandler(BaseHTTPRequestHandler):
                     if not content:
                         self.respond_json({'error': 'Content required'}, status=400)
                         return
+
+                    conn = get_db_connection()
+                    try:
+                        cur = conn.cursor()
+                        cur.execute("SELECT locked FROM posts WHERE id = ?", (post_id,))
+                        row = cur.fetchone()
+                        if row and row['locked'] == 1:
+                            self.respond_json({'error': 'This thread is locked.'}, status=403)
+                            return
+                    finally:
+                        conn.close()
+
                     comment_id = add_comment(post_id, current_user['agent_id'], parent_id, content)
                     
                     # Trigger an AI reply if human is replying to an AI agent
@@ -2940,6 +3463,8 @@ def run_server(host: str = 'localhost', port: int = 8080) -> None:
                     row['novelty_pressure'],
                     row['current_topics']
                 )
+                if 'active_ama_agent_id' in row.keys():
+                    sim.active_ama_agent_id = row['active_ama_agent_id']
                 SIMULATIONS[comm_id] = sim
                 ENGINE.schedule(
                     start_delay,

@@ -79,6 +79,9 @@ const toneOptions = [
 const communityPageState = {
     name: null,
     community: null,
+    feedOffset: 0,
+    feedHasMore: false,
+    isLoadingFeed: false,
     currentUser: null,
 };
 
@@ -309,6 +312,20 @@ function syncCommunityHeader() {
     subtitle.textContent = community.description
         ? community.description
         : 'Live conversation from your local simulation.';
+
+    // AMA Banner
+    let amaBanner = document.getElementById('ama-banner');
+    if (community.active_ama_agent_id) {
+        if (!amaBanner) {
+            amaBanner = document.createElement('div');
+            amaBanner.id = 'ama-banner';
+            amaBanner.className = 'ama-banner';
+            amaBanner.innerHTML = `<span class="pulsing-dot"></span> <strong>Live AMA in Progress!</strong> An agent is currently hosting an AMA in this community.`;
+            document.querySelector('.feed-header-copy').appendChild(amaBanner);
+        }
+    } else if (amaBanner) {
+        amaBanner.remove();
+    }
     if (subscribeButton) {
         const subscribed = !!community.subscribed;
         subscribeButton.querySelector('span').textContent = subscribed ? 'Subscribed' : 'Subscribe';
@@ -470,7 +487,7 @@ function createEmptyState(title, message) {
     `;
 }
 
-function renderComments(comments, container, depth = 0, postId = null) {
+function renderComments(comments, container, depth = 0, postId = null, isLocked = false) {
     comments.forEach((comment) => {
         const div = document.createElement('div');
         div.className = 'comment';
@@ -482,31 +499,41 @@ function renderComments(comments, container, depth = 0, postId = null) {
                 <span>${escapeHTML(formatTimestamp(comment.created_at))}</span>
             </div>
             <div class="post-content">${escapeHTML(comment.content)}</div>
-            <button class="btn-text reply-btn" data-post-id="${postId}" data-parent-id="${comment.id}">
+            ${isLocked ? '' : `<button class="btn-text reply-btn" data-post-id="${postId}" data-parent-id="${comment.id}">
                 <i data-lucide="message-square-plus"></i>
                 <span>Reply</span>
-            </button>
+            </button>`}
         `;
         container.appendChild(div);
 
         if (comment.children && comment.children.length > 0) {
-            renderComments(comment.children, container, depth + 1, postId);
+            renderComments(comment.children, container, depth + 1, postId, isLocked);
         }
     });
 }
 
-function renderFeed(posts) {
+let communityFeedObserver = null;
+
+function renderFeed(posts, isLoadMore = false) {
     const feed = document.getElementById('feed');
     const unread = communityPageState.name ? getUnreadNotifications(communityPageState.name) : new Set();
 
-    syncCommunityHeader();
+    if (!isLoadMore) {
+        syncCommunityHeader();
 
-    if (!posts.length) {
-        feed.innerHTML = createEmptyState('No posts yet', 'Publish a thread or wait for the simulation to begin posting.');
-        return;
+        if (!posts.length) {
+            feed.innerHTML = createEmptyState('No posts yet', 'Publish a thread or wait for the simulation to begin posting.');
+            return;
+        }
+
+        feed.innerHTML = '';
     }
 
-    feed.innerHTML = '';
+    // Remove old sentinel
+    const oldSentinel = document.getElementById('feed-sentinel');
+    if (oldSentinel) {
+        oldSentinel.remove();
+    }
 
     posts.forEach((post) => {
         const article = document.createElement('article');
@@ -522,6 +549,7 @@ function renderFeed(posts) {
                     <span class="pill pill-accent">${escapeHTML(`@${post.author}`)}</span>
                     <span class="pill">${escapeHTML(formatTimestamp(post.created_at))}</span>
                     <span class="pill">${escapeHTML(`${totalComments} repl${totalComments === 1 ? 'y' : 'ies'}`)}</span>
+                    ${post.locked ? '<span class="pill pill-danger" style="color: var(--danger-color);"><i data-lucide="lock"></i> Locked</span>' : ''}
                     ${unreadTargets.length ? `<button type="button" class="reply-badge" data-target-id="${unreadTargets[0]}">${escapeHTML(`${unreadTargets.length} ${unreadLabel}`)}</button>` : ''}
                 </div>
                 <div>
@@ -531,21 +559,44 @@ function renderFeed(posts) {
                     </div>
                 </div>
             </div>
+            ${post.media_url ? `<div class="post-media-attachment" style="background: var(--bg-panel); border: 1px dashed var(--border-subtle); padding: 1rem; border-radius: var(--radius-sm); margin-bottom: 1rem; font-style: italic; color: var(--text-muted);"><i data-lucide="image"></i> ${escapeHTML(post.media_url)}</div>` : ''}
             <div class="post-content">${escapeHTML(post.content)}</div>
-            <button class="btn-text reply-btn" data-post-id="${post.id}" data-parent-id="">
+            ${post.locked ? '<span class="locked-text" style="color: var(--text-muted); font-size: 0.9rem; padding: 0.5rem 1rem; display: inline-flex; align-items: center; gap: 0.4rem;"><i data-lucide="lock"></i> Thread Locked</span>' : `<button class="btn-text reply-btn" data-post-id="${post.id}" data-parent-id="">
                 <i data-lucide="message-square-plus"></i>
                 <span>Reply</span>
-            </button>
+            </button>`}
             <div class="comments"></div>
         `;
 
         const commentsContainer = article.querySelector('.comments');
         if (post.comments && post.comments.length > 0) {
-            renderComments(post.comments, commentsContainer, 0, post.id);
+            renderComments(post.comments, commentsContainer, 0, post.id, post.locked);
         }
 
         feed.appendChild(article);
     });
+
+    if (communityPageState.feedHasMore) {
+        const sentinel = document.createElement('div');
+        sentinel.id = 'feed-sentinel';
+        sentinel.className = 'feed-loader';
+        sentinel.innerHTML = `<i data-lucide="loader-2" class="spin"></i> Loading more posts...`;
+        feed.appendChild(sentinel);
+        if (window.lucide) {
+            lucide.createIcons({ root: sentinel });
+        }
+
+        if (communityFeedObserver) {
+            communityFeedObserver.disconnect();
+        }
+
+        communityFeedObserver = new IntersectionObserver((entries) => {
+            if (entries[0].isIntersecting && !communityPageState.isLoadingFeed) {
+                loadFeed(communityPageState.name, { isLoadMore: true });
+            }
+        });
+        communityFeedObserver.observe(sentinel);
+    }
 
     if (window.lucide) {
         lucide.createIcons();
@@ -554,30 +605,47 @@ function renderFeed(posts) {
 
 async function loadFeed(name, options = {}) {
     const feed = document.getElementById('feed');
+    if (communityPageState.isLoadingFeed) return;
+
     const {
         silentNotifications = false,
         preserveScroll = false,
         focusTarget = false,
         renderDOM = true,
+        isLoadMore = false,
     } = options;
+
+    if (!isLoadMore) {
+        communityPageState.feedOffset = 0;
+    } else {
+        communityPageState.feedOffset += 50;
+    }
+
+    communityPageState.isLoadingFeed = true;
+
     const previousScrollY = preserveScroll ? window.scrollY : null;
     const hash = window.location.hash.replace('#', '').trim();
     const targetPostMatch = hash.match(/^post-(\d+)$/);
     const targetPostId = targetPostMatch ? targetPostMatch[1] : '';
-    const requestUrl = targetPostId
+
+    let requestUrl = targetPostId && !isLoadMore
         ? `/api/community/${encodeURIComponent(name)}/feed?target_post_id=${encodeURIComponent(targetPostId)}`
         : `/api/community/${encodeURIComponent(name)}/feed`;
+
+    requestUrl += `${requestUrl.includes('?') ? '&' : '?'}offset=${communityPageState.feedOffset}&limit=50`;
 
     try {
         const data = await fetchJSON(requestUrl);
         const posts = data.posts || [];
+        communityPageState.feedHasMore = data.has_more || false;
+
         if (data.community) {
             communityPageState.community = data.community;
         }
         communityPageState.currentUser = data.current_user || communityPageState.currentUser;
 
         if (renderDOM) {
-            renderFeed(posts);
+            renderFeed(posts, isLoadMore);
         }
 
         const notifications = collectUserReplyNotifications(posts, name);
@@ -600,9 +668,11 @@ async function loadFeed(name, options = {}) {
             focusTargetFromHash();
         }
     } catch (err) {
-        if (renderDOM) {
+        if (renderDOM && !isLoadMore) {
             feed.innerHTML = createEmptyState('Feed unavailable', err.message);
         }
+    } finally {
+        communityPageState.isLoadingFeed = false;
     }
 }
 
