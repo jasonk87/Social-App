@@ -717,6 +717,12 @@ document.addEventListener('DOMContentLoaded', () => {
     window.addEventListener('hashchange', focusTargetFromHash);
 
     document.getElementById('community-settings-btn').addEventListener('click', openEditModal);
+
+    const editForm = document.getElementById('community-edit-form');
+    if (editForm) {
+        editForm.addEventListener('submit', saveCommunityEdits);
+    }
+
     document.getElementById('community-subscribe-btn').addEventListener('click', async () => {
         if (!communityPageState.community) {
             return;
@@ -779,9 +785,57 @@ document.addEventListener('DOMContentLoaded', () => {
         updateNotificationButtons(name);
     });
 
-    setInterval(() => {
-        window.loadCommunityData();
-    }, 15000);
+    // Live updates via SSE
+    function initSSE() {
+        const eventSource = new EventSource('/api/stream');
+        eventSource.addEventListener('new_post', async (event) => {
+            try {
+                const data = JSON.parse(event.data);
+                if (window.communityPageState && window.communityPageState.community && window.communityPageState.community.id === data.community_id) {
+                    await window.loadCommunityData();
+                }
+            } catch (e) {
+                console.error('Failed to parse SSE new_post event', e);
+            }
+        });
+        eventSource.addEventListener('new_comment', async (event) => {
+            try {
+                const data = JSON.parse(event.data);
+                if (window.communityPageState && window.communityPageState.community && window.communityPageState.community.id === data.community_id) {
+                    await window.loadCommunityData();
+                }
+            } catch (e) {
+                console.error('Failed to parse SSE new_comment event', e);
+            }
+        });
+        eventSource.onerror = () => {
+            console.warn('SSE connection lost. Reconnecting...');
+        };
+    }
+
+    initSSE();
+
+    async function loadCommunityState() {
+        if (!communityPageState.community) return;
+        try {
+            const data = await fetchJSON(`/api/community_state/${communityPageState.community.id}`);
+            const panel = document.getElementById('community-state-panel');
+            if (panel && data) {
+                panel.style.display = 'block';
+                document.getElementById('state-energy').textContent = parseFloat(data.energy).toFixed(2);
+                document.getElementById('state-mood').textContent = parseFloat(data.mood).toFixed(2);
+                document.getElementById('state-conflict').textContent = parseFloat(data.conflict_level).toFixed(2);
+
+                const topics = data.top_topics.map(t => t.topic).join(', ');
+                document.getElementById('state-topics').textContent = topics || 'None';
+                if (window.lucide) {
+                    window.lucide.createIcons();
+                }
+            }
+        } catch (e) {
+            console.warn('Failed to load community state', e);
+        }
+    }
 
     window.loadCommunityData = async function() {
         const titleVal = document.getElementById('new-post-title').value.trim();
@@ -793,6 +847,7 @@ document.addEventListener('DOMContentLoaded', () => {
         // This keeps notifications flowing but prevents wiping their typed text.
         const shouldRender = !document.querySelector('.reply-form') && !titleVal && !contentVal && !isTyping;
         await loadFeed(name, { preserveScroll: true, renderDOM: shouldRender });
+        await loadCommunityState();
     };
 
     async function submitPost() {

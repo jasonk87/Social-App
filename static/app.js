@@ -788,13 +788,8 @@ function initSSE() {
     const eventSource = new EventSource('/api/stream');
     eventSource.addEventListener('new_post', async (event) => {
         try {
-            const data = JSON.parse(event.data);
             if (appState.activeView === 'feed') {
                 await loadFeed();
-            } else if (appState.activeView === 'community' && window.communityPageState && window.communityPageState.community && window.communityPageState.community.id === data.community_id) {
-                if (typeof window.loadCommunityData === 'function') {
-                    await window.loadCommunityData();
-                }
             }
         } catch (e) {
             console.error('Failed to parse SSE new_post event', e);
@@ -802,13 +797,8 @@ function initSSE() {
     });
     eventSource.addEventListener('new_comment', async (event) => {
         try {
-            const data = JSON.parse(event.data);
             if (appState.activeView === 'feed') {
                 await loadFeed();
-            } else if (appState.activeView === 'community' && window.communityPageState && window.communityPageState.community && window.communityPageState.community.id === data.community_id) {
-                if (typeof window.loadCommunityData === 'function') {
-                    await window.loadCommunityData();
-                }
             }
         } catch (e) {
             console.error('Failed to parse SSE new_comment event', e);

@@ -38,24 +38,264 @@ def test_simulation_pop_order():
     conn.commit()
     conn.close()
 
-    # We will manually trigger the pop logic from _run
+    # We will use the new claim logic
     def pop_next():
-        conn = server.get_db_connection()
-        try:
-            cur = conn.cursor()
-            cur.execute(
-                "SELECT id, event_type, event_data FROM simulation_events WHERE timestamp <= ? ORDER BY timestamp ASC, priority ASC LIMIT 1",
-                (time.time(),)
-            )
-            row = cur.fetchone()
-            if row:
-                cur.execute("DELETE FROM simulation_events WHERE id = ?", (row['id'],))
-                conn.commit()
-                return row['event_type']
-            return None
-        finally:
-            conn.close()
+        event = engine._claim_next_due_event()
+        return event.event_type if event else None
 
     assert pop_next() == 'EVENT_3' # Oldest
     assert pop_next() == 'EVENT_1' # Tied for time, HIGH priority
     assert pop_next() == 'EVENT_2' # Tied for time, LOW priority
+
+
+def test_simulation_dedupe_replace():
+    engine = server.SimulationEngine()
+
+    # Schedule first event
+    engine.schedule(50, server.EventPriority.LOW, 'EVENT_DUP', {'v': 1}, dedupe_key='key1', replace_existing=True)
+
+    # Schedule replacement event with same key but different priority and data
+    engine.schedule(10, server.EventPriority.HIGH, 'EVENT_DUP', {'v': 2}, dedupe_key='key1', replace_existing=True)
+
+    conn = server.get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM simulation_events WHERE dedupe_key = 'key1'")
+    rows = cur.fetchall()
+    conn.close()
+
+    assert len(rows) == 1
+    assert rows[0]['priority'] == server.EventPriority.HIGH.value
+    data = json.loads(rows[0]['event_data'])
+    assert data['v'] == 2
+
+
+def test_simulation_lifecycle():
+    engine = server.SimulationEngine()
+
+    # Schedule an event due immediately
+    engine.schedule(-10, server.EventPriority.HIGH, 'LIFECYCLE_TEST', {})
+
+    conn = server.get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT id, status FROM simulation_events WHERE event_type = 'LIFECYCLE_TEST'")
+    row = cur.fetchone()
+    assert row['status'] == 'pending'
+
+    # Claim it
+    event = engine._claim_next_due_event()
+    assert event is not None
+    assert event.event_type == 'LIFECYCLE_TEST'
+
+    cur.execute("SELECT status, attempts, claimed_at, timestamp FROM simulation_events WHERE id = ?", (event.id,))
+    row = cur.fetchone()
+    assert row['status'] == 'processing'
+    assert row['attempts'] == 1
+    assert row['claimed_at'] is not None
+    orig_timestamp = row['timestamp']
+
+    # Mark it failed
+    engine._mark_event_failed(event.id, "some error")
+    cur.execute("SELECT status, last_error, timestamp, claimed_at FROM simulation_events WHERE id = ?", (event.id,))
+    row = cur.fetchone()
+    assert row['status'] == 'pending' # still under 3 attempts
+    assert row['last_error'] == 'some error'
+    assert row['claimed_at'] is None
+    assert row['timestamp'] > orig_timestamp # backoff applied
+
+    # Claim it again to move to attempts=2
+    event2 = engine._claim_next_due_event()
+    # It won't be claimable immediately because timestamp moved forward, so we hack the timestamp back
+    conn.execute("UPDATE simulation_events SET timestamp = timestamp - 100 WHERE id = ?", (event.id,))
+    conn.commit()
+
+    event2 = engine._claim_next_due_event()
+    assert event2 is not None
+
+    # Fail it up to terminal
+    engine._mark_event_failed(event.id, "error 2") # attempts=2
+
+    # We must claim it again so attempts increments from 2 to 3
+    conn.execute("UPDATE simulation_events SET timestamp = timestamp - 100 WHERE id = ?", (event.id,))
+    conn.commit()
+    engine._claim_next_due_event()
+
+    engine._mark_event_failed(event.id, "error 3") # attempts=3
+    cur.execute("SELECT status, attempts, claimed_at FROM simulation_events WHERE id = ?", (event.id,))
+    row = cur.fetchone()
+    assert row['attempts'] == 3
+    assert row['status'] == 'failed' # Reached terminal failure
+    assert row['claimed_at'] is None
+
+    # Verify terminal status dedupe key override behavior
+    engine.schedule(0, server.EventPriority.HIGH, 'TERM_TEST', {}, dedupe_key='term_key', replace_existing=False)
+    # Set to failed
+    conn.execute("UPDATE simulation_events SET status = 'failed' WHERE dedupe_key = 'term_key'")
+    conn.commit()
+
+    # Schedule with replace_existing=False. It SHOULD overwrite because it's terminal.
+    engine.schedule(0, server.EventPriority.HIGH, 'TERM_TEST', {}, dedupe_key='term_key', replace_existing=False)
+    cur.execute("SELECT status, claimed_at FROM simulation_events WHERE dedupe_key = 'term_key'")
+    row = cur.fetchone()
+    assert row['status'] == 'pending'
+    assert row['claimed_at'] is None
+
+    conn.close()
+
+def test_simulation_restart_semantics():
+    engine = server.SimulationEngine()
+
+    # 1. Processing events reset cleanly on restart
+    engine.schedule(-10, server.EventPriority.HIGH, 'STUCK_PROCESS', {})
+    event = engine._claim_next_due_event()
+    assert event is not None
+
+    conn = server.get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT status FROM simulation_events WHERE id = ?", (event.id,))
+    assert cur.fetchone()['status'] == 'processing'
+
+    # Simulate restart logic
+    conn.execute("UPDATE simulation_events SET status = 'pending', claimed_at = NULL WHERE status = 'processing'")
+    conn.commit()
+
+    cur.execute("SELECT status, claimed_at FROM simulation_events WHERE id = ?", (event.id,))
+    row = cur.fetchone()
+    assert row['status'] == 'pending'
+    assert row['claimed_at'] is None
+
+    # 2. No duplicate COMMUNITY_POST scheduling after restart
+    engine.schedule(100, server.EventPriority.LOW, 'COMMUNITY_POST', {'community_id': 99}, dedupe_key='COMMUNITY_POST_99', replace_existing=False)
+
+    # Count rows before "restart" schedule
+    cur.execute("SELECT COUNT(*) as count FROM simulation_events WHERE dedupe_key = 'COMMUNITY_POST_99'")
+    assert cur.fetchone()['count'] == 1
+
+    # Simulate restart trying to schedule again
+    engine.schedule(200, server.EventPriority.LOW, 'COMMUNITY_POST', {'community_id': 99}, dedupe_key='COMMUNITY_POST_99', replace_existing=False)
+
+    # Verify no duplicate was added and the timestamp wasn't overridden (it shouldn't replace existing non-terminal)
+    cur.execute("SELECT COUNT(*) as count FROM simulation_events WHERE dedupe_key = 'COMMUNITY_POST_99'")
+    assert cur.fetchone()['count'] == 1
+
+    cur.execute("SELECT timestamp FROM simulation_events WHERE dedupe_key = 'COMMUNITY_POST_99'")
+    # Still the original +100s stamp
+    ts = cur.fetchone()['timestamp']
+    assert ts < time.time() + 150
+
+    conn.close()
+
+def test_community_state_update():
+    # Insert dummy community
+    conn = server.get_db_connection()
+    cur = conn.cursor()
+    cur.execute("INSERT INTO communities (name) VALUES ('test_comm')")
+    comm_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+
+    # Initialize simulation instance
+    server.SIMULATIONS[comm_id] = server.Simulation(comm_id, "test_comm", "desc", "none", 60)
+
+    # Test update triggers correctly
+    server.update_community_state(comm_id, "This is a new test topic about apples", is_argumentative=True, is_new_post=True)
+
+    sim = server.SIMULATIONS[comm_id]
+
+    # Energy should go up for new post
+    assert sim.energy > 1.0
+    # Conflict should go up, mood down
+    assert sim.conflict_level > 0.0
+    assert sim.mood < 0.0
+
+    # Topics should contain "test" and "topic" and "about" (due to stopword filtering and count logic)
+    topics = [t['topic'] for t in sim.current_topics]
+    assert "test" in topics
+    assert "topic" in topics
+    assert len(topics) <= 3 # extract_topics grabs top 3
+
+    # Test drift decay
+    sim.energy = 2.0
+    sim.mood = -0.5
+    sim.conflict_level = 0.5
+
+    engine = server.SimulationEngine()
+    engine._do_community_drift({'community_id': comm_id})
+
+    # Verify decay
+    assert sim.energy < 2.0
+    assert sim.mood > -0.5
+    assert sim.conflict_level < 0.5
+
+def test_community_state_endpoint_offline():
+    # Insert dummy community and some state
+    conn = server.get_db_connection()
+    cur = conn.cursor()
+    cur.execute("INSERT INTO communities (name, mood, conflict_level, energy, current_topics) VALUES ('offline_test_comm', 0.8, 0.4, 2.5, '[{\"topic\": \"xyz\", \"weight\": 1.0}]')")
+    comm_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+
+    # Clear SIMULATIONS in-memory map to simulate an offline or not-yet-booted server state
+    server.SIMULATIONS.clear()
+
+    class DummyHandler:
+        def __init__(self):
+            self.headers = {}
+            self.responses = []
+            self.status_code = None
+
+        def send_response(self, code):
+            self.status_code = code
+
+        def send_header(self, k, v):
+            pass
+
+        def end_headers(self):
+            pass
+
+        def wfile_write(self, data):
+            self.responses.append(data)
+
+        # Inject wfile object
+        class WFile:
+            def __init__(self, parent):
+                self.parent = parent
+            def write(self, data):
+                self.parent.wfile_write(data)
+
+        def get_wfile(self):
+            return self.WFile(self)
+
+    # Since RequestHandler requires an active socket connection during init,
+    # we'll create a lightweight mock of the class just to call handle_api_get directly.
+    class MockHandler(server.RequestHandler):
+        def __init__(self):
+            # Skip the actual BaseHTTPRequestHandler init that needs a socket
+            self.headers = {}
+            self.captured_data = None
+            self.captured_status = None
+
+        def respond_json(self, data, status=200, extra_headers=None):
+            self.captured_data = data
+            self.captured_status = status
+
+        def get_current_user(self):
+            return None # Not needed for community_state
+
+    handler = MockHandler()
+
+    class MockParsed:
+        def __init__(self, path):
+            self.path = path
+            self.query = ""
+
+    handler.handle_api_get(MockParsed(f"/api/community_state/{comm_id}"))
+
+    assert handler.captured_status is None or handler.captured_status == 200
+    captured_data = handler.captured_data
+    assert captured_data is not None
+    assert captured_data['mood'] == 0.8
+    assert captured_data['conflict_level'] == 0.4
+    assert captured_data['energy'] == 2.5
+    assert len(captured_data['top_topics']) == 1
+    assert captured_data['top_topics'][0]['topic'] == 'xyz'
