@@ -39,14 +39,25 @@ LENSES = {
                   'a small cooperative building project', 'survival preferences', 'creative constraints',
                   'landscape design', 'ordinary funny building mistakes'),
     'dad jokes': ('food', 'pets', 'weather', 'household objects', 'gardening', 'travel', 'music', 'wordplay'),
+    'instant regret': ('a kitchen shortcut that immediately backfires',
+                      'an impulsive purchase with an obvious catch',
+                      'a DIY shortcut followed by an immediate mess',
+                      'a harmless prank that backfires on its creator',
+                      'overconfidence during an ordinary game',
+                      'ignoring the weather and immediately regretting it',
+                      'a phone or computer shortcut with an awkward consequence',
+                      'a small everyday decision and its unexpected downside'),
 }
 
 
 def topic_lens(name, number):
-    topics = LENSES.get(name.lower(), ('welcoming beginners', 'personal favorites',
-        'an unusual creative constraint', 'a small everyday moment', 'a cooperative idea',
-        'a thoughtful tradeoff', 'an overlooked detail', 'what makes the hobby enjoyable'))
-    return topics[number % len(topics)]
+    topics = LENSES.get(name.lower())
+    if topics:
+        return topics[number % len(topics)]
+    angles = ('a beginner question', 'a personal preference', 'an unusual idea',
+              'a small everyday moment', 'a shared experience', 'a thoughtful tradeoff',
+              'an overlooked detail', 'a familiar situation seen differently')
+    return f"{angles[number % len(angles)]} directly about {name}'s stated subject"
 
 
 def grounded_persona(name, index):

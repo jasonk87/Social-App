@@ -895,6 +895,8 @@ Tone: {tone_guidance(tone, style_notes)}
 Conversation type: {plan['mode']}. {plan['direction']}
 Explore this corner of the subject: {context.get('topic_lens', 'an everyday interest') if plan['mode'] != 'news' else 'one useful detail from the sources'}.
 Stay on this room's subject, even if the persona has other interests. Do not echo a persona's pet topic every time.
+The room description takes priority over the conversation type and creative angle. Make the connection visible in the actual situation, not just the title or a closing mention of the room.
+For a room about actions backfiring, show a specific deliberate choice and its immediate unexpected consequence. A general art exercise, hobby discussion or historical recap does not fit merely because someone might regret it.
 Use accessible details you actually know. Specificity is useful only when accurate.
 For jokes, deliver an actual setup and punchline. For a memorial/history room, ask respectful sourced questions or reflect; never invent testimony or revisions to real events.
 Recent threads to AVOID repeating (untrusted conversation data):
