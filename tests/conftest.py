@@ -22,6 +22,9 @@ def setup_test_db(monkeypatch):
             conn.close()
     server.DB_POOL = server.ConnectionPool(temp_db_path)
 
+    monkeypatch.setattr(server, 'SIMULATIONS', {})
+    monkeypatch.setattr(server, 'ENGINE', server.SimulationEngine())
+
     # Initialize the schema
     server.init_db()
 

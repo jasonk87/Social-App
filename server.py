@@ -3,7 +3,7 @@
 social_app/server.py
 
 This module implements a lightweight social media simulation server that runs
-entirely on the local machine.  It uses only Python's standard library to
+entirely on the local machine. It uses Python's standard library and requests to
 provide a simple HTTP API and a minimal web interface.  Users can create
 communities (akin to subreddits), generate AI personas, and run
 simulations that produce posts and comments using a locally running
@@ -42,6 +42,7 @@ import dataclasses
 from enum import IntEnum
 import re
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 
 # -----------------------------------------------------------------------------
 # Database and data models
@@ -55,7 +56,7 @@ from collections import Counter
 # along with a reference back to the agent and community/post.
 #
 
-DB_PATH = os.path.join(os.path.dirname(__file__), 'social.db')
+DB_PATH = os.environ.get('SOCIAL_DB_PATH', os.path.join(os.path.dirname(__file__), 'social.db'))
 MAX_COMMUNITIES = 20
 SESSION_COOKIE_NAME = "social_session"
 
@@ -95,6 +96,8 @@ TONE_PRESETS: Dict[str, Dict[str, Any]] = {
 
 
 def normalize_tone(value: Optional[str]) -> str:
+    if value is not None and not isinstance(value, str):
+        raise ValueError('tone must be a string.')
     tone = (value or DEFAULT_COMMUNITY_TONE).strip().lower()
     return tone if tone in TONE_PRESETS else DEFAULT_COMMUNITY_TONE
 
@@ -124,42 +127,56 @@ class ConnectionPool:
         except queue.Empty:
             conn = sqlite3.connect(self.db_path, check_same_thread=False)
             conn.row_factory = sqlite3.Row
-            # Enable WAL mode for better concurrency
-            conn.execute("PRAGMA journal_mode = WAL")
+            # WAL is enabled once in init_db; per-connection pragmas are safe here.
             conn.execute("PRAGMA synchronous = NORMAL")
             conn.execute("PRAGMA foreign_keys = ON")
             return conn
 
     def release_connection(self, conn: sqlite3.Connection) -> None:
+        # A failed write must never leak its transaction into another request.
+        try:
+            conn.rollback()
+        except sqlite3.Error:
+            conn.close()
+            return
         try:
             self.pool.put_nowait(conn)
         except queue.Full:
             conn.close()
 
 DB_POOL = None
+DB_POOL_LOCK = threading.Lock()
 
 def get_db_connection():
     global DB_POOL
-    if DB_POOL is None:
-        DB_POOL = ConnectionPool(DB_PATH)
-
-    conn = DB_POOL.get_connection()
+    with DB_POOL_LOCK:
+        if DB_POOL is None:
+            DB_POOL = ConnectionPool(DB_PATH)
+        pool = DB_POOL
+    conn = pool.get_connection()
 
     class PooledConnection:
         def __init__(self, _conn):
             self._conn = _conn
+            self._closed = False
 
         def __getattr__(self, item):
             return getattr(self._conn, item)
 
         def close(self):
-            DB_POOL.release_connection(self._conn)
+            if not self._closed:
+                self._closed = True
+                pool.release_connection(self._conn)
 
         def __enter__(self):
-            return self._conn.__enter__()
+            self._conn.__enter__()
+            return self
 
         def __exit__(self, exc_type, exc_val, exc_tb):
-            return self._conn.__exit__(exc_type, exc_val, exc_tb)
+            try:
+                return self._conn.__exit__(exc_type, exc_val, exc_tb)
+            finally:
+                self.close()
 
     return PooledConnection(conn)
 
@@ -168,6 +185,7 @@ def init_db() -> None:
     """Initialise the SQLite database and create tables if absent."""
     conn = sqlite3.connect(DB_PATH)
     try:
+        conn.execute("PRAGMA journal_mode = WAL")
         cur = conn.cursor()
         # Create communities table
         cur.execute(
@@ -359,6 +377,16 @@ def init_db() -> None:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_sim_events_status_time ON simulation_events (status, timestamp, priority)")
         cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_sim_events_dedupe ON simulation_events (dedupe_key) WHERE dedupe_key IS NOT NULL")
 
+        cur.execute('CREATE INDEX IF NOT EXISTS idx_posts_community_time ON posts (community_id, created_at DESC, id DESC)')
+        cur.execute('CREATE INDEX IF NOT EXISTS idx_comments_post_time ON comments (post_id, created_at, id)')
+        cur.execute('CREATE INDEX IF NOT EXISTS idx_posts_agent ON posts (agent_id)')
+        cur.execute('CREATE INDEX IF NOT EXISTS idx_comments_agent ON comments (agent_id)')
+
+        # Older maintenance scripts could delete accounts without foreign keys enabled.
+        # Remove only unusable account metadata; social content is retained.
+        cur.execute('DELETE FROM user_sessions WHERE user_id NOT IN (SELECT id FROM users)')
+        cur.execute('DELETE FROM community_subscriptions WHERE user_id NOT IN (SELECT id FROM users) OR community_id NOT IN (SELECT id FROM communities)')
+
         # Ensure Human agent exists for the 'You' interactions
         cur.execute("SELECT id FROM agents WHERE username = 'You' AND model = 'none'")
         if not cur.fetchone():
@@ -397,21 +425,43 @@ def verify_pin(pin: str, stored_hash: str) -> bool:
 OLLAMA_BASE_URL = os.environ.get('OLLAMA_BASE_URL', 'http://localhost:11434')
 
 
+MODEL_CAPABILITIES = {}
+MODEL_CAPABILITIES_LOCK = threading.Lock()
+
+
 class OllamaError(Exception):
     pass
 
 
+def model_can_generate(item: Dict[str, Any]) -> bool:
+    key = (OLLAMA_BASE_URL, item['name'], item.get('digest'))
+    with MODEL_CAPABILITIES_LOCK:
+        cached = MODEL_CAPABILITIES.get(key)
+        if cached is not None:
+            return cached
+    response = requests.post(f"{OLLAMA_BASE_URL}/api/show", json={'model': item['name']}, timeout=(3, 5))
+    response.raise_for_status()
+    capabilities = response.json().get('capabilities')
+    # Older Ollama releases omit capabilities. Preserve their text-model support.
+    supported = capabilities is None or 'completion' in capabilities
+    with MODEL_CAPABILITIES_LOCK:
+        MODEL_CAPABILITIES[key] = supported
+    return supported
+
+
 def list_models() -> List[str]:
-    """Return a list of model names installed on the local Ollama instance."""
+    """Return installed models that support text generation, excluding embedders."""
     try:
-        resp = requests.get(f"{OLLAMA_BASE_URL}/api/tags")
-        if resp.status_code != 200:
-            raise OllamaError(f"list models failed: {resp.status_code} {resp.text}")
-        data = resp.json()
-        models = [item['name'] for item in data.get('models', [])]
-        return models
+        resp = requests.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=(3, 10))
+        resp.raise_for_status()
+        items = resp.json().get('models', [])
+        if not items:
+            return []
+        with ThreadPoolExecutor(max_workers=min(8, len(items))) as pool:
+            supported = list(pool.map(model_can_generate, items))
+        return [item['name'] for item, usable in zip(items, supported) if usable]
     except Exception as e:
-        raise OllamaError(f"Failed to list models: {e}")
+        raise OllamaError(f"Failed to list models: {e}") from e
 
 
 def generate_text(model: str, prompt: str, system: Optional[str] = None, max_tokens: Optional[int] = None) -> str:
@@ -433,17 +483,19 @@ def generate_text(model: str, prompt: str, system: Optional[str] = None, max_tok
         'model': model,
         'prompt': prompt,
         'stream': False,
+        'options': {'num_predict': max_tokens or 512},
     }
     if system:
         payload['system'] = system
-    if max_tokens:
-        payload['max_tokens'] = max_tokens
     try:
-        resp = requests.post(f"{OLLAMA_BASE_URL}/api/generate", json=payload)
+        resp = requests.post(f"{OLLAMA_BASE_URL}/api/generate", json=payload, timeout=(3, 180))
         if resp.status_code != 200:
             raise OllamaError(f"generate failed: {resp.status_code} {resp.text}")
         data = resp.json()
-        return data.get('response', '')
+        result = data.get('response')
+        if not isinstance(result, str) or not result.strip():
+            raise OllamaError('The model returned no text. Try a different local model.')
+        return result.strip()
     except Exception as e:
         raise OllamaError(f"Failed to generate text: {e}")
 
@@ -633,7 +685,7 @@ Return only the JSON object and no other commentary. Do not return a list.
         if start != -1 and end != -1:
             response = response[start:end+1]
         data = json.loads(response)
-        if not isinstance(data, dict) or 'username' not in data or 'persona' not in data:
+        if not isinstance(data, dict) or any(not isinstance(data.get(key), str) or not data[key].strip() for key in ('username', 'persona')):
             raise ValueError("Response did not contain expected keys")
         return data
     except Exception as e:
@@ -708,7 +760,7 @@ def get_relationship_context(agent_id: int, target_agent_id: int) -> str:
 
 
 def check_and_update_agent_burnout(agent_id: int, conflict_level: float, memory_str: str, persona: str, model: str) -> None:
-    if model == 'none':
+    if model in ('none', 'human'):
         return
 
     conn = get_db_connection()
@@ -747,6 +799,8 @@ def check_and_update_agent_burnout(agent_id: int, conflict_level: float, memory_
             # Evolve if crossing threshold
             if old_burnout < 0.6 and burnout >= 0.6:
                 print(f"Agent {username} is approaching burnout! Evolving persona.")
+                # Release the SQLite writer before the scheduler opens its own transaction.
+                conn.commit()
                 ENGINE.schedule(5, EventPriority.HIGH, 'AGENT_EVOLVE', {
                     'agent_id': agent_id,
                     'memory': memory_str,
@@ -818,8 +872,10 @@ Return only the JSON object and no other commentary.
         if start != -1 and end != -1:
             response = response[start:end+1]
         data = json.loads(response)
-        if 'title' not in data or 'content' not in data:
+        if not isinstance(data, dict) or any(not isinstance(data.get(key), str) or not data[key].strip() for key in ('title', 'content')):
             raise ValueError("Missing keys in post JSON")
+        if data.get('media_url') is not None and not isinstance(data['media_url'], str):
+            raise ValueError('Invalid media description in post JSON')
         return data
     except Exception as e:
         raise OllamaError(f"Failed to parse post JSON: {e}\nResponse: {response}")
@@ -956,6 +1012,7 @@ class SimulationEngine:
         conn = get_db_connection()
         try:
             if dedupe_key:
+                conn.execute('BEGIN IMMEDIATE')
                 # To support older sqlite without ON CONFLICT (or with UNIQUE index restrictions on UPSERT),
                 # we'll do an explicit select/update/insert
                 cur = conn.cursor()
@@ -1026,7 +1083,7 @@ class SimulationEngine:
         conn = get_db_connection()
         try:
             cur = conn.cursor()
-            cur.execute("SELECT attempts FROM simulation_events WHERE id = ?", (event_id,))
+            cur.execute("SELECT attempts FROM simulation_events WHERE id = ? AND status = 'processing'", (event_id,))
             row = cur.fetchone()
             if row:
                 attempts = row['attempts']
@@ -1123,7 +1180,7 @@ class SimulationEngine:
                 SELECT agents.id, agents.username, agents.persona, agents.model, agents.memory
                 FROM agents
                 JOIN community_agents ON agents.id = community_agents.agent_id
-                WHERE community_agents.community_id = ?
+                WHERE community_agents.community_id = ? AND agents.model NOT IN ('none', 'human')
                 """,
                 (community_id,),
             )
@@ -1161,7 +1218,7 @@ class SimulationEngine:
                     SELECT agents.id, agents.username, agents.persona, agents.model, agents.memory
                     FROM agents
                     JOIN community_agents ON agents.id = community_agents.agent_id
-                    WHERE community_agents.community_id != ? AND agents.model != 'none'
+                    WHERE community_agents.community_id != ? AND agents.model NOT IN ('none', 'human')
                     ORDER BY RANDOM() LIMIT 1
                     """,
                     (community_id,)
@@ -1338,7 +1395,7 @@ class SimulationEngine:
                         conn = get_db_connection()
                         try:
                             cur = conn.cursor()
-                            cur.execute("SELECT id FROM agents WHERE id = ? AND model != 'none'", (parent_agent_id,))
+                            cur.execute("SELECT id FROM agents WHERE id = ? AND model NOT IN ('none', 'human')", (parent_agent_id,))
                             pa_row = cur.fetchone()
                             if pa_row:
                                 ENGINE.schedule(random.randint(60, 180), EventPriority.HIGH, 'AGENT_REPLY', {
@@ -1427,7 +1484,7 @@ class SimulationEngine:
                         conn = get_db_connection()
                         try:
                             cur = conn.cursor()
-                            cur.execute("SELECT id FROM agents WHERE id = ? AND model != 'none'", (post_agent_id,))
+                            cur.execute("SELECT id FROM agents WHERE id = ? AND model NOT IN ('none', 'human')", (post_agent_id,))
                             pa_row = cur.fetchone()
                             if pa_row:
                                 ENGINE.schedule(random.randint(60, 180), EventPriority.HIGH, 'AGENT_REPLY', {
@@ -1457,8 +1514,16 @@ class SimulationEngine:
             cur = conn.cursor()
             cur.execute("SELECT username, persona, model, memory FROM agents WHERE id = ?", (agent_id,))
             agent_row = cur.fetchone()
-            if not agent_row or agent_row['model'] == 'none':
+            if not agent_row or agent_row['model'] in ('none', 'human'):
                 return
+
+            post = cur.execute('SELECT community_id, locked FROM posts WHERE id = ?', (post_id,)).fetchone()
+            if not post or post['locked'] or post['community_id'] != community_id:
+                return
+            if reply_to_comment_id is not None:
+                parent = cur.execute('SELECT post_id FROM comments WHERE id = ?', (reply_to_comment_id,)).fetchone()
+                if not parent or parent['post_id'] != post_id:
+                    return
 
             cur.execute("SELECT 1 FROM community_agents WHERE agent_id = ? AND community_id = ?", (agent_id, community_id))
             if not cur.fetchone():
@@ -1656,7 +1721,7 @@ Return only the JSON object."""
                 SELECT agents.id, agents.username, agents.model, agents.persona
                 FROM agents
                 JOIN community_agents ON agents.id = community_agents.agent_id
-                WHERE community_agents.community_id = ? AND agents.model != 'none'
+                WHERE community_agents.community_id = ? AND agents.model NOT IN ('none', 'human')
                 ORDER BY RANDOM() LIMIT 1
                 """,
                 (community_id,)
@@ -1823,7 +1888,7 @@ Do not apologize, just state that the thread is locked. Do not output JSON, just
         # Community Merger Logic: Low energy and shared topics
         if sim.energy < 0.5 and sim.current_topics:
             sim_topic_names = {t['topic'] for t in sim.current_topics}
-            for other_id, other_sim in SIMULATIONS.items():
+            for other_id, other_sim in list(SIMULATIONS.items()):
                 if other_id != community_id and other_sim.energy < 0.5 and other_sim.current_topics:
                     other_topic_names = {t['topic'] for t in other_sim.current_topics}
                     if sim_topic_names & other_topic_names:
@@ -1914,7 +1979,7 @@ Respond with ONLY the new persona string and no other commentary or JSON.
                 SELECT agents.id, agents.username, agents.persona, agents.model
                 FROM agents
                 JOIN community_agents ON agents.id = community_agents.agent_id
-                WHERE community_agents.community_id = ? AND agents.model != 'none'
+                WHERE community_agents.community_id = ? AND agents.model NOT IN ('none', 'human')
                 ORDER BY RANDOM() LIMIT 1
                 """,
                 (source_community_id,)
@@ -2310,9 +2375,9 @@ def get_user_by_session(token: str) -> Optional[sqlite3.Row]:
             FROM user_sessions
             JOIN users ON users.id = user_sessions.user_id
             JOIN agents ON agents.id = users.agent_id
-            WHERE user_sessions.token = ?
+            WHERE user_sessions.token = ? AND user_sessions.created_at > ?
             """,
-            (token,),
+            (token, time.time() - 2592000),
         )
         return cur.fetchone()
     finally:
@@ -2323,6 +2388,7 @@ def create_session(user_id: int) -> str:
     token = secrets.token_urlsafe(32)
     conn = get_db_connection()
     try:
+        conn.execute("DELETE FROM user_sessions WHERE created_at <= ?", (time.time() - 2592000,))
         conn.execute(
             "INSERT INTO user_sessions (token, user_id, created_at) VALUES (?, ?, ?)",
             (token, user_id, time.time()),
@@ -2396,16 +2462,17 @@ def is_user_subscribed(user_id: int, community_id: int) -> bool:
 
 
 def create_household_user(display_name: str, pin: str) -> sqlite3.Row:
-    clean_name = (display_name or "").strip()
-    clean_pin = (pin or "").strip()
+    clean_name = coerce_string(display_name, 'display_name', required=True, max_length=80)
+    clean_pin = coerce_string(pin, 'pin', required=True, max_length=32)
     if len(clean_name) < 2:
         raise ValueError("Display name must be at least 2 characters.")
-    if len(clean_pin) < 4:
-        raise ValueError("PIN must be at least 4 digits.")
+    if len(clean_pin) < 4 or not re.fullmatch(r'[0-9]+', clean_pin):
+        raise ValueError("PIN must contain 4 to 32 digits.")
 
     conn = get_db_connection()
     try:
         cur = conn.cursor()
+        cur.execute('BEGIN IMMEDIATE')
         cur.execute("SELECT 1 FROM users WHERE LOWER(display_name) = LOWER(?)", (clean_name,))
         if cur.fetchone():
             raise ValueError("That user already exists.")
@@ -2492,7 +2559,7 @@ def update_community(community_id: int, description: str, model: str, posting_ra
             """
             UPDATE agents
             SET model = ?
-            WHERE id IN (
+            WHERE model NOT IN ('none', 'human') AND id IN (
                 SELECT agent_id
                 FROM community_agents
                 WHERE community_id = ?
@@ -2508,12 +2575,27 @@ def update_community(community_id: int, description: str, model: str, posting_ra
 def parse_posting_rate(raw_value: Any, fallback: int = 60) -> int:
     """Parse user-supplied posting rate and return a validated integer."""
     try:
+        if isinstance(raw_value, (bool, float)):
+            raise ValueError
         posting_rate = int(raw_value if raw_value not in (None, "") else fallback)
     except (TypeError, ValueError) as exc:
         raise ValueError("Posting rate must be a whole number.") from exc
     if posting_rate < 30:
         raise ValueError("Posting rate must be at least 30 seconds.")
+    if posting_rate > 86400:
+        raise ValueError("Posting rate must be at most 86400 seconds.")
     return posting_rate
+
+
+def parse_page(query: Dict[str, List[str]], default_limit: int) -> tuple[int, int]:
+    try:
+        offset = int(query.get('offset', ['0'])[0])
+        limit = int(query.get('limit', [str(default_limit)])[0])
+    except ValueError as exc:
+        raise ValueError('offset and limit must be whole numbers.') from exc
+    if offset < 0 or not 1 <= limit <= 100:
+        raise ValueError('offset must be nonnegative and limit must be between 1 and 100.')
+    return offset, limit
 
 
 def coerce_string(value: Any, field_name: str, *, required: bool = False, max_length: int = 1000) -> str:
@@ -2585,6 +2667,16 @@ def add_comment(post_id: int, agent_id: int, parent_id: Optional[int], content: 
     conn = get_db_connection()
     try:
         cur = conn.cursor()
+        cur.execute('BEGIN IMMEDIATE')
+        post = cur.execute('SELECT locked FROM posts WHERE id = ?', (post_id,)).fetchone()
+        if post is None:
+            raise ValueError('Post not found.')
+        if post['locked']:
+            raise ValueError('This thread is locked.')
+        if parent_id is not None:
+            parent = cur.execute('SELECT post_id FROM comments WHERE id = ?', (parent_id,)).fetchone()
+            if parent is None or parent['post_id'] != post_id:
+                raise ValueError('Parent comment must belong to this post.')
         cur.execute(
             "INSERT INTO comments (post_id, agent_id, parent_id, content, created_at) VALUES (?, ?, ?, ?, ?)",
             (post_id, agent_id, parent_id, content, time.time()),
@@ -2667,12 +2759,14 @@ def fetch_community_feed(community_id: int, target_post_id: Optional[int] = None
             FROM posts
             JOIN agents ON posts.agent_id = agents.id
             WHERE posts.community_id = ?
-            ORDER BY posts.created_at DESC
+            ORDER BY posts.created_at DESC, posts.id DESC
             LIMIT ? OFFSET ?
             """,
             (community_id, limit + 1, offset),
         )
-        append_posts(cur.fetchall())
+        page_rows = cur.fetchall()
+        has_more = len(page_rows) > limit
+        append_posts(page_rows[:limit])
 
         if target_post_id is not None and target_post_id not in post_map:
             cur.execute(
@@ -2691,35 +2785,23 @@ def fetch_community_feed(community_id: int, target_post_id: Optional[int] = None
 
         posts = list(post_map.values())
         posts.sort(key=lambda post: post['created_at'], reverse=True)
-        has_more = False
-        if target_post_id is None and len(posts) > limit:
-            has_more = True
-            posts = posts[:limit]
         return posts, has_more
     finally:
         conn.close()
 
 
 def fetch_home_feed(user_id: int, sort: str = "latest", offset: int = 0, limit: int = 20) -> tuple[List[Dict[str, Any]], bool]:
-    conn = get_db_connection()
-    try:
-        cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT
-                posts.id AS post_id,
-                posts.title,
-                posts.content,
-                posts.created_at,
-                posts.community_id,
-                posts.locked,
-                posts.media_url,
-                communities.name AS community_name,
-                communities.description AS community_description,
-                agents.username AS author,
-                agents.id AS agent_id,
-                COUNT(comments.id) AS comment_count,
-                GROUP_CONCAT(comments.id) AS comment_ids
+    # Let SQLite select one page instead of materializing the entire household feed.
+    order = 'best_score DESC, posts.created_at DESC, posts.id DESC' if sort == 'best' else 'posts.created_at DESC, posts.id DESC'
+    with get_db_connection() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT posts.id, posts.title, posts.content, posts.created_at, posts.community_id,
+                   posts.locked, posts.media_url, communities.name AS community_name,
+                   communities.description AS community_description,
+                   agents.username AS author, agents.id AS agent_id,
+                   COUNT(comments.id) AS comment_count, GROUP_CONCAT(comments.id) AS comment_ids,
+                   COUNT(comments.id) * 6 + 24.0 / MAX((? - posts.created_at) / 3600.0, 1.0) AS best_score
             FROM community_subscriptions
             JOIN communities ON communities.id = community_subscriptions.community_id
             JOIN posts ON posts.community_id = communities.id
@@ -2727,40 +2809,20 @@ def fetch_home_feed(user_id: int, sort: str = "latest", offset: int = 0, limit: 
             LEFT JOIN comments ON comments.post_id = posts.id
             WHERE community_subscriptions.user_id = ?
             GROUP BY posts.id
+            ORDER BY {order}
+            LIMIT ? OFFSET ?
             """,
-            (user_id,),
-        )
-        rows = cur.fetchall()
-        posts: List[Dict[str, Any]] = []
-        now = time.time()
-        for row in rows:
-            age_hours = max((now - row["created_at"]) / 3600.0, 1.0)
-            best_score = row["comment_count"] * 6 + (24.0 / age_hours)
-            posts.append({
-                "id": row["post_id"],
-                "title": row["title"],
-                "content": row["content"],
-                "created_at": row["created_at"],
-                "community_id": row["community_id"],
-                "locked": bool(row["locked"]),
-                "community_name": row["community_name"],
-                "community_description": row["community_description"] or "",
-                "author": row["author"],
-                "agent_id": row["agent_id"],
-                "comment_count": row["comment_count"],
-                "comment_ids": [int(comment_id) for comment_id in (row["comment_ids"] or "").split(",") if comment_id],
-                "best_score": round(best_score, 4),
-            })
-
-        if sort == "best":
-            posts.sort(key=lambda post: (post["best_score"], post["created_at"]), reverse=True)
-        else:
-            posts.sort(key=lambda post: post["created_at"], reverse=True)
-
-        has_more = len(posts) > offset + limit
-        return posts[offset:offset+limit], has_more
-    finally:
-        conn.close()
+            (time.time(), user_id, limit + 1, offset),
+        ).fetchall()
+    posts = []
+    for row in rows[:limit]:
+        post = dict(row)
+        post['locked'] = bool(post['locked'])
+        post['community_description'] = post['community_description'] or ''
+        post['comment_ids'] = [int(value) for value in (post['comment_ids'] or '').split(',') if value]
+        post['best_score'] = round(post['best_score'], 4)
+        posts.append(post)
+    return posts, len(rows) > limit
 
 
 # -----------------------------------------------------------------------------
@@ -2824,6 +2886,7 @@ class RequestHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header('Content-Type', 'application/json')
         self.send_header('Content-Length', str(len(body)))
+        self.send_header('Cache-Control', 'no-store')
         for header, value in extra_headers or []:
             self.send_header(header, value)
         self.end_headers()
@@ -2985,8 +3048,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                 sort = (query.get('sort', ['latest'])[0] or 'latest').lower()
                 if sort not in ('latest', 'best'):
                     sort = 'latest'
-                offset = int(query.get('offset', ['0'])[0] or '0')
-                limit = int(query.get('limit', ['20'])[0] or '20')
+                offset, limit = parse_page(query, 20)
                 posts, has_more = fetch_home_feed(current_user['id'], sort, offset=offset, limit=limit)
                 self.respond_json({
                     'sort': sort,
@@ -3013,8 +3075,13 @@ class RequestHandler(BaseHTTPRequestHandler):
                         return
                     target_post_id_raw = (query.get('target_post_id', [''])[0] or '').strip()
                     target_post_id = int(target_post_id_raw) if target_post_id_raw.isdigit() else None
-                    offset = int(query.get('offset', ['0'])[0] or '0')
-                    limit = int(query.get('limit', ['50'])[0] or '50')
+                    offset, limit = parse_page(query, 50)
+                    target_comment = query.get('target_comment_id', [''])[0]
+                    if target_comment.isdigit():
+                        with get_db_connection() as conn:
+                            target = conn.execute('SELECT post_id FROM comments WHERE id = ?', (int(target_comment),)).fetchone()
+                            if target:
+                                target_post_id = target['post_id']
                     posts, has_more = fetch_community_feed(row['id'], target_post_id=target_post_id, offset=offset, limit=limit)
                     self.respond_json({
                         'posts': posts,
@@ -3028,7 +3095,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                             'tone': normalize_tone(row['tone']),
                             'style_notes': row['style_notes'] or '',
                             'subscribed': bool(current_user and is_user_subscribed(current_user['id'], row['id'])),
-                            'active_ama_agent_id': row.get('active_ama_agent_id'),
+                            'active_ama_agent_id': row['active_ama_agent_id'],
                         },
                         'current_user': (
                             {
@@ -3094,9 +3161,11 @@ class RequestHandler(BaseHTTPRequestHandler):
                     self.respond_json({'error': 'Invalid agent path'}, status=400)
             else:
                 self.respond_error('Unknown API path', status=404, code='not_found')
+        except ValueError as e:
+            self.respond_error(str(e), status=400, code='validation_error')
         except OllamaError as e:
             try:
-                self.respond_error(str(e), status=500, code='ollama_error')
+                self.respond_error(str(e), status=503, code='ollama_error')
             except Exception:
                 pass
         except Exception as e:
@@ -3107,8 +3176,19 @@ class RequestHandler(BaseHTTPRequestHandler):
 
     def handle_api_post(self, parsed) -> None:
         path = parsed.path[len('/api/'):]  # strip '/api/'
-        content_length = int(self.headers.get('Content-Length', 0))
+        try:
+            content_length = int(self.headers.get('Content-Length', 0))
+        except ValueError:
+            self.respond_error('Invalid Content-Length.', status=400, code='invalid_payload')
+            return
+        if content_length < 0 or content_length > 65536:
+            self.respond_error('Request body must be at most 64 KB.', status=413, code='payload_too_large')
+            return
         body = self.rfile.read(content_length) if content_length > 0 else b''
+        origin = self.headers.get('Origin')
+        if origin and urlparse(origin).netloc.lower() != self.headers.get('Host', '').lower():
+            self.respond_error('Cross-origin requests are not allowed.', status=403, code='invalid_origin')
+            return
         data = {}
         if body:
             try:
@@ -3363,6 +3443,8 @@ class RequestHandler(BaseHTTPRequestHandler):
                     parent_id = data.get('parent_id')
                     if parent_id is not None:
                         try:
+                            if isinstance(parent_id, (bool, float)):
+                                raise ValueError
                             parent_id = int(parent_id)
                         except (TypeError, ValueError):
                             self.respond_error('parent_id must be an integer or null.', status=400, code='validation_error')
@@ -3376,6 +3458,9 @@ class RequestHandler(BaseHTTPRequestHandler):
                         cur = conn.cursor()
                         cur.execute("SELECT locked FROM posts WHERE id = ?", (post_id,))
                         row = cur.fetchone()
+                        if row is None:
+                            self.respond_error('Post not found.', status=404, code='not_found')
+                            return
                         if row and row['locked'] == 1:
                             self.respond_error('This thread is locked.', status=403, code='thread_locked')
                             return
@@ -3399,7 +3484,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                             if p_row: parent_agent_id = p_row['agent_id']
 
                         if parent_agent_id:
-                            cur.execute("SELECT id FROM agents WHERE id = ? AND model != 'none'", (parent_agent_id,))
+                            cur.execute("SELECT id FROM agents WHERE id = ? AND model NOT IN ('none', 'human')", (parent_agent_id,))
                             if cur.fetchone():
                                 cur.execute("SELECT community_id FROM posts WHERE id = ?", (post_id,))
                                 post_row = cur.fetchone()
@@ -3419,9 +3504,11 @@ class RequestHandler(BaseHTTPRequestHandler):
                     self.respond_error('Invalid comment path', status=400, code='invalid_path')
             else:
                 self.respond_error('Unknown API path', status=404, code='not_found')
+        except ValueError as e:
+            self.respond_error(str(e), status=400, code='validation_error')
         except OllamaError as e:
             try:
-                self.respond_error(str(e), status=500, code='ollama_error')
+                self.respond_error(str(e), status=503, code='ollama_error')
             except Exception:
                 pass
         except Exception as e:
@@ -3435,11 +3522,19 @@ class RequestHandler(BaseHTTPRequestHandler):
         if path == '/' or path == '':
             filename = 'index.html'
         else:
-            filename = path.lstrip('/')
-        # Prevent directory traversal
-        filename = os.path.normpath(filename)
-        full_path = os.path.join(STATIC_DIR, filename)
-        if not full_path.startswith(STATIC_DIR):
+            filename = unquote(path).lstrip('/')
+        # Normalize both URL and Windows separators before checking containment.
+        if ':' in filename or '\x00' in filename:
+            self.send_error(HTTPStatus.FORBIDDEN, 'Forbidden')
+            return
+        filename = os.path.normpath(filename.replace('\\', '/'))
+        static_root = os.path.realpath(STATIC_DIR)
+        full_path = os.path.realpath(os.path.join(static_root, filename))
+        try:
+            inside_static = os.path.commonpath([static_root, full_path]) == static_root
+        except ValueError:
+            inside_static = False
+        if not inside_static or ':' in filename or '\x00' in filename:
             self.send_error(HTTPStatus.FORBIDDEN, "Forbidden")
             return
         if os.path.isdir(full_path):
@@ -3466,23 +3561,14 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self.send_response(HTTPStatus.OK)
                 self.send_header('Content-Type', ctype)
                 self.send_header('Content-Length', str(len(content)))
+                self.send_header('Cache-Control', 'no-cache')
+                self.send_header('X-Content-Type-Options', 'nosniff')
                 self.end_headers()
                 self.wfile.write(content)
             except Exception as e:
                 self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR, str(e))
         else:
-            # Fallback: return index.html for client-side routing
-            index_path = os.path.join(STATIC_DIR, 'index.html')
-            if os.path.isfile(index_path):
-                with open(index_path, 'rb') as f:
-                    content = f.read()
-                self.send_response(HTTPStatus.OK)
-                self.send_header('Content-Type', 'text/html')
-                self.send_header('Content-Length', str(len(content)))
-                self.end_headers()
-                self.wfile.write(content)
-            else:
-                self.send_error(HTTPStatus.NOT_FOUND, "File not found")
+            self.send_error(HTTPStatus.NOT_FOUND, 'File not found')
 
 
 class SocialHTTPServer(ThreadingHTTPServer):
@@ -3506,8 +3592,7 @@ def run_server(host: str = 'localhost', port: int = 8080) -> None:
         finally:
             conn.close()
 
-        # Start the central simulation engine
-        ENGINE.start()
+        # Restore all simulation state before any queued event can be claimed.
         
         # Auto-boot all communities on startup by scheduling their heartbeats.
         # We use dedupe_key + replace_existing=False so that if a community
@@ -3515,12 +3600,9 @@ def run_server(host: str = 'localhost', port: int = 8080) -> None:
         # Our updated schedule() logic natively handles replacing terminal rows, so no deletes are needed.
         conn = get_db_connection()
         try:
-            # Mark all as active for the UI
-            conn.execute("UPDATE communities SET active = 1")
-            conn.commit()
             
             cur = conn.cursor()
-            cur.execute("SELECT * FROM communities")
+            cur.execute("SELECT * FROM communities WHERE active = 1")
             start_delay = 5
             for row in cur.fetchall():
                 comm_id = row['id']
@@ -3562,6 +3644,7 @@ def run_server(host: str = 'localhost', port: int = 8080) -> None:
         finally:
             conn.close()
         
+        ENGINE.start()
         httpd.serve_forever()
     except KeyboardInterrupt:
         pass
@@ -3572,4 +3655,9 @@ def run_server(host: str = 'localhost', port: int = 8080) -> None:
 
 
 if __name__ == '__main__':
-    run_server(host='0.0.0.0', port=5000)
+    import argparse
+    parser = argparse.ArgumentParser(description='Local Social Lab')
+    parser.add_argument('--host', default='0.0.0.0', help='Use 127.0.0.1 for this computer only.')
+    parser.add_argument('--port', type=int, default=5000)
+    args = parser.parse_args()
+    run_server(host=args.host, port=args.port)

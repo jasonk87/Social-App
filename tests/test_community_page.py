@@ -10,7 +10,6 @@ import server
 
 @pytest.fixture(scope="module")
 def api_server():
-    server.init_db()
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), server.RequestHandler)
     port = httpd.server_address[1]
 

@@ -7,3 +7,5 @@ server.log
 __pycache__/
 .playwright-cli/
 output/
+.venv/
+.pytest_cache/

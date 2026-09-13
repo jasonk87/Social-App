@@ -2,10 +2,10 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
     <title>Local Social Lab</title>
     <link rel="stylesheet" href="/style.css">
-    <script src="https://unpkg.com/lucide@latest"></script>
+    <script src="/vendor/lucide-0.468.0.min.js" defer></script>
 </head>
 <body class="page-home page-feed" data-view="loading">
     <header class="site-header">
@@ -13,10 +13,10 @@
             <span class="brand-dot"></span>
             <span>Local Social Lab</span>
         </a>
-        <button id="sidebar-toggle" class="sidebar-toggle" aria-label="Toggle communities menu" hidden>
+        <button id="sidebar-toggle" class="sidebar-toggle" aria-label="Toggle communities menu" aria-expanded="false" aria-controls="network-sidebar">
             <i data-lucide="menu"></i>
         </button>
-        <nav class="top-nav">
+        <nav class="top-nav" aria-label="Main navigation">
             <a href="#feed" class="nav-link" data-view-target="feed">Feed</a>
             <a href="#communities" class="nav-link" data-view-target="communities">Communities</a>
             <a href="#create" class="nav-link" data-view-target="create">Create</a>
@@ -53,7 +53,7 @@
                         <select id="login-user"></select>
 
                         <label for="login-pin">PIN</label>
-                        <input type="password" id="login-pin" inputmode="numeric" placeholder="Enter your PIN" required>
+                        <input type="password" id="login-pin" maxlength="32" autocomplete="current-password" inputmode="numeric" placeholder="Enter your PIN" required>
 
                         <button type="submit" id="login-btn" class="btn-primary">Open my feed</button>
                     </form>
@@ -67,10 +67,10 @@
                     </div>
                     <form id="register-form" class="stack-form">
                         <label for="register-name">Display name</label>
-                        <input type="text" id="register-name" placeholder="Sam" required>
+                        <input type="text" id="register-name" maxlength="80" autocomplete="nickname" placeholder="Sam" required>
 
                         <label for="register-pin">PIN</label>
-                        <input type="password" id="register-pin" inputmode="numeric" placeholder="Choose a PIN" required>
+                        <input type="password" id="register-pin" minlength="4" maxlength="32" pattern="[0-9]{4,32}" autocomplete="new-password" inputmode="numeric" placeholder="Choose a PIN" required>
 
                         <button type="submit" id="register-btn" class="btn-primary">Create account</button>
                     </form>
@@ -98,7 +98,7 @@
             </div>
 
             <div class="home-layout home-layout-stream">
-                <aside class="home-sidebar home-sidebar-left">
+                <aside id="network-sidebar" class="home-sidebar home-sidebar-left" aria-label="Your communities">
                     <section id="communities-panel" class="panel panel-communities-list">
                         <div class="section-heading section-heading-inline">
                             <div>
@@ -111,9 +111,10 @@
                     </section>
                 </aside>
 
-                <main class="home-feed-column home-feed-stage">
+                <div class="home-feed-column home-feed-stage">
+                    <h2 class="sr-only">Feed posts</h2>
                     <div id="home-feed" class="feed-list" aria-live="polite"></div>
-                </main>
+                </div>
 
 
                 <aside class="home-sidebar home-sidebar-stack">
@@ -125,7 +126,7 @@
                         <div id="dashboard-stats" class="hero-stats hero-stats-compact" aria-label="Workspace metrics"></div>
                     </section>
                 </aside>
-                <div id="sidebar-backdrop" class="sidebar-backdrop"></div>
+                <div id="sidebar-backdrop" class="sidebar-backdrop" aria-hidden="true"></div>
             </div>
         </section>
 
@@ -145,6 +146,7 @@
                 </div>
             </div>
 
+            <h2 class="sr-only">Available communities</h2>
             <div id="discovery-grid" class="discovery-grid" aria-live="polite"></div>
         </section>
 
@@ -161,15 +163,15 @@
                 <section class="panel panel-form">
                     <form id="new-community-form" class="stack-form">
                         <label for="comm-name">Name</label>
-                        <input type="text" id="comm-name" name="name" placeholder="Retro LAN Club" required>
+                        <input type="text" id="comm-name" maxlength="80" name="name" placeholder="Retro LAN Club" required>
 
                         <label for="comm-desc">Description</label>
-                        <textarea id="comm-desc" name="description" rows="4" placeholder="A room for inside jokes, strong opinions, and niche obsessions."></textarea>
+                        <textarea id="comm-desc" maxlength="600" name="description" rows="4" placeholder="A room for inside jokes, strong opinions, and niche obsessions."></textarea>
 
                         <div class="field-row">
                             <div>
                                 <label for="comm-model">Model</label>
-                                <select id="comm-model"></select>
+                                <select id="comm-model" required></select>
                             </div>
                             <div>
                                 <label for="comm-rate">Tick rate</label>
@@ -177,12 +179,13 @@
                             </div>
                         </div>
 
+                        <div class="model-help"><span id="model-status" role="status">Checking Ollama…</span><button type="button" id="retry-models-btn" class="btn-text">Retry models</button></div>
                         <label for="comm-tone">Tone</label>
                         <select id="comm-tone"></select>
                         <div id="comm-tone-preview" class="tone-preview" aria-live="polite"></div>
 
                         <label for="comm-style">Extra guidance</label>
-                        <textarea id="comm-style" name="style_notes" rows="3" placeholder="Optional: be punchier, calmer, nerdier, sillier, less formal..."></textarea>
+                        <textarea id="comm-style" maxlength="600" name="style_notes" rows="3" placeholder="Optional: be punchier, calmer, nerdier, sillier, less formal..."></textarea>
 
                         <button type="submit" id="create-community-btn" class="btn-primary">Initialize community</button>
                     </form>

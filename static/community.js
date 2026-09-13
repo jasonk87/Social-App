@@ -1,27 +1,3 @@
-async function fetchJSON(url, options = {}) {
-    let res;
-    try {
-        res = await fetch(url, options);
-    } catch (err) {
-        throw new Error('Network error. Check your connection and try again.');
-    }
-
-    let data = null;
-    try {
-        data = await res.json();
-    } catch (err) {
-        data = null;
-    }
-
-    if (!res.ok) {
-        throw new Error(data?.error || `Request failed (${res.status})`);
-    }
-    return data || {};
-}
-
-
-
-
 function getNotificationStorageKey(name) {
     const actor = communityPageState.currentUser?.agent_username || 'guest';
     return `community-notifications:${actor}:${name}`;
@@ -38,7 +14,7 @@ function getNotificationPreferenceKey(name, kind) {
 }
 
 function getNotificationPreference(name, kind) {
-    return localStorage.getItem(getNotificationPreferenceKey(name, kind)) === 'true';
+    try { return localStorage.getItem(getNotificationPreferenceKey(name, kind)) === 'true'; } catch { return false; }
 }
 
 const toneOptions = [
@@ -99,7 +75,7 @@ const communityPageState = {
 };
 
 function setNotificationPreference(name, kind, value) {
-    localStorage.setItem(getNotificationPreferenceKey(name, kind), value ? 'true' : 'false');
+    try { localStorage.setItem(getNotificationPreferenceKey(name, kind), value ? 'true' : 'false'); } catch { /* Optional preference storage. */ }
 }
 
 function getSeenNotifications(name) {
@@ -112,7 +88,7 @@ function getSeenNotifications(name) {
 }
 
 function persistSeenNotifications(name, ids) {
-    localStorage.setItem(getNotificationStorageKey(name), JSON.stringify(Array.from(ids)));
+    try { localStorage.setItem(getNotificationStorageKey(name), JSON.stringify(Array.from(ids))); } catch { /* Optional preference storage. */ }
 }
 
 function getUnreadNotifications(name) {
@@ -125,7 +101,7 @@ function getUnreadNotifications(name) {
 }
 
 function persistUnreadNotifications(name, ids) {
-    localStorage.setItem(getUnreadNotificationStorageKey(name), JSON.stringify(Array.from(ids)));
+    try { localStorage.setItem(getUnreadNotificationStorageKey(name), JSON.stringify(Array.from(ids))); } catch { /* Optional preference storage. */ }
 }
 
 function targetIdToNotificationKey(targetId) {
@@ -253,10 +229,11 @@ function openEditModal() {
     elements.error.textContent = '';
 
     if (community.model) {
-        elements.model.value = community.model;
+        selectSavedModel(elements.model, community.model);
     }
 
     updateTonePreview();
+    activateDialog(elements.shell);
     elements.shell.hidden = false;
     elements.shell.classList.add('is-open');
     elements.shell.setAttribute('aria-hidden', 'false');
@@ -271,6 +248,7 @@ function closeEditModal() {
     elements.shell.classList.remove('is-open');
     elements.shell.setAttribute('aria-hidden', 'true');
     elements.shell.hidden = true;
+    deactivateDialog(elements.shell);
 }
 
 async function saveCommunityEdits(event) {
@@ -322,6 +300,9 @@ function syncCommunityHeader() {
     }
 
     titleEl.textContent = community.name;
+    const signedIn = !!communityPageState.currentUser;
+    document.querySelectorAll('#compose-post input, #compose-post textarea, #submit-post-btn, #community-settings-btn, #community-subscribe-btn').forEach(control => { control.disabled = !signedIn; });
+    document.getElementById('composer-auth-note').hidden = signedIn;
     subtitle.textContent = community.description
         ? community.description
         : 'Live conversation from your local simulation.';
@@ -334,7 +315,7 @@ function syncCommunityHeader() {
             amaBanner.id = 'ama-banner';
             amaBanner.className = 'ama-banner';
             amaBanner.innerHTML = `<span class="pulsing-dot"></span> <strong>Live AMA in Progress!</strong> An agent is currently hosting an AMA in this community.`;
-            document.querySelector('.feed-header-copy').appendChild(amaBanner);
+            document.querySelector('.hero-content').appendChild(amaBanner);
         }
     } else if (amaBanner) {
         amaBanner.remove();
@@ -505,14 +486,14 @@ function renderComments(comments, container, depth = 0, postId = null, isLocked 
         const div = document.createElement('div');
         div.className = 'comment';
         div.id = `comment-${comment.id}`;
-        div.style.setProperty('--depth', depth);
+        div.style.setProperty('--depth', Math.min(depth, 6));
         div.innerHTML = `
             <div class="comment-meta">
                 <a href="/agent.html?id=${comment.agent_id}"><strong>@${escapeHTML(comment.author)}</strong></a>
                 <span>${escapeHTML(formatTimestamp(comment.created_at))}</span>
             </div>
             <div class="post-content">${escapeHTML(comment.content)}</div>
-            ${isLocked ? '' : `<button class="btn-text reply-btn" data-post-id="${postId}" data-parent-id="${comment.id}">
+            ${isLocked || !communityPageState.currentUser ? '' : `<button class="btn-text reply-btn" data-post-id="${postId}" data-parent-id="${comment.id}">
                 <i data-lucide="message-square-plus"></i>
                 <span>Reply</span>
             </button>`}
@@ -529,6 +510,7 @@ let communityFeedObserver = null;
 
 function renderFeed(posts, isLoadMore = false) {
     const feed = document.getElementById('feed');
+    communityFeedObserver?.disconnect();
     const unread = communityPageState.name ? getUnreadNotifications(communityPageState.name) : new Set();
 
     if (!isLoadMore) {
@@ -549,6 +531,7 @@ function renderFeed(posts, isLoadMore = false) {
     }
 
     posts.forEach((post) => {
+        if (isLoadMore && document.getElementById(`post-${post.id}`)) return;
         const article = document.createElement('article');
         article.className = 'post reveal-on-load';
         article.id = `post-${post.id}`;
@@ -574,7 +557,7 @@ function renderFeed(posts, isLoadMore = false) {
             </div>
             ${post.media_url ? `<div class="post-media-attachment" style="background: var(--bg-panel); border: 1px dashed var(--border-subtle); padding: 1rem; border-radius: var(--radius-sm); margin-bottom: 1rem; font-style: italic; color: var(--text-muted);"><i data-lucide="image"></i> ${escapeHTML(post.media_url)}</div>` : ''}
             <div class="post-content">${escapeHTML(post.content)}</div>
-            ${post.locked ? '<span class="locked-text" style="color: var(--text-muted); font-size: 0.9rem; padding: 0.5rem 1rem; display: inline-flex; align-items: center; gap: 0.4rem;"><i data-lucide="lock"></i> Thread Locked</span>' : `<button class="btn-text reply-btn" data-post-id="${post.id}" data-parent-id="">
+            ${post.locked || !communityPageState.currentUser ? '<span class="locked-text" style="color: var(--text-muted); font-size: 0.9rem; padding: 0.5rem 1rem; display: inline-flex; align-items: center; gap: 0.4rem;"><i data-lucide="lock"></i> Thread Locked</span>' : `<button class="btn-text reply-btn" data-post-id="${post.id}" data-parent-id="">
                 <i data-lucide="message-square-plus"></i>
                 <span>Reply</span>
             </button>`}
@@ -593,7 +576,8 @@ function renderFeed(posts, isLoadMore = false) {
         const sentinel = document.createElement('div');
         sentinel.id = 'feed-sentinel';
         sentinel.className = 'feed-loader';
-        sentinel.innerHTML = `<i data-lucide="loader-2" class="spin"></i> Loading more posts...`;
+        sentinel.innerHTML = '<button type="button" class="btn-text">Load more posts</button>';
+        sentinel.querySelector('button').onclick = () => loadFeed(communityPageState.name, { isLoadMore: true });
         feed.appendChild(sentinel);
         if (window.lucide) {
             lucide.createIcons({ root: sentinel });
@@ -618,7 +602,10 @@ function renderFeed(posts, isLoadMore = false) {
 
 async function loadFeed(name, options = {}) {
     const feed = document.getElementById('feed');
-    if (communityPageState.isLoadingFeed) return;
+    if (communityPageState.isLoadingFeed) {
+        if (!options.isLoadMore) communityPageState.pendingFeed = { name, options };
+        return;
+    }
 
     const {
         silentNotifications = false,
@@ -628,34 +615,28 @@ async function loadFeed(name, options = {}) {
         isLoadMore = false,
     } = options;
 
-    if (!isLoadMore) {
-        communityPageState.feedOffset = 0;
-    } else {
-        communityPageState.feedOffset += 50;
-    }
-
+    const offset = isLoadMore ? communityPageState.feedOffset : 0;
+    const limit = preserveScroll && !isLoadMore ? Math.min(100, Math.max(50, communityPageState.feedOffset)) : 50;
     communityPageState.isLoadingFeed = true;
-
     const previousScrollY = preserveScroll ? window.scrollY : null;
-    const hash = window.location.hash.replace('#', '').trim();
-    const targetPostMatch = hash.match(/^post-(\d+)$/);
-    const targetPostId = targetPostMatch ? targetPostMatch[1] : '';
-
-    let requestUrl = targetPostId && !isLoadMore
-        ? `/api/community/${encodeURIComponent(name)}/feed?target_post_id=${encodeURIComponent(targetPostId)}`
-        : `/api/community/${encodeURIComponent(name)}/feed`;
-
-    requestUrl += `${requestUrl.includes('?') ? '&' : '?'}offset=${communityPageState.feedOffset}&limit=50`;
+    const hash = window.location.hash.slice(1);
+    const targetMatch = hash.match(/^(post|comment)-(\d+)$/);
+    const query = new URLSearchParams({ offset, limit });
+    if (targetMatch && !isLoadMore) query.set(`target_${targetMatch[1]}_id`, targetMatch[2]);
+    const requestUrl = `/api/community/${encodeURIComponent(name)}/feed?${query}`;
 
     try {
         const data = await fetchJSON(requestUrl);
         const posts = data.posts || [];
-        communityPageState.feedHasMore = data.has_more || false;
+        if (renderDOM) {
+            communityPageState.feedHasMore = !!data.has_more;
+            communityPageState.feedOffset = offset + limit;
+        }
 
         if (data.community) {
             communityPageState.community = data.community;
         }
-        communityPageState.currentUser = data.current_user || communityPageState.currentUser;
+        communityPageState.currentUser = data.current_user || null;
 
         if (renderDOM) {
             renderFeed(posts, isLoadMore);
@@ -681,16 +662,34 @@ async function loadFeed(name, options = {}) {
             focusTargetFromHash();
         }
     } catch (err) {
-        if (renderDOM && !isLoadMore) {
-            feed.innerHTML = createEmptyState('Feed unavailable', err.message);
+        if (renderDOM) {
+            communityFeedObserver?.disconnect();
+            if (!isLoadMore) feed.innerHTML = createEmptyState('Feed unavailable', err.message);
+            document.getElementById('feed-sentinel')?.remove();
+            const retry = document.createElement('button');
+            retry.className = 'btn-text feed-retry';
+            retry.textContent = 'Could not load posts · Retry';
+            retry.onclick = () => { retry.remove(); loadFeed(name, options); };
+            feed.appendChild(retry);
         }
     } finally {
         communityPageState.isLoadingFeed = false;
+        const pending = communityPageState.pendingFeed;
+        communityPageState.pendingFeed = null;
+        if (pending) await loadFeed(pending.name, pending.options);
     }
 }
 
 document.addEventListener('DOMContentLoaded', async () => {
     initScrollObserver();
+    const composer = document.getElementById('composer-details');
+    const compact = window.matchMedia('(max-width: 980px)');
+    composer.open = !compact.matches;
+    document.getElementById('community-tools').open = !compact.matches;
+    compact.addEventListener('change', event => {
+        composer.open = !event.matches;
+        document.getElementById('community-tools').open = !event.matches;
+    });
     const name = getQueryParam('name');
     const titleEl = document.getElementById('community-title');
 
@@ -705,12 +704,6 @@ document.addEventListener('DOMContentLoaded', async () => {
     updateNotificationButtons(name);
     populateToneSelect();
     loadModelsIntoEditModal();
-    loadCommunityDetails(name)
-        .then(() => syncCommunityHeader())
-        .catch((err) => {
-            titleEl.textContent = name;
-            document.getElementById('community-subtitle').textContent = err.message;
-        });
     await loadFeed(name, { silentNotifications: true, focusTarget: true });
     await loadCommunityState();
     window.addEventListener('hashchange', focusTargetFromHash);
@@ -857,6 +850,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             });
 
             eventSource.onopen = () => {
+                if (reconnectAttempts > 0) scheduleSseRefresh();
                 reconnectAttempts = 0;
             };
 
@@ -885,7 +879,9 @@ document.addEventListener('DOMContentLoaded', async () => {
                 document.getElementById('state-mood').textContent = parseFloat(data.mood).toFixed(2);
                 document.getElementById('state-conflict').textContent = parseFloat(data.conflict_level).toFixed(2);
 
-                const topics = data.top_topics.map(t => t.topic).join(', ');
+                communityPageState.community.active_ama_agent_id = data.active_ama_agent_id;
+                syncCommunityHeader();
+                const topics = (data.top_topics || []).map(t => t.topic).join(', ');
                 document.getElementById('state-topics').textContent = topics || 'None';
                 if (window.lucide) {
                     window.lucide.createIcons();
@@ -905,6 +901,17 @@ document.addEventListener('DOMContentLoaded', async () => {
         // We fetch the data but only re-render if the user isn't actively writing.
         // This keeps notifications flowing but prevents wiping their typed text.
         const shouldRender = !document.querySelector('.reply-form') && !titleVal && !contentVal && !isTyping;
+        if (!shouldRender || window.scrollY > 500 || communityPageState.feedOffset > 50) {
+            showFeedUpdate(document.getElementById('feed'), () => {
+                if (document.querySelector('.reply-form')) {
+                    showToast('Reply draft open', 'Send or cancel your reply before refreshing.');
+                    return;
+                }
+                loadFeed(name, { preserveScroll: true });
+            });
+            await loadCommunityState();
+            return;
+        }
         await loadFeed(name, { preserveScroll: true, renderDOM: shouldRender });
         await loadCommunityState();
     };
@@ -919,7 +926,9 @@ document.addEventListener('DOMContentLoaded', async () => {
         const title = document.getElementById('new-post-title').value.trim();
         const content = document.getElementById('new-post-content').value.trim();
 
+        if (button.disabled) return;
         if (!title || !content) {
+            showToast('Add a title and post', 'Fill in both fields before publishing.');
             return;
         }
 
@@ -946,7 +955,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     document.getElementById('submit-post-btn').addEventListener('click', submitPost);
 
     document.getElementById('new-post-content').addEventListener('keydown', (event) => {
-        if (event.key === 'Enter' && !event.shiftKey) {
+        if (event.key === 'Enter' && (event.ctrlKey || event.metaKey) && !event.isComposing) {
             event.preventDefault();
             submitPost();
         }
@@ -975,7 +984,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         const formDiv = document.createElement('div');
         formDiv.className = 'reply-form';
         formDiv.innerHTML = `
-            <textarea rows="4" placeholder="Write a reply..."></textarea>
+            <textarea rows="4" maxlength="5000" aria-label="Your reply" placeholder="Write a reply..."></textarea>
             <div class="reply-actions">
                 <button class="btn-text cancel-reply-btn" type="button">Cancel</button>
                 <button class="btn-primary submit-reply-btn" type="button">Send reply</button>
@@ -993,6 +1002,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             }
 
             const submitButton = formDiv.querySelector('.submit-reply-btn');
+            if (submitButton.disabled) return;
             submitButton.disabled = true;
             submitButton.classList.add('is-busy');
 
@@ -1002,6 +1012,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ content, parent_id: parentId ? parseInt(parentId, 10) : null }),
                 });
+                formDiv.remove();
                 await refreshCommunityAfterLocalAction({ preserveScroll: true });
             } catch (err) {
                 showToast('Unable to publish reply', err.message);
@@ -1015,7 +1026,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         formDiv.querySelector('.cancel-reply-btn').addEventListener('click', () => formDiv.remove());
 
         textarea.addEventListener('keydown', (keyEvent) => {
-            if (keyEvent.key === 'Enter' && !keyEvent.shiftKey) {
+            if (keyEvent.key === 'Enter' && (keyEvent.ctrlKey || keyEvent.metaKey) && !keyEvent.isComposing) {
                 keyEvent.preventDefault();
                 submitReply();
             }
