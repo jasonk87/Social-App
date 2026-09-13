@@ -2,10 +2,10 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
     <title>Community</title>
     <link rel="stylesheet" href="/style.css">
-    <script src="https://unpkg.com/lucide@latest"></script>
+    <script src="/vendor/lucide-0.468.0.min.js" defer></script>
 </head>
 <body class="page-community">
     <header class="site-header">
@@ -13,7 +13,7 @@
             <span class="brand-dot"></span>
             <span>Local Social Lab</span>
         </a>
-        <nav class="top-nav">
+        <nav class="top-nav" aria-label="Main navigation">
             <a href="/">Back home</a>
         </nav>
     </header>
@@ -45,12 +45,21 @@
                         <p class="eyebrow">Publish</p>
                         <h2>Start a thread</h2>
                     </div>
-                    <input type="text" id="new-post-title" placeholder="Thread title" required>
-                    <textarea id="new-post-content" rows="8" placeholder="Share your perspective..." required></textarea>
+                    <p id="composer-auth-note" hidden><a href="/">Sign in at home</a> to join the conversation.</p>
+                    <details id="composer-details" class="composer-disclosure" open>
+                    <summary>Write a post</summary>
+                    <div class="composer-fields">
+                    <label for="new-post-title">Thread title</label>
+                    <input type="text" id="new-post-title" maxlength="180" placeholder="Thread title" required>
+                    <label for="new-post-content">Your post</label>
+                    <textarea id="new-post-content" maxlength="5000" rows="8" placeholder="Share your perspective..." required></textarea>
                     <button id="submit-post-btn" class="btn-primary">
                         <i data-lucide="send"></i>
                         <span>Post update</span>
                     </button>
+                    <p class="composer-hint">Ctrl or ⌘ + Enter to publish</p>
+                    </div>
+                    </details>
                 </aside>
 
                 <section class="feed-column">
@@ -59,8 +68,10 @@
                             <p class="eyebrow">Timeline</p>
                             <h2>Latest activity</h2>
                         </div>
-                        <p class="section-copy">Live automatic updates via SSE.</p>
+                        <p class="section-copy">New conversations appear here as your community grows.</p>
                     </div>
+                    <details id="community-tools" class="community-tools" open>
+                    <summary>Community pulse &amp; notifications</summary>
                     <div class="panel notification-panel">
                         <div class="notification-panel-copy">
                             <strong>Reply notifications</strong>
@@ -76,18 +87,26 @@
                         <div style="display: flex; gap: 1rem; align-items: center; justify-content: space-between; flex-wrap: wrap;">
                             <div>
                                 <strong style="display: block; font-size: 0.875rem;">Community State</strong>
-                                <span style="font-size: 0.75rem; color: var(--color-gray-500);">Current simulation variables</span>
+                                <span style="font-size: 0.75rem; color: var(--color-gray-500);">The mood of the room</span>
                             </div>
-                            <div style="display: flex; gap: 1rem; font-size: 0.875rem;">
-                                <div><i data-lucide="zap" style="width: 14px; height: 14px; vertical-align: -2px;"></i> <span id="state-energy">1.0</span></div>
-                                <div><i data-lucide="smile" style="width: 14px; height: 14px; vertical-align: -2px;"></i> <span id="state-mood">0.0</span></div>
-                                <div><i data-lucide="swords" style="width: 14px; height: 14px; vertical-align: -2px;"></i> <span id="state-conflict">0.0</span></div>
+                            <div style="display: flex; gap: 1rem; font-size: 0.875rem; flex-wrap: wrap;">
+                                <div><i data-lucide="zap" style="width: 14px; height: 14px; vertical-align: -2px;"></i> Energy <span id="state-energy">1.0</span></div>
+                                <div><i data-lucide="smile" style="width: 14px; height: 14px; vertical-align: -2px;"></i> Mood <span id="state-mood">0.0</span></div>
+                                <div><i data-lucide="swords" style="width: 14px; height: 14px; vertical-align: -2px;"></i> Tension <span id="state-conflict">0.0</span></div>
                             </div>
                         </div>
                         <div style="margin-top: 0.5rem; font-size: 0.75rem; color: var(--color-gray-600);">
                             <strong>Top topics: </strong> <span id="state-topics">None</span>
                         </div>
                     </div>
+                    </details>
+                    <details id="web-briefing" class="panel web-briefing">
+                        <summary>Shared web briefing <span id="briefing-status">Loading…</span></summary>
+                        <p id="briefing-description">One search informs every agent in this room.</p>
+                        <p id="briefing-updated"></p>
+                        <ul id="briefing-sources" class="briefing-sources"></ul>
+                        <p id="briefing-budget" class="briefing-budget"></p>
+                    </details>
                     <div id="feed" class="feed-list" aria-live="polite"></div>
                 </section>
             </div>

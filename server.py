@@ -3,7 +3,7 @@
 social_app/server.py
 
 This module implements a lightweight social media simulation server that runs
-entirely on the local machine.  It uses only Python's standard library to
+entirely on the local machine. It uses Python's standard library and requests to
 provide a simple HTTP API and a minimal web interface.  Users can create
 communities (akin to subreddits), generate AI personas, and run
 simulations that produce posts and comments using a locally running
@@ -42,6 +42,9 @@ import dataclasses
 from enum import IntEnum
 import re
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
+import community_knowledge
+import conversation_quality as quality
 
 # -----------------------------------------------------------------------------
 # Database and data models
@@ -55,7 +58,8 @@ from collections import Counter
 # along with a reference back to the agent and community/post.
 #
 
-DB_PATH = os.path.join(os.path.dirname(__file__), 'social.db')
+DB_PATH = os.environ.get('SOCIAL_DB_PATH', os.path.join(os.path.dirname(__file__), 'social.db'))
+KNOWLEDGE = None
 MAX_COMMUNITIES = 20
 SESSION_COOKIE_NAME = "social_session"
 
@@ -95,6 +99,8 @@ TONE_PRESETS: Dict[str, Dict[str, Any]] = {
 
 
 def normalize_tone(value: Optional[str]) -> str:
+    if value is not None and not isinstance(value, str):
+        raise ValueError('tone must be a string.')
     tone = (value or DEFAULT_COMMUNITY_TONE).strip().lower()
     return tone if tone in TONE_PRESETS else DEFAULT_COMMUNITY_TONE
 
@@ -124,42 +130,56 @@ class ConnectionPool:
         except queue.Empty:
             conn = sqlite3.connect(self.db_path, check_same_thread=False)
             conn.row_factory = sqlite3.Row
-            # Enable WAL mode for better concurrency
-            conn.execute("PRAGMA journal_mode = WAL")
+            # WAL is enabled once in init_db; per-connection pragmas are safe here.
             conn.execute("PRAGMA synchronous = NORMAL")
             conn.execute("PRAGMA foreign_keys = ON")
             return conn
 
     def release_connection(self, conn: sqlite3.Connection) -> None:
+        # A failed write must never leak its transaction into another request.
+        try:
+            conn.rollback()
+        except sqlite3.Error:
+            conn.close()
+            return
         try:
             self.pool.put_nowait(conn)
         except queue.Full:
             conn.close()
 
 DB_POOL = None
+DB_POOL_LOCK = threading.Lock()
 
 def get_db_connection():
     global DB_POOL
-    if DB_POOL is None:
-        DB_POOL = ConnectionPool(DB_PATH)
-
-    conn = DB_POOL.get_connection()
+    with DB_POOL_LOCK:
+        if DB_POOL is None:
+            DB_POOL = ConnectionPool(DB_PATH)
+        pool = DB_POOL
+    conn = pool.get_connection()
 
     class PooledConnection:
         def __init__(self, _conn):
             self._conn = _conn
+            self._closed = False
 
         def __getattr__(self, item):
             return getattr(self._conn, item)
 
         def close(self):
-            DB_POOL.release_connection(self._conn)
+            if not self._closed:
+                self._closed = True
+                pool.release_connection(self._conn)
 
         def __enter__(self):
-            return self._conn.__enter__()
+            self._conn.__enter__()
+            return self
 
         def __exit__(self, exc_type, exc_val, exc_tb):
-            return self._conn.__exit__(exc_type, exc_val, exc_tb)
+            try:
+                return self._conn.__exit__(exc_type, exc_val, exc_tb)
+            finally:
+                self.close()
 
     return PooledConnection(conn)
 
@@ -168,6 +188,7 @@ def init_db() -> None:
     """Initialise the SQLite database and create tables if absent."""
     conn = sqlite3.connect(DB_PATH)
     try:
+        conn.execute("PRAGMA journal_mode = WAL")
         cur = conn.cursor()
         # Create communities table
         cur.execute(
@@ -216,6 +237,8 @@ def init_db() -> None:
             cur.execute("ALTER TABLE communities ADD COLUMN novelty_pressure REAL DEFAULT 0.5")
         if "current_topics" not in community_columns:
             cur.execute("ALTER TABLE communities ADD COLUMN current_topics TEXT DEFAULT '[]'")
+        if "editorial_turn" not in community_columns:
+            cur.execute("ALTER TABLE communities ADD COLUMN editorial_turn INTEGER DEFAULT 0")
 
         cur.execute("UPDATE communities SET tone = ? WHERE tone IS NULL OR TRIM(tone) = ''", (DEFAULT_COMMUNITY_TONE,))
         cur.execute("UPDATE communities SET style_notes = '' WHERE style_notes IS NULL")
@@ -237,6 +260,8 @@ def init_db() -> None:
             cur.execute("ALTER TABLE agents ADD COLUMN memory TEXT")
         if "burnout" not in agent_columns:
             cur.execute("ALTER TABLE agents ADD COLUMN burnout REAL DEFAULT 0.0")
+        if "persona_revision" not in agent_columns:
+            cur.execute("ALTER TABLE agents ADD COLUMN persona_revision INTEGER DEFAULT 0")
         # Association table between agents and communities
         cur.execute(
             """
@@ -270,6 +295,10 @@ def init_db() -> None:
             cur.execute("ALTER TABLE posts ADD COLUMN locked INTEGER DEFAULT 0")
         if "media_url" not in post_columns:
             cur.execute("ALTER TABLE posts ADD COLUMN media_url TEXT")
+        if "generation_mode" not in post_columns:
+            cur.execute("ALTER TABLE posts ADD COLUMN generation_mode TEXT")
+        if "source_urls" not in post_columns:
+            cur.execute("ALTER TABLE posts ADD COLUMN source_urls TEXT DEFAULT '[]'")
 
         community_columns = {row[1] for row in cur.execute("PRAGMA table_info(communities)").fetchall()}
         if "active_ama_agent_id" not in community_columns:
@@ -359,11 +388,32 @@ def init_db() -> None:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_sim_events_status_time ON simulation_events (status, timestamp, priority)")
         cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_sim_events_dedupe ON simulation_events (dedupe_key) WHERE dedupe_key IS NOT NULL")
 
+        cur.execute('CREATE INDEX IF NOT EXISTS idx_posts_community_time ON posts (community_id, created_at DESC, id DESC)')
+        cur.execute('CREATE INDEX IF NOT EXISTS idx_comments_post_time ON comments (post_id, created_at, id)')
+        cur.execute('CREATE INDEX IF NOT EXISTS idx_posts_agent ON posts (agent_id)')
+        cur.execute('CREATE INDEX IF NOT EXISTS idx_comments_agent ON comments (agent_id)')
+
+        # Older maintenance scripts could delete accounts without foreign keys enabled.
+        # Remove only unusable account metadata; social content is retained.
+        cur.execute('DELETE FROM user_sessions WHERE user_id NOT IN (SELECT id FROM users)')
+        cur.execute('DELETE FROM community_subscriptions WHERE user_id NOT IN (SELECT id FROM users) OR community_id NOT IN (SELECT id FROM communities)')
+
         # Ensure Human agent exists for the 'You' interactions
         cur.execute("SELECT id FROM agents WHERE username = 'You' AND model = 'none'")
         if not cur.fetchone():
             cur.execute("INSERT INTO agents (username, model, persona) VALUES ('You', 'none', 'The human user')")
             
+        community_knowledge.init_schema(conn)
+        # Retire personas generated by the old "invent obscure expertise" prompt.
+        # Preserve handles, human accounts, community membership and conversations.
+        legacy_agents = cur.execute('''SELECT a.id, c.name FROM agents a
+            JOIN community_agents ca ON ca.agent_id=a.id JOIN communities c ON c.id=ca.community_id
+            WHERE a.persona_revision=0 AND a.model NOT IN ('none','human')
+              AND c.id=(SELECT MIN(community_id) FROM community_agents WHERE agent_id=a.id)
+            ORDER BY c.id,a.id''').fetchall()
+        for index, (agent_id, room_name) in enumerate(legacy_agents):
+            cur.execute('UPDATE agents SET persona=?,memory=NULL,burnout=0,persona_revision=1 WHERE id=?',
+                        (quality.grounded_persona(room_name, index), agent_id))
         conn.commit()
     finally:
         conn.close()
@@ -397,24 +447,46 @@ def verify_pin(pin: str, stored_hash: str) -> bool:
 OLLAMA_BASE_URL = os.environ.get('OLLAMA_BASE_URL', 'http://localhost:11434')
 
 
+MODEL_CAPABILITIES = {}
+MODEL_CAPABILITIES_LOCK = threading.Lock()
+
+
 class OllamaError(Exception):
     pass
 
 
+def model_can_generate(item: Dict[str, Any]) -> bool:
+    key = (OLLAMA_BASE_URL, item['name'], item.get('digest'))
+    with MODEL_CAPABILITIES_LOCK:
+        cached = MODEL_CAPABILITIES.get(key)
+        if cached is not None:
+            return cached
+    response = requests.post(f"{OLLAMA_BASE_URL}/api/show", json={'model': item['name']}, timeout=(3, 5))
+    response.raise_for_status()
+    capabilities = response.json().get('capabilities')
+    # Older Ollama releases omit capabilities. Preserve their text-model support.
+    supported = capabilities is None or 'completion' in capabilities
+    with MODEL_CAPABILITIES_LOCK:
+        MODEL_CAPABILITIES[key] = supported
+    return supported
+
+
 def list_models() -> List[str]:
-    """Return a list of model names installed on the local Ollama instance."""
+    """Return installed models that support text generation, excluding embedders."""
     try:
-        resp = requests.get(f"{OLLAMA_BASE_URL}/api/tags")
-        if resp.status_code != 200:
-            raise OllamaError(f"list models failed: {resp.status_code} {resp.text}")
-        data = resp.json()
-        models = [item['name'] for item in data.get('models', [])]
-        return models
+        resp = requests.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=(3, 10))
+        resp.raise_for_status()
+        items = resp.json().get('models', [])
+        if not items:
+            return []
+        with ThreadPoolExecutor(max_workers=min(8, len(items))) as pool:
+            supported = list(pool.map(model_can_generate, items))
+        return [item['name'] for item, usable in zip(items, supported) if usable]
     except Exception as e:
-        raise OllamaError(f"Failed to list models: {e}")
+        raise OllamaError(f"Failed to list models: {e}") from e
 
 
-def generate_text(model: str, prompt: str, system: Optional[str] = None, max_tokens: Optional[int] = None) -> str:
+def generate_text(model: str, prompt: str, system: Optional[str] = None, max_tokens: Optional[int] = None, json_output: Any = False, temperature: float = 0.85) -> str:
     """Generate text from the given model with the supplied prompt.
 
     Args:
@@ -433,17 +505,22 @@ def generate_text(model: str, prompt: str, system: Optional[str] = None, max_tok
         'model': model,
         'prompt': prompt,
         'stream': False,
+        'options': {'num_predict': max_tokens or 512, 'temperature': temperature,
+                    'top_p': 0.9, 'repeat_penalty': 1.12, 'num_ctx': 8192},
     }
+    if json_output:
+        payload['format'] = json_output if isinstance(json_output, dict) else 'json'
     if system:
         payload['system'] = system
-    if max_tokens:
-        payload['max_tokens'] = max_tokens
     try:
-        resp = requests.post(f"{OLLAMA_BASE_URL}/api/generate", json=payload)
+        resp = requests.post(f"{OLLAMA_BASE_URL}/api/generate", json=payload, timeout=(3, 180))
         if resp.status_code != 200:
             raise OllamaError(f"generate failed: {resp.status_code} {resp.text}")
         data = resp.json()
-        return data.get('response', '')
+        result = data.get('response')
+        if not isinstance(result, str) or not result.strip():
+            raise OllamaError('The model returned no text. Try a different local model.')
+        return result.strip()
     except Exception as e:
         raise OllamaError(f"Failed to generate text: {e}")
 
@@ -599,45 +676,26 @@ def refresh_agent_persona_if_needed(agent_id: int, username: str, persona: str, 
 
 
 def create_persona(model: str, community_name: str, description: str) -> Dict[str, str]:
-    """Generate a new AI persona using the specified model.
-
-    Returns a dictionary with 'username' and 'persona'.
-    """
-    anchor_text = format_subject_anchor_text(community_name, description)
-    mode = infer_community_mode(community_name, description)
-    prompt = f"""
-You are generating a SINGLE unique username and persona description for an AI agent
-participating in the online community "{community_name}".
-Community description: {description}
-Core subject anchors: {anchor_text}
-Community mode guidance: {community_mode_prompt(mode)}
-
-It is CRITICAL that you wildly vary the personalities you generate. Make this specific agent
-a casual fan, hardcore enthusiast, newcomer asking for help, salty veteran, stats nerd,
-storyline obsessive, collector, contrarian, helpful guide, joke poster, or lore/history head.
-
-The persona must care about highly specific, deep-cut topics within this niche. For example, if it's about wrestling, they should obsess over specific obscure matches, individual moves, or backstage politics, not generic statements. If it's a game, they should focus on obscure mechanics, specific items, or complex strategies, rather than surface-level 'glitches', one mushroom island, or basic gameplay.
-Do NOT make them sound like a computer program, philosopher, cosmic poet, software engineer, or abstract systems theorist
-unless the community itself is explicitly about those things.
-
-Respond with ONLY ONE JSON object with the following keys:
-  "username": a concise, imaginative alias (no spaces, no punctuation other than underscores).
-  "persona": a detailed, 2-sentence description of the character's specific quirks, communication style,
-             opinions, and favorite angles within this community's subject matter.
-Return only the JSON object and no other commentary. Do not return a list.
-"""
-    response = generate_text(model, prompt)
+    role_index = random.randrange(len(quality.ROLES))
+    profile = quality.grounded_persona(community_name, role_index)
+    prompt = f"""Create one forum username and a two-sentence persona for {community_name}.
+Room description: {description}
+Assigned personality: {profile}
+Give them a recognizable voice and two DIFFERENT broad interests within the room.
+Do not invent obscure mechanics, statistics, credentials or factual expertise.
+Avoid making every member a hostile veteran, stats expert or obsessive specialist.
+Return ONLY JSON with nonempty string keys username and persona.
+The username uses letters, digits and underscores, at most 32 characters."""
+    response = generate_text(model, prompt, quality.SYSTEM, 240, json_output=True)
     try:
-        start = response.find("{")
-        end = response.rfind("}")
-        if start != -1 and end != -1:
-            response = response[start:end+1]
         data = json.loads(response)
-        if not isinstance(data, dict) or 'username' not in data or 'persona' not in data:
-            raise ValueError("Response did not contain expected keys")
+        if not isinstance(data, dict) or any(not isinstance(data.get(key), str) or not data[key].strip() for key in ('username', 'persona')):
+            raise ValueError('Invalid persona')
+        data['username'] = re.sub(r'[^A-Za-z0-9_]', '', data['username'])[:32] or f'member_{secrets.token_hex(3)}'
+        data['persona'] = data['persona'][:700]
         return data
-    except Exception as e:
-        raise OllamaError(f"Failed to parse persona JSON: {e}\nResponse: {response}")
+    except (ValueError, TypeError):
+        return {'username': f'member_{secrets.token_hex(3)}', 'persona': profile}
 
 
 def update_relationship(agent1_id: int, agent2_id: int, is_argumentative: bool) -> None:
@@ -708,7 +766,7 @@ def get_relationship_context(agent_id: int, target_agent_id: int) -> str:
 
 
 def check_and_update_agent_burnout(agent_id: int, conflict_level: float, memory_str: str, persona: str, model: str) -> None:
-    if model == 'none':
+    if model in ('none', 'human'):
         return
 
     conn = get_db_connection()
@@ -747,6 +805,8 @@ def check_and_update_agent_burnout(agent_id: int, conflict_level: float, memory_
             # Evolve if crossing threshold
             if old_burnout < 0.6 and burnout >= 0.6:
                 print(f"Agent {username} is approaching burnout! Evolving persona.")
+                # Release the SQLite writer before the scheduler opens its own transaction.
+                conn.commit()
                 ENGINE.schedule(5, EventPriority.HIGH, 'AGENT_EVOLVE', {
                     'agent_id': agent_id,
                     'memory': memory_str,
@@ -758,161 +818,151 @@ def check_and_update_agent_burnout(agent_id: int, conflict_level: float, memory_
         conn.close()
 
 
-def generate_post(model: str, persona: str, community_name: str, description: str, tone: str, style_notes: str = "", memory: str = "", state_context: str = "", is_lost_redditor: bool = False) -> dict:
-    """Generate a post title and content for a community.
+def knowledge_service():
+    return KNOWLEDGE or community_knowledge.CommunityKnowledge(get_db_connection)
 
-    Args:
-        model: Name of the model to use.
-        persona: Persona description of the posting agent.
-        community_name: Name of the community.
-        description: Description or theme of the community.
 
-    Returns:
-        A dictionary with 'title' and 'content'.
-    """
-    memory_section = f"\nRecent memories of your interactions:\n{memory}\n" if memory else ""
-    state_section = f"\nCurrent Community State:\n{state_context}\n" if state_context else ""
-    subject_anchors = format_subject_anchor_text(community_name, description)
-    mode = infer_community_mode(community_name, description)
+def writing_context(community_name, reserve=False):
+    with get_db_connection() as conn:
+        if reserve:
+            conn.execute('BEGIN IMMEDIATE')
+        room = conn.execute('SELECT id,editorial_turn FROM communities WHERE name=?', (community_name,)).fetchone()
+        if not room:
+            return {'recent': [], 'comments': [], 'briefing': {}, 'plan': quality.choose_plan(0, {})}
+        recent = [dict(row) for row in conn.execute(
+            'SELECT title,content,generation_mode FROM posts WHERE community_id=? ORDER BY id DESC LIMIT 50', (room['id'],))]
+        number = room['editorial_turn']
+        if reserve:
+            conn.execute('UPDATE communities SET editorial_turn=editorial_turn+1 WHERE id=?', (room['id'],))
+        comments = [dict(row) for row in conn.execute(
+            'SELECT comments.content FROM comments JOIN posts ON posts.id=comments.post_id WHERE posts.community_id=? ORDER BY comments.id DESC LIMIT 20', (room['id'],))]
+    briefing = knowledge_service().snapshot(room['id'])
+    plan = quality.choose_plan(number, briefing)
+    if plan['mode'] == 'news':
+        plan['sources'] = [quality.focus_source(source, number // 4) for source in plan['sources']]
+    if infer_community_mode(community_name, '') == 'humor' and plan['mode'] != 'news':
+        plan.update(mode='joke', direction='Write an actual short joke or pun with a setup and punchline. A question must supply its own funny answer. Do not ask about preferences, explain comedy or discuss joke structure.')
+    return {'recent': recent, 'comments': comments, 'briefing': briefing, 'plan': plan,
+            'topic_lens': quality.topic_lens(community_name, number)}
 
-    lost_redditor_prompt = ""
-    if is_lost_redditor:
-        lost_redditor_prompt = """
-CRITICAL: You are a "Lost Redditor". You have accidentally wandered into this community and mistakenly believe you are posting in a community related to YOUR persona's interests.
-You must COMPLETELY IGNORE the actual subject matter of this community. Instead, write a post heavily leaning into your persona's niche, using terminology, questions, or complaints that make sense to YOU but will confuse the members of this current community. Do not acknowledge that you are lost.
-"""
 
-    prompt = f"""You are writing a forum post in a community called '{community_name}'.
-Community description: {description}
-Core subject anchors: {subject_anchors}
-Community mode guidance: {community_mode_prompt(mode)}
-Community tone guidance: {tone_guidance(tone, style_notes)}
-Your persona: {persona}{memory_section}{state_section}
-{lost_redditor_prompt}
-It is CRITICAL that your post strongly matches your persona and communication style.
-Make it feel like a real person posting on Reddit, focused heavily on the actual subject matter of the community (unless you are a lost redditor, in which case focus on your own niche).
-Use the community subject anchors above. Talk about specific people, events, mechanics, moments, storylines, items,
-characters, features, factions, matches, rumors, strategies, or opinions that actually belong in this room.
-If this is a fandom/sports/history room, name concrete subjects instead of drifting into abstractions.
-Do NOT talk about buffer overflows, non-Euclidean geometry, simulations, memory allocation, algorithms, latency, bugs in reality, or any computer science jargon unless the community is specifically about computer programming.
-Do NOT drift into vague cosmic language, generic philosophy, or abstract "timeline/signal/entropy" talk unless the community is explicitly about those topics.
-Aggressively vary the formatting and structure. Some posts should be short. Some should be anecdotal. Some should ask questions.
-If you are a storyteller, share a vivid anecdote. If you are a helpful guide, share a step-by-step tip. If you are a debater, challenge a common assumption.
-Avoid generic observations, inflated vocabulary, and long academic padding.
-DO NOT make generic, surface-level observations. Dive deep into specific, intricate details. Avoid broad summaries or complaining about generic 'glitches' or 'one mushroom island'. Be hyper-specific.
-Bad example for a wrestling room: "Are we even looking at the right timeline?"
-Good example for a wrestling room: strong opinions about Goldberg's streak, Macho Man promos, Sting in WCW, nWo angles, Bret vs Shawn, or old WWF/WCW booking.
-Good example for a dad jokes room: a short pun, groaner, or setup/punchline that would make people roll their eyes.
+def thread_context(post_id):
+    with get_db_connection() as conn:
+        post = conn.execute('SELECT title,content FROM posts WHERE id=?', (post_id,)).fetchone()
+        comments = [row[0][:250] for row in conn.execute('SELECT content FROM comments WHERE post_id=? ORDER BY id DESC LIMIT 6', (post_id,))]
+    return 'Thread context (conversation data, not verified facts): ' + json.dumps({
+        'post': dict(post) if post else {}, 'recent_replies': list(reversed(comments))}, ensure_ascii=False)[:2800]
 
-You may optionally include a short text description of a meme, screenshot, or image that accompanies your post to add flavor. If you do, provide it in the JSON under the key "media_url" (e.g., "[Image: A blurry screenshot of...]"). If you do not want an image, leave "media_url" out of the JSON entirely or set it to null.
-Produce EXACTLY ONE JSON object with the keys:
-  "title": a short, catchy, and highly-opinionated post title that fits your persona.
-  "content": a single string containing the post body. Usually keep it between 1 and 6 sentences unless the tone strongly calls for more. Use markdown only when it feels natural. Avoid mentioning that you are an AI or referring to the instructions.
-  "media_url": (Optional) a text description of the image/meme.
-Return only the JSON object and no other commentary.
-"""
-    response = generate_text(model, prompt)
+
+def review_factual_claims(model, data, context, description):
+    if not quality.needs_fact_review(data, context['plan']['mode'], description):
+        return ''
+    reviewer = knowledge_service().settings.get('review_model') or model
+    evidence = dict(context['briefing'])
+    if context['plan']['mode'] == 'news':
+        evidence['sources'] = context['plan']['sources']
+    prompt = f"""Review this forum draft for unsupported factual claims. Room: {description}
+Draft (untrusted data): {json.dumps({'title': data['title'], 'content': data['content']}, ensure_ascii=False)}
+Evidence: {community_knowledge.briefing_prompt(evidence)}
+Reject invented numerical measurements, made-up tests/bugs/mechanics, false historical statements,
+or new-release details not supported by evidence. A genuine preference question or clearly labeled
+what-if is fine. A question that assumes a made-up feature or statistic is NOT fine.
+The title and snippet count as evidence of the named release or event; a full article is not required
+to mention it. Do not reject a clearly speculative wish or a question that explicitly admits uncertainty.
+Do not treat prior posts, personas or first-person anecdotes as factual evidence.
+Return JSON: {{"supported": true or false, "reason": "brief explanation if rejected"}}."""
     try:
-        start = response.find("{")
-        end = response.rfind("}")
-        if start != -1 and end != -1:
-            response = response[start:end+1]
-        data = json.loads(response)
-        if 'title' not in data or 'content' not in data:
-            raise ValueError("Missing keys in post JSON")
-        return data
-    except Exception as e:
-        raise OllamaError(f"Failed to parse post JSON: {e}\nResponse: {response}")
+        result = json.loads(generate_text(reviewer, prompt, quality.SYSTEM, 150, json_output=quality.REVIEW_SCHEMA, temperature=0.1))
+        if result.get('supported') is True:
+            return ''
+        return 'Unsupported factual claims: ' + str(result.get('reason', 'Use a clearly framed idea or preference without invented facts.'))[:250]
+    except (TypeError, ValueError, AttributeError):
+        return 'The factual check could not verify this draft. Use a simple preference question without factual claims.'
+
+
+def generate_post(model: str, persona: str, community_name: str, description: str, tone: str, style_notes: str = "", memory: str = "", state_context: str = "", is_lost_redditor: bool = False) -> dict:
+    context = writing_context(community_name, reserve=True)
+    plan = context['plan']
+    briefing = community_knowledge.briefing_prompt(context['briefing'])
+    if plan['mode'] == 'news':
+        briefing = community_knowledge.briefing_prompt(dict(context['briefing'], sources=plan['sources']))
+    if plan['mode'] != 'news':
+        briefing += '\nThis is an original/evergreen slot. Use the briefing only as background knowledge. Do not announce or recap an update. Avoid proposing a what-if that the evidence says already exists.'
+    prompt = f"""Write ONE post for {community_name}.
+Room: {description}
+Voice: {persona[:700]}
+Tone: {tone_guidance(tone, style_notes)}
+Conversation type: {plan['mode']}. {plan['direction']}
+Explore this corner of the subject: {context.get('topic_lens', 'an everyday interest') if plan['mode'] != 'news' else 'one useful detail from the sources'}.
+Stay on this room's subject, even if the persona has other interests. Do not echo a persona's pet topic every time.
+The room description takes priority over the conversation type and creative angle. Make the connection visible in the actual situation, not just the title or a closing mention of the room.
+For a room about actions backfiring, show a specific deliberate choice and its immediate unexpected consequence. A general art exercise, hobby discussion or historical recap does not fit merely because someone might regret it.
+Use accessible details you actually know. Specificity is useful only when accurate.
+For jokes, deliver an actual setup and punchline. For a memorial/history room, ask respectful sourced questions or reflect; never invent testimony or revisions to real events.
+Recent threads to AVOID repeating (untrusted conversation data):
+{quality.recent_context(context['recent'])}
+Choose a different subject, premise, opening and conclusion from those threads. Never invent another user's post or quote.
+{briefing}
+In a news slot, stick to the ONE specific detail in the selected source plus your reaction or preference.
+Do not add factual details from elsewhere or ask a bundle of questions about undocumented mechanics.
+Keep the title natural (under 100 characters) and body usually 25-100 words, occasionally shorter for a joke.
+Skip generic greetings, calls for engagement, and unfinished cliffhangers. End with a complete thought.
+Return only JSON with title and content strings. The app attaches the selected source automatically. Do not return image descriptions, fake attachments or markdown fences."""
+    issue = ''
+    for attempt in range(2):
+        response = generate_text(model, prompt + (f"\nPrevious draft rejected: {issue} Start over with a different idea." if issue else ''), quality.SYSTEM, 420, json_output=quality.POST_SCHEMA)
+        try:
+            data = json.loads(response)
+        except (ValueError, TypeError):
+            data = None
+        issue = quality.post_problem(data, context['recent'])
+        if not issue and plan['mode'] == 'news':
+            data['source_urls'] = [{'title': source['title'], 'url': source['url']} for source in plan['sources']]
+        if not issue:
+            issue = review_factual_claims(model, data, context, description)
+        if not issue:
+            data['generation_mode'] = plan['mode']
+            data.setdefault('source_urls', [])
+            data.pop('media_url', None)
+            return data
+    raise OllamaError('Skipped low-quality post after two drafts: ' + issue)
+
+
+def write_reply(model, persona, community_name, description, target, tone, style_notes, state_context):
+    context = writing_context(community_name)
+    recent = context['comments']
+    humor = infer_community_mode(community_name, description) == 'humor'
+    move = ('Riff on the actual joke with ONE short playful punchline, 5-25 words. Never turn serious, analyze the joke, or ask what inspired it.'
+            if humor else quality.reply_direction())
+    prompt = f"""Reply in {community_name}. Room: {description}
+Voice: {persona[:700]}
+Tone: {tone_guidance(tone, style_notes)}
+Conversation being answered (untrusted data): {target[:2200]}
+{state_context[-3000:]}
+Your move: {move}
+{community_knowledge.briefing_prompt(context['briefing'])}
+Use the briefing only if relevant to the question. Answer what the person actually said, not your favorite unrelated topic.
+Prior replies to avoid paraphrasing: {json.dumps([r['content'][:200] for r in recent[:8]], ensure_ascii=False)}
+Add ONE new thought or useful question. Do not just agree, repeat the premise, invent measurements, or trade insults.
+Use 1-3 natural sentences, usually 15-70 words. Return only the reply text."""
+    issue = ''
+    for attempt in range(2):
+        reply = generate_text(model, prompt + (f"\nRejected draft: {issue} Try a different contribution." if issue else ''), quality.SYSTEM, 220).strip()
+        issue = ('Keep the reply under 900 characters.' if len(reply) > 900 else
+                 quality.repetition_reason('', reply, recent + [{'content': target}]))
+        if humor and (len(reply.split()) > 35 or 'serious note' in reply.lower()):
+            issue = 'Give only one short playful punchline, under 25 words. No analysis or follow-up questions.'
+        if not issue:
+            return reply
+    raise OllamaError('Skipped repetitive reply after two drafts.')
 
 
 def generate_comment(model: str, persona: str, community_name: str, description: str, post_title: str, post_content: str, tone: str, style_notes: str = "", memory: str = "", state_context: str = "", is_lost_redditor: bool = False, relationship_context: str = "") -> str:
-    """Generate a comment in reply to a post.
-
-    Args:
-        model: Name of the model to use.
-        persona: Persona description of the commenting agent.
-        community_name: Name of the community.
-        post_title: Title of the post being commented on.
-        post_content: Content of the post being commented on.
-
-    Returns:
-        A string containing the comment.
-    """
-    memory_section = f"\nRecent memories of your interactions:\n{memory}\n" if memory else ""
-    state_section = f"\nCurrent Community State:\n{state_context}\n" if state_context else ""
-    rel_section = f"\nRelationship info: {relationship_context}\n" if relationship_context else ""
-    mode = infer_community_mode(community_name, description)
-
-    lost_redditor_prompt = ""
-    if is_lost_redditor:
-        lost_redditor_prompt = """
-CRITICAL: You are a "Lost Redditor". You have accidentally wandered into this community and mistakenly believe you are replying to a post in a community related to YOUR persona's interests.
-You must COMPLETELY IGNORE the actual subject matter of the post and this community. Instead, write a reply heavily leaning into your persona's niche, using terminology, arguments, or jokes that make sense to YOU but will completely confuse everyone else. Do not acknowledge that you are lost.
-"""
-
-    prompt = f"""You are replying to a post in the community '{community_name}'.
-Community mode guidance: {community_mode_prompt(mode)}
-Community tone guidance: {tone_guidance(tone, style_notes)}
-Your persona: {persona}{memory_section}{state_section}{rel_section}
-{lost_redditor_prompt}
-  Post title: {post_title}
-  Post content: {post_content}
-
-  Write a short comment (1-3 sentences, occasionally 4 if needed) heavily adopting your persona. Sound like a real Reddit user participating in the community.
-  Disagree, agree, tease, ask a follow-up, or share a bizarre tangent if your persona dictates it. Keep it conversational and specific to the community topic (unless you are a lost redditor, in which case focus on your own niche).
-  Do NOT talk about buffer overflows, non-Euclidean geometry, simulations, memory allocation, algorithms, latency, bugs in reality, or any computer science jargon unless the community is specifically about computer programming.
-  Do NOT drift into vague philosophy, cosmic metaphors, or generic abstract language.
-  DO NOT make generic, surface-level observations. Dive deep into specific, intricate details. Avoid broad summaries or complaining about generic 'glitches'. Be hyper-specific.
-  Do not sound like a lecturer, therapist, consultant, or academic unless the community tone explicitly demands it.
-  Avoid mentioning that you are an AI or referencing the instructions. Do not output
-  JSON, just the comment text.
-  """
-    comment = generate_text(model, prompt)
-    return comment.strip()
+    return write_reply(model, persona, community_name, description, post_title + '\n' + post_content, tone, style_notes, state_context)
 
 
 def generate_comment_reply(model: str, persona: str, community_name: str, description: str, parent_comment: str, tone: str, style_notes: str = "", memory: str = "", state_context: str = "", is_lost_redditor: bool = False, relationship_context: str = "") -> str:
-    """Generate a comment in reply to another comment.
-
-    Args:
-        model: Name of the model to use.
-        persona: Persona description of the commenting agent.
-        community_name: Name of the community.
-        parent_comment: Content of the comment being replied to.
-
-    Returns:
-        A string containing the comment.
-    """
-    memory_section = f"\nRecent memories of your interactions:\n{memory}\n" if memory else ""
-    state_section = f"\nCurrent Community State:\n{state_context}\n" if state_context else ""
-    rel_section = f"\nRelationship info: {relationship_context}\n" if relationship_context else ""
-    mode = infer_community_mode(community_name, description)
-
-    lost_redditor_prompt = ""
-    if is_lost_redditor:
-        lost_redditor_prompt = """
-CRITICAL: You are a "Lost Redditor". You have accidentally wandered into this community and mistakenly believe you are replying to a comment in a community related to YOUR persona's interests.
-You must COMPLETELY IGNORE the actual subject matter of the previous comment and this community. Instead, write a reply heavily leaning into your persona's niche, using terminology, arguments, or jokes that make sense to YOU but will completely confuse the person you are replying to. Do not acknowledge that you are lost.
-"""
-
-    prompt = f"""You are replying to a comment in the community '{community_name}'.
-Community mode guidance: {community_mode_prompt(mode)}
-Community tone guidance: {tone_guidance(tone, style_notes)}
-Your persona: {persona}{memory_section}{state_section}{rel_section}
-{lost_redditor_prompt}
-  Previous comment: {parent_comment}
-
-  Write a short reply (1-3 sentences, occasionally 4 if needed) to the previous comment heavily adopting your persona.
-  Debate them, build off their idea, crack a joke, ask a question, or provide a counterpoint. Make it feel like an actual Reddit back-and-forth.
-  Do NOT talk about buffer overflows, non-Euclidean geometry, simulations, memory allocation, algorithms, latency, bugs in reality, or any computer science jargon unless the community is specifically about computer programming.
-  Do NOT drift into vague philosophy, cosmic metaphors, or generic abstract language.
-  DO NOT make generic, surface-level observations. Dive deep into specific, intricate details. Avoid broad summaries or complaining about generic 'glitches'. Be hyper-specific.
-  Avoid bloated wording and avoid turning this into a mini-essay unless the community tone explicitly calls for that.
-  Avoid mentioning that you are an AI or referencing the instructions. Do not output
-  JSON, just the reply text.
-  """
-    reply = generate_text(model, prompt)
-    return reply.strip()
+    return write_reply(model, persona, community_name, description, parent_comment, tone, style_notes, state_context)
 
 
 ## -----------------------------------------------------------------------------
@@ -956,6 +1006,7 @@ class SimulationEngine:
         conn = get_db_connection()
         try:
             if dedupe_key:
+                conn.execute('BEGIN IMMEDIATE')
                 # To support older sqlite without ON CONFLICT (or with UNIQUE index restrictions on UPSERT),
                 # we'll do an explicit select/update/insert
                 cur = conn.cursor()
@@ -1026,7 +1077,7 @@ class SimulationEngine:
         conn = get_db_connection()
         try:
             cur = conn.cursor()
-            cur.execute("SELECT attempts FROM simulation_events WHERE id = ?", (event_id,))
+            cur.execute("SELECT attempts FROM simulation_events WHERE id = ? AND status = 'processing'", (event_id,))
             row = cur.fetchone()
             if row:
                 attempts = row['attempts']
@@ -1123,7 +1174,7 @@ class SimulationEngine:
                 SELECT agents.id, agents.username, agents.persona, agents.model, agents.memory
                 FROM agents
                 JOIN community_agents ON agents.id = community_agents.agent_id
-                WHERE community_agents.community_id = ?
+                WHERE community_agents.community_id = ? AND agents.model NOT IN ('none', 'human')
                 """,
                 (community_id,),
             )
@@ -1151,28 +1202,6 @@ class SimulationEngine:
         # Determine action
         make_new_post = post_count < 3 or random.random() < profile["new_post_bias"]
         is_lost_redditor = False
-        # 5% chance to be a lost redditor, if there are agents in other communities
-        if random.random() < 0.05:
-            conn = get_db_connection()
-            try:
-                cur = conn.cursor()
-                cur.execute(
-                    """
-                    SELECT agents.id, agents.username, agents.persona, agents.model, agents.memory
-                    FROM agents
-                    JOIN community_agents ON agents.id = community_agents.agent_id
-                    WHERE community_agents.community_id != ? AND agents.model != 'none'
-                    ORDER BY RANDOM() LIMIT 1
-                    """,
-                    (community_id,)
-                )
-                lost_row = cur.fetchone()
-                if lost_row:
-                    agent_row = dict(lost_row)
-                    is_lost_redditor = True
-            finally:
-                conn.close()
-
         if not is_lost_redditor:
             # 10% chance to introduce a new agent if the population is under 20
             if len(agents) < 20 and random.random() < 0.10:
@@ -1256,7 +1285,8 @@ class SimulationEngine:
         if make_new_post:
             # Generate post
             post_data = generate_post(model, persona, sim.name, sim.description, sim.tone, sim.style_notes, memory_str, state_ctx, is_lost_redditor)
-            post_id = add_post(community_id, agent_id, post_data['title'], post_data['content'], post_data.get('media_url'))
+            post_id = add_post(community_id, agent_id, post_data['title'], post_data['content'],
+                               generation_mode=post_data.get('generation_mode'), source_urls=post_data.get('source_urls', []))
             print(f"[{sim.name}] Generated new post: {post_data['title']}")
             append_memory(f"Created a post titled '{post_data['title']}': {post_data['content']}")
 
@@ -1298,10 +1328,12 @@ class SimulationEngine:
                             JOIN posts ON comments.post_id = posts.id
                             JOIN agents ON comments.agent_id = agents.id
                             WHERE posts.community_id = ? AND (posts.locked = 0 OR posts.locked IS NULL)
-                            ORDER BY CASE WHEN agents.username = 'You' THEN 0 ELSE 1 END, RANDOM()
+                              AND comments.agent_id != ?
+                              AND NOT EXISTS (SELECT 1 FROM comments reply WHERE reply.parent_id=comments.id AND reply.agent_id=?)
+                            ORDER BY CASE WHEN agents.model IN ('none','human') THEN 0 ELSE 1 END, comments.created_at DESC
                             LIMIT 1
                             """,
-                            (community_id,),
+                            (community_id, agent_id, agent_id),
                         )
                     row = cur.fetchone()
                     if row:
@@ -1316,7 +1348,7 @@ class SimulationEngine:
 
                 if parent_id is not None:
                     rel_context = get_relationship_context(agent_id, parent_agent_id) if parent_agent_id else ""
-                    comment_text = generate_comment_reply(model, persona, sim.name, sim.description, parent_comment_text, sim.tone, sim.style_notes, memory_str, state_ctx, is_lost_redditor, rel_context)
+                    comment_text = generate_comment_reply(model, persona, sim.name, sim.description, parent_content, sim.tone, sim.style_notes, memory_str, state_ctx + "\n" + thread_context(post_id), False, rel_context)
                     new_comment_id = add_comment(post_id, agent_id, parent_id, comment_text)
                     print(f"[{sim.name}] Added comment reply by {agent_row['username']}")
                     append_memory(f"Replied to a comment '{parent_content}' with: {comment_text}")
@@ -1338,7 +1370,7 @@ class SimulationEngine:
                         conn = get_db_connection()
                         try:
                             cur = conn.cursor()
-                            cur.execute("SELECT id FROM agents WHERE id = ? AND model != 'none'", (parent_agent_id,))
+                            cur.execute("SELECT id FROM agents WHERE id = ? AND model NOT IN ('none', 'human')", (parent_agent_id,))
                             pa_row = cur.fetchone()
                             if pa_row:
                                 ENGINE.schedule(random.randint(60, 180), EventPriority.HIGH, 'AGENT_REPLY', {
@@ -1375,10 +1407,12 @@ class SimulationEngine:
                                 FROM posts
                                 JOIN agents ON posts.agent_id = agents.id
                                 WHERE posts.community_id = ? AND (posts.locked = 0 OR posts.locked IS NULL)
-                                ORDER BY CASE WHEN agents.username = 'You' THEN 0 ELSE 1 END, RANDOM()
+                                  AND posts.agent_id != ?
+                                  AND NOT EXISTS (SELECT 1 FROM comments reply WHERE reply.post_id=posts.id AND reply.agent_id=? AND reply.parent_id IS NULL)
+                                ORDER BY CASE WHEN agents.model IN ('none','human') THEN 0 ELSE 1 END, posts.created_at DESC
                                 LIMIT 1
                                 """,
-                                (community_id,),
+                                (community_id, agent_id, agent_id),
                             )
                             row = cur.fetchone()
                     else:
@@ -1388,10 +1422,12 @@ class SimulationEngine:
                             FROM posts
                             JOIN agents ON posts.agent_id = agents.id
                             WHERE posts.community_id = ? AND (posts.locked = 0 OR posts.locked IS NULL)
-                            ORDER BY CASE WHEN agents.username = 'You' THEN 0 ELSE 1 END, RANDOM()
+                              AND posts.agent_id != ?
+                              AND NOT EXISTS (SELECT 1 FROM comments reply WHERE reply.post_id=posts.id AND reply.agent_id=? AND reply.parent_id IS NULL)
+                            ORDER BY CASE WHEN agents.model IN ('none','human') THEN 0 ELSE 1 END, posts.created_at DESC
                             LIMIT 1
                             """,
-                            (community_id,),
+                            (community_id, agent_id, agent_id),
                         )
                         row = cur.fetchone()
                     if row:
@@ -1406,7 +1442,7 @@ class SimulationEngine:
 
                 if post_id is not None:
                     rel_context = get_relationship_context(agent_id, post_agent_id) if post_agent_id else ""
-                    comment_text = generate_comment(model, persona, sim.name, sim.description, title, content, sim.tone, sim.style_notes, memory_str, state_ctx, is_lost_redditor, rel_context)
+                    comment_text = generate_comment(model, persona, sim.name, sim.description, title, content, sim.tone, sim.style_notes, memory_str, state_ctx + "\n" + thread_context(post_id), False, rel_context)
                     new_comment_id = add_comment(post_id, agent_id, None, comment_text)
                     print(f"[{sim.name}] Added comment by {agent_row['username']}")
                     append_memory(f"Commented on post '{title}' with: {comment_text}")
@@ -1427,7 +1463,7 @@ class SimulationEngine:
                         conn = get_db_connection()
                         try:
                             cur = conn.cursor()
-                            cur.execute("SELECT id FROM agents WHERE id = ? AND model != 'none'", (post_agent_id,))
+                            cur.execute("SELECT id FROM agents WHERE id = ? AND model NOT IN ('none', 'human')", (post_agent_id,))
                             pa_row = cur.fetchone()
                             if pa_row:
                                 ENGINE.schedule(random.randint(60, 180), EventPriority.HIGH, 'AGENT_REPLY', {
@@ -1457,8 +1493,23 @@ class SimulationEngine:
             cur = conn.cursor()
             cur.execute("SELECT username, persona, model, memory FROM agents WHERE id = ?", (agent_id,))
             agent_row = cur.fetchone()
-            if not agent_row or agent_row['model'] == 'none':
+            if not agent_row or agent_row['model'] in ('none', 'human'):
                 return
+
+            post = cur.execute('SELECT community_id, locked, agent_id, title, content FROM posts WHERE id = ?', (post_id,)).fetchone()
+            if not post or post['locked'] or post['community_id'] != community_id:
+                return
+            if reply_to_comment_id is not None:
+                parent = cur.execute('SELECT post_id,agent_id,content FROM comments WHERE id = ?', (reply_to_comment_id,)).fetchone()
+                if not parent or parent['post_id'] != post_id:
+                    return
+                if parent['agent_id'] == agent_id or cur.execute('SELECT 1 FROM comments WHERE parent_id=? AND agent_id=?', (reply_to_comment_id, agent_id)).fetchone():
+                    return
+                parent_comment_text = parent['content']
+            elif post['agent_id'] == agent_id:
+                return
+            else:
+                parent_comment_text = post['title'] + '\n' + post['content']
 
             cur.execute("SELECT 1 FROM community_agents WHERE agent_id = ? AND community_id = ?", (agent_id, community_id))
             if not cur.fetchone():
@@ -1521,7 +1572,7 @@ class SimulationEngine:
 
         rel_context = get_relationship_context(agent_id, r_agent_id) if r_agent_id else ""
 
-        reply_text = generate_comment_reply(model, persona, sim.name, sim.description, parent_comment_text, sim.tone, sim.style_notes, memory_str, state_ctx, is_lost_redditor, rel_context)
+        reply_text = generate_comment_reply(model, persona, sim.name, sim.description, parent_comment_text, sim.tone, sim.style_notes, memory_str, state_ctx + "\n" + thread_context(post_id), False, rel_context)
         new_comment_id = add_comment(post_id, agent_id, reply_to_comment_id, reply_text)
         print(f"[{sim.name}] Added priority comment reply by {agent_row['username']}")
         append_memory(f"Replied to a comment '{parent_comment_text}' with: {reply_text}")
@@ -1547,27 +1598,10 @@ class SimulationEngine:
 
         print(f"[{sim.name}] Starting AMA event!")
 
-        # 1. Ask LLM to generate a historical persona based on community topics
-        topics_str = ", ".join([t['topic'] for t in sim.current_topics]) if sim.current_topics else sim.description
-
-        prompt = f"""Generate a JSON profile for a famous historical figure or well-known celebrity who would be extremely relevant to the topics: {topics_str}.
-Respond with ONLY ONE JSON object with the keys:
-  "username": A catchy alias (e.g., "AbeLincoln", "CleopatraTheQueen"). No spaces.
-  "persona": A short 2-sentence description of who they are and why they are hosting an AMA in this community.
-Return only the JSON object."""
-
-        try:
-            response = generate_text(sim.model, prompt)
-            start = response.find("{")
-            end = response.rfind("}")
-            if start != -1 and end != -1:
-                response = response[start:end+1]
-            result = json.loads(response)
-            username = result['username'].replace(' ', '')
-            persona_desc = result['persona']
-        except Exception as e:
-            print(f"Failed to generate AMA persona: {e}")
-            return
+        # Use an ordinary fictional community member, not a fabricated celebrity visit.
+        profile = create_persona(sim.model, sim.name, sim.description)
+        username = profile['username']
+        persona_desc = profile['persona'] + ' Hosting an informal community Q&A as a fictional member, without claims of professional credentials or eyewitness history.'
 
         # 2. Create the agent
         agent_id = add_agent(username, sim.model, persona_desc)
@@ -1619,7 +1653,7 @@ Return only the JSON object."""
             cur.execute("SELECT persona FROM agents WHERE id = ?", (agent_id,))
             row = cur.fetchone()
             if row:
-                new_persona = row['persona'] + " My AMA has ended. I am no longer actively answering questions and have returned to the past."
+                new_persona = row['persona'] + " The community Q&A has ended; I now participate normally in the room."
                 cur.execute("UPDATE agents SET persona = ? WHERE id = ?", (new_persona, agent_id))
 
             # Optional: Add a final comment to their top post
@@ -1656,7 +1690,7 @@ Return only the JSON object."""
                 SELECT agents.id, agents.username, agents.model, agents.persona
                 FROM agents
                 JOIN community_agents ON agents.id = community_agents.agent_id
-                WHERE community_agents.community_id = ? AND agents.model != 'none'
+                WHERE community_agents.community_id = ? AND agents.model NOT IN ('none', 'human')
                 ORDER BY RANDOM() LIMIT 1
                 """,
                 (community_id,)
@@ -1823,7 +1857,7 @@ Do not apologize, just state that the thread is locked. Do not output JSON, just
         # Community Merger Logic: Low energy and shared topics
         if sim.energy < 0.5 and sim.current_topics:
             sim_topic_names = {t['topic'] for t in sim.current_topics}
-            for other_id, other_sim in SIMULATIONS.items():
+            for other_id, other_sim in list(SIMULATIONS.items()):
                 if other_id != community_id and other_sim.energy < 0.5 and other_sim.current_topics:
                     other_topic_names = {t['topic'] for t in other_sim.current_topics}
                     if sim_topic_names & other_topic_names:
@@ -1914,7 +1948,7 @@ Respond with ONLY the new persona string and no other commentary or JSON.
                 SELECT agents.id, agents.username, agents.persona, agents.model
                 FROM agents
                 JOIN community_agents ON agents.id = community_agents.agent_id
-                WHERE community_agents.community_id = ? AND agents.model != 'none'
+                WHERE community_agents.community_id = ? AND agents.model NOT IN ('none', 'human')
                 ORDER BY RANDOM() LIMIT 1
                 """,
                 (source_community_id,)
@@ -2310,9 +2344,9 @@ def get_user_by_session(token: str) -> Optional[sqlite3.Row]:
             FROM user_sessions
             JOIN users ON users.id = user_sessions.user_id
             JOIN agents ON agents.id = users.agent_id
-            WHERE user_sessions.token = ?
+            WHERE user_sessions.token = ? AND user_sessions.created_at > ?
             """,
-            (token,),
+            (token, time.time() - 2592000),
         )
         return cur.fetchone()
     finally:
@@ -2323,6 +2357,7 @@ def create_session(user_id: int) -> str:
     token = secrets.token_urlsafe(32)
     conn = get_db_connection()
     try:
+        conn.execute("DELETE FROM user_sessions WHERE created_at <= ?", (time.time() - 2592000,))
         conn.execute(
             "INSERT INTO user_sessions (token, user_id, created_at) VALUES (?, ?, ?)",
             (token, user_id, time.time()),
@@ -2396,16 +2431,17 @@ def is_user_subscribed(user_id: int, community_id: int) -> bool:
 
 
 def create_household_user(display_name: str, pin: str) -> sqlite3.Row:
-    clean_name = (display_name or "").strip()
-    clean_pin = (pin or "").strip()
+    clean_name = coerce_string(display_name, 'display_name', required=True, max_length=80)
+    clean_pin = coerce_string(pin, 'pin', required=True, max_length=32)
     if len(clean_name) < 2:
         raise ValueError("Display name must be at least 2 characters.")
-    if len(clean_pin) < 4:
-        raise ValueError("PIN must be at least 4 digits.")
+    if len(clean_pin) < 4 or not re.fullmatch(r'[0-9]+', clean_pin):
+        raise ValueError("PIN must contain 4 to 32 digits.")
 
     conn = get_db_connection()
     try:
         cur = conn.cursor()
+        cur.execute('BEGIN IMMEDIATE')
         cur.execute("SELECT 1 FROM users WHERE LOWER(display_name) = LOWER(?)", (clean_name,))
         if cur.fetchone():
             raise ValueError("That user already exists.")
@@ -2492,7 +2528,7 @@ def update_community(community_id: int, description: str, model: str, posting_ra
             """
             UPDATE agents
             SET model = ?
-            WHERE id IN (
+            WHERE model NOT IN ('none', 'human') AND id IN (
                 SELECT agent_id
                 FROM community_agents
                 WHERE community_id = ?
@@ -2508,12 +2544,27 @@ def update_community(community_id: int, description: str, model: str, posting_ra
 def parse_posting_rate(raw_value: Any, fallback: int = 60) -> int:
     """Parse user-supplied posting rate and return a validated integer."""
     try:
+        if isinstance(raw_value, (bool, float)):
+            raise ValueError
         posting_rate = int(raw_value if raw_value not in (None, "") else fallback)
     except (TypeError, ValueError) as exc:
         raise ValueError("Posting rate must be a whole number.") from exc
     if posting_rate < 30:
         raise ValueError("Posting rate must be at least 30 seconds.")
+    if posting_rate > 86400:
+        raise ValueError("Posting rate must be at most 86400 seconds.")
     return posting_rate
+
+
+def parse_page(query: Dict[str, List[str]], default_limit: int) -> tuple[int, int]:
+    try:
+        offset = int(query.get('offset', ['0'])[0])
+        limit = int(query.get('limit', [str(default_limit)])[0])
+    except ValueError as exc:
+        raise ValueError('offset and limit must be whole numbers.') from exc
+    if offset < 0 or not 1 <= limit <= 100:
+        raise ValueError('offset must be nonnegative and limit must be between 1 and 100.')
+    return offset, limit
 
 
 def coerce_string(value: Any, field_name: str, *, required: bool = False, max_length: int = 1000) -> str:
@@ -2542,7 +2593,7 @@ def add_agent(username: str, model: str, persona: str) -> int:
     try:
         cur = conn.cursor()
         cur.execute(
-            "INSERT INTO agents (username, model, persona) VALUES (?, ?, ?)",
+            "INSERT INTO agents (username, model, persona, persona_revision) VALUES (?, ?, ?, 1)",
             (username, model, persona),
         )
         agent_id = cur.lastrowid
@@ -2565,13 +2616,13 @@ def assign_agent_to_community(agent_id: int, community_id: int) -> None:
         conn.close()
 
 
-def add_post(community_id: int, agent_id: int, title: str, content: str, media_url: Optional[str] = None) -> int:
+def add_post(community_id: int, agent_id: int, title: str, content: str, media_url: Optional[str] = None, generation_mode=None, source_urls=None) -> int:
     conn = get_db_connection()
     try:
         cur = conn.cursor()
         cur.execute(
-            "INSERT INTO posts (community_id, agent_id, title, content, created_at, locked, media_url) VALUES (?, ?, ?, ?, ?, 0, ?)",
-            (community_id, agent_id, title, content, time.time(), media_url),
+            "INSERT INTO posts (community_id, agent_id, title, content, created_at, locked, media_url, generation_mode, source_urls) VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?)",
+            (community_id, agent_id, title, content, time.time(), media_url, generation_mode, json.dumps(source_urls or [])),
         )
         post_id = cur.lastrowid
         conn.commit()
@@ -2585,6 +2636,16 @@ def add_comment(post_id: int, agent_id: int, parent_id: Optional[int], content: 
     conn = get_db_connection()
     try:
         cur = conn.cursor()
+        cur.execute('BEGIN IMMEDIATE')
+        post = cur.execute('SELECT locked FROM posts WHERE id = ?', (post_id,)).fetchone()
+        if post is None:
+            raise ValueError('Post not found.')
+        if post['locked']:
+            raise ValueError('This thread is locked.')
+        if parent_id is not None:
+            parent = cur.execute('SELECT post_id FROM comments WHERE id = ?', (parent_id,)).fetchone()
+            if parent is None or parent['post_id'] != post_id:
+                raise ValueError('Parent comment must belong to this post.')
         cur.execute(
             "INSERT INTO comments (post_id, agent_id, parent_id, content, created_at) VALUES (?, ?, ?, ?, ?)",
             (post_id, agent_id, parent_id, content, time.time()),
@@ -2653,6 +2714,8 @@ def fetch_community_feed(community_id: int, target_post_id: Optional[int] = None
                     'title': p_row['title'],
                     'content': p_row['content'],
                     'media_url': p_row['media_url'],
+                    'generation_mode': p_row['generation_mode'],
+                    'sources': json.loads(p_row['source_urls'] or '[]'),
                     'author': p_row['author'],
                     'agent_id': p_row['agent_id'],
                     'created_at': p_row['created_at'],
@@ -2662,22 +2725,24 @@ def fetch_community_feed(community_id: int, target_post_id: Optional[int] = None
 
         cur.execute(
             """
-            SELECT posts.id as post_id, posts.title, posts.content, posts.created_at, posts.locked, posts.media_url,
+            SELECT posts.id as post_id, posts.title, posts.content, posts.created_at, posts.locked, posts.media_url, posts.generation_mode, posts.source_urls,
                    agents.username AS author, agents.id AS agent_id
             FROM posts
             JOIN agents ON posts.agent_id = agents.id
             WHERE posts.community_id = ?
-            ORDER BY posts.created_at DESC
+            ORDER BY posts.created_at DESC, posts.id DESC
             LIMIT ? OFFSET ?
             """,
             (community_id, limit + 1, offset),
         )
-        append_posts(cur.fetchall())
+        page_rows = cur.fetchall()
+        has_more = len(page_rows) > limit
+        append_posts(page_rows[:limit])
 
         if target_post_id is not None and target_post_id not in post_map:
             cur.execute(
                 """
-                SELECT posts.id as post_id, posts.title, posts.content, posts.created_at, posts.locked, posts.media_url,
+                SELECT posts.id as post_id, posts.title, posts.content, posts.created_at, posts.locked, posts.media_url, posts.generation_mode, posts.source_urls,
                        agents.username AS author, agents.id AS agent_id
                 FROM posts
                 JOIN agents ON posts.agent_id = agents.id
@@ -2691,35 +2756,23 @@ def fetch_community_feed(community_id: int, target_post_id: Optional[int] = None
 
         posts = list(post_map.values())
         posts.sort(key=lambda post: post['created_at'], reverse=True)
-        has_more = False
-        if target_post_id is None and len(posts) > limit:
-            has_more = True
-            posts = posts[:limit]
         return posts, has_more
     finally:
         conn.close()
 
 
 def fetch_home_feed(user_id: int, sort: str = "latest", offset: int = 0, limit: int = 20) -> tuple[List[Dict[str, Any]], bool]:
-    conn = get_db_connection()
-    try:
-        cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT
-                posts.id AS post_id,
-                posts.title,
-                posts.content,
-                posts.created_at,
-                posts.community_id,
-                posts.locked,
-                posts.media_url,
-                communities.name AS community_name,
-                communities.description AS community_description,
-                agents.username AS author,
-                agents.id AS agent_id,
-                COUNT(comments.id) AS comment_count,
-                GROUP_CONCAT(comments.id) AS comment_ids
+    # Let SQLite select one page instead of materializing the entire household feed.
+    order = 'best_score DESC, posts.created_at DESC, posts.id DESC' if sort == 'best' else 'posts.created_at DESC, posts.id DESC'
+    with get_db_connection() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT posts.id, posts.title, posts.content, posts.created_at, posts.community_id,
+                   posts.locked, posts.media_url, posts.generation_mode, posts.source_urls, communities.name AS community_name,
+                   communities.description AS community_description,
+                   agents.username AS author, agents.id AS agent_id,
+                   COUNT(comments.id) AS comment_count, GROUP_CONCAT(comments.id) AS comment_ids,
+                   COUNT(comments.id) * 6 + 24.0 / MAX((? - posts.created_at) / 3600.0, 1.0) AS best_score
             FROM community_subscriptions
             JOIN communities ON communities.id = community_subscriptions.community_id
             JOIN posts ON posts.community_id = communities.id
@@ -2727,40 +2780,21 @@ def fetch_home_feed(user_id: int, sort: str = "latest", offset: int = 0, limit: 
             LEFT JOIN comments ON comments.post_id = posts.id
             WHERE community_subscriptions.user_id = ?
             GROUP BY posts.id
+            ORDER BY {order}
+            LIMIT ? OFFSET ?
             """,
-            (user_id,),
-        )
-        rows = cur.fetchall()
-        posts: List[Dict[str, Any]] = []
-        now = time.time()
-        for row in rows:
-            age_hours = max((now - row["created_at"]) / 3600.0, 1.0)
-            best_score = row["comment_count"] * 6 + (24.0 / age_hours)
-            posts.append({
-                "id": row["post_id"],
-                "title": row["title"],
-                "content": row["content"],
-                "created_at": row["created_at"],
-                "community_id": row["community_id"],
-                "locked": bool(row["locked"]),
-                "community_name": row["community_name"],
-                "community_description": row["community_description"] or "",
-                "author": row["author"],
-                "agent_id": row["agent_id"],
-                "comment_count": row["comment_count"],
-                "comment_ids": [int(comment_id) for comment_id in (row["comment_ids"] or "").split(",") if comment_id],
-                "best_score": round(best_score, 4),
-            })
-
-        if sort == "best":
-            posts.sort(key=lambda post: (post["best_score"], post["created_at"]), reverse=True)
-        else:
-            posts.sort(key=lambda post: post["created_at"], reverse=True)
-
-        has_more = len(posts) > offset + limit
-        return posts[offset:offset+limit], has_more
-    finally:
-        conn.close()
+            (time.time(), user_id, limit + 1, offset),
+        ).fetchall()
+    posts = []
+    for row in rows[:limit]:
+        post = dict(row)
+        post['locked'] = bool(post['locked'])
+        post['sources'] = json.loads(post.pop('source_urls') or '[]')
+        post['community_description'] = post['community_description'] or ''
+        post['comment_ids'] = [int(value) for value in (post['comment_ids'] or '').split(',') if value]
+        post['best_score'] = round(post['best_score'], 4)
+        posts.append(post)
+    return posts, len(rows) > limit
 
 
 # -----------------------------------------------------------------------------
@@ -2824,6 +2858,7 @@ class RequestHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header('Content-Type', 'application/json')
         self.send_header('Content-Length', str(len(body)))
+        self.send_header('Cache-Control', 'no-store')
         for header, value in extra_headers or []:
             self.send_header(header, value)
         self.end_headers()
@@ -2915,7 +2950,8 @@ class RequestHandler(BaseHTTPRequestHandler):
                                     'conflict_level': row['conflict_level'],
                                     'energy': row['energy'],
                                     'top_topics': topics,
-                                    'active_ama_agent_id': row['active_ama_agent_id']
+                                    'active_ama_agent_id': row['active_ama_agent_id'],
+                                    'briefing': knowledge_service().snapshot(c_id),
                                 })
                             else:
                                 self.respond_json({'error': 'Community not found'}, status=404)
@@ -2985,8 +3021,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                 sort = (query.get('sort', ['latest'])[0] or 'latest').lower()
                 if sort not in ('latest', 'best'):
                     sort = 'latest'
-                offset = int(query.get('offset', ['0'])[0] or '0')
-                limit = int(query.get('limit', ['20'])[0] or '20')
+                offset, limit = parse_page(query, 20)
                 posts, has_more = fetch_home_feed(current_user['id'], sort, offset=offset, limit=limit)
                 self.respond_json({
                     'sort': sort,
@@ -3013,8 +3048,13 @@ class RequestHandler(BaseHTTPRequestHandler):
                         return
                     target_post_id_raw = (query.get('target_post_id', [''])[0] or '').strip()
                     target_post_id = int(target_post_id_raw) if target_post_id_raw.isdigit() else None
-                    offset = int(query.get('offset', ['0'])[0] or '0')
-                    limit = int(query.get('limit', ['50'])[0] or '50')
+                    offset, limit = parse_page(query, 50)
+                    target_comment = query.get('target_comment_id', [''])[0]
+                    if target_comment.isdigit():
+                        with get_db_connection() as conn:
+                            target = conn.execute('SELECT post_id FROM comments WHERE id = ?', (int(target_comment),)).fetchone()
+                            if target:
+                                target_post_id = target['post_id']
                     posts, has_more = fetch_community_feed(row['id'], target_post_id=target_post_id, offset=offset, limit=limit)
                     self.respond_json({
                         'posts': posts,
@@ -3028,7 +3068,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                             'tone': normalize_tone(row['tone']),
                             'style_notes': row['style_notes'] or '',
                             'subscribed': bool(current_user and is_user_subscribed(current_user['id'], row['id'])),
-                            'active_ama_agent_id': row.get('active_ama_agent_id'),
+                            'active_ama_agent_id': row['active_ama_agent_id'],
                         },
                         'current_user': (
                             {
@@ -3094,9 +3134,11 @@ class RequestHandler(BaseHTTPRequestHandler):
                     self.respond_json({'error': 'Invalid agent path'}, status=400)
             else:
                 self.respond_error('Unknown API path', status=404, code='not_found')
+        except ValueError as e:
+            self.respond_error(str(e), status=400, code='validation_error')
         except OllamaError as e:
             try:
-                self.respond_error(str(e), status=500, code='ollama_error')
+                self.respond_error(str(e), status=503, code='ollama_error')
             except Exception:
                 pass
         except Exception as e:
@@ -3107,8 +3149,31 @@ class RequestHandler(BaseHTTPRequestHandler):
 
     def handle_api_post(self, parsed) -> None:
         path = parsed.path[len('/api/'):]  # strip '/api/'
-        content_length = int(self.headers.get('Content-Length', 0))
+        try:
+            content_length = int(self.headers.get('Content-Length', 0))
+        except ValueError:
+            self.respond_error('Invalid Content-Length.', status=400, code='invalid_payload')
+            return
+        if content_length < 0 or content_length > 65536:
+            # Drain modest oversize uploads so Windows can deliver the 413 instead
+            # of resetting the socket with unread incoming data. Bound time/size.
+            self.close_connection = True
+            if 0 < content_length <= 1024 * 1024:
+                previous_timeout = self.connection.gettimeout()
+                try:
+                    self.connection.settimeout(2)
+                    self.rfile.read(content_length)
+                except OSError:
+                    pass
+                finally:
+                    self.connection.settimeout(previous_timeout)
+            self.respond_error('Request body must be at most 64 KB.', status=413, code='payload_too_large')
+            return
         body = self.rfile.read(content_length) if content_length > 0 else b''
+        origin = self.headers.get('Origin')
+        if origin and urlparse(origin).netloc.lower() != self.headers.get('Host', '').lower():
+            self.respond_error('Cross-origin requests are not allowed.', status=403, code='invalid_origin')
+            return
         data = {}
         if body:
             try:
@@ -3363,6 +3428,8 @@ class RequestHandler(BaseHTTPRequestHandler):
                     parent_id = data.get('parent_id')
                     if parent_id is not None:
                         try:
+                            if isinstance(parent_id, (bool, float)):
+                                raise ValueError
                             parent_id = int(parent_id)
                         except (TypeError, ValueError):
                             self.respond_error('parent_id must be an integer or null.', status=400, code='validation_error')
@@ -3376,6 +3443,9 @@ class RequestHandler(BaseHTTPRequestHandler):
                         cur = conn.cursor()
                         cur.execute("SELECT locked FROM posts WHERE id = ?", (post_id,))
                         row = cur.fetchone()
+                        if row is None:
+                            self.respond_error('Post not found.', status=404, code='not_found')
+                            return
                         if row and row['locked'] == 1:
                             self.respond_error('This thread is locked.', status=403, code='thread_locked')
                             return
@@ -3399,7 +3469,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                             if p_row: parent_agent_id = p_row['agent_id']
 
                         if parent_agent_id:
-                            cur.execute("SELECT id FROM agents WHERE id = ? AND model != 'none'", (parent_agent_id,))
+                            cur.execute("SELECT id FROM agents WHERE id = ? AND model NOT IN ('none', 'human')", (parent_agent_id,))
                             if cur.fetchone():
                                 cur.execute("SELECT community_id FROM posts WHERE id = ?", (post_id,))
                                 post_row = cur.fetchone()
@@ -3419,9 +3489,11 @@ class RequestHandler(BaseHTTPRequestHandler):
                     self.respond_error('Invalid comment path', status=400, code='invalid_path')
             else:
                 self.respond_error('Unknown API path', status=404, code='not_found')
+        except ValueError as e:
+            self.respond_error(str(e), status=400, code='validation_error')
         except OllamaError as e:
             try:
-                self.respond_error(str(e), status=500, code='ollama_error')
+                self.respond_error(str(e), status=503, code='ollama_error')
             except Exception:
                 pass
         except Exception as e:
@@ -3435,11 +3507,19 @@ class RequestHandler(BaseHTTPRequestHandler):
         if path == '/' or path == '':
             filename = 'index.html'
         else:
-            filename = path.lstrip('/')
-        # Prevent directory traversal
-        filename = os.path.normpath(filename)
-        full_path = os.path.join(STATIC_DIR, filename)
-        if not full_path.startswith(STATIC_DIR):
+            filename = unquote(path).lstrip('/')
+        # Normalize both URL and Windows separators before checking containment.
+        if ':' in filename or '\x00' in filename:
+            self.send_error(HTTPStatus.FORBIDDEN, 'Forbidden')
+            return
+        filename = os.path.normpath(filename.replace('\\', '/'))
+        static_root = os.path.realpath(STATIC_DIR)
+        full_path = os.path.realpath(os.path.join(static_root, filename))
+        try:
+            inside_static = os.path.commonpath([static_root, full_path]) == static_root
+        except ValueError:
+            inside_static = False
+        if not inside_static or ':' in filename or '\x00' in filename:
             self.send_error(HTTPStatus.FORBIDDEN, "Forbidden")
             return
         if os.path.isdir(full_path):
@@ -3466,23 +3546,14 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self.send_response(HTTPStatus.OK)
                 self.send_header('Content-Type', ctype)
                 self.send_header('Content-Length', str(len(content)))
+                self.send_header('Cache-Control', 'no-cache')
+                self.send_header('X-Content-Type-Options', 'nosniff')
                 self.end_headers()
                 self.wfile.write(content)
             except Exception as e:
                 self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR, str(e))
         else:
-            # Fallback: return index.html for client-side routing
-            index_path = os.path.join(STATIC_DIR, 'index.html')
-            if os.path.isfile(index_path):
-                with open(index_path, 'rb') as f:
-                    content = f.read()
-                self.send_response(HTTPStatus.OK)
-                self.send_header('Content-Type', 'text/html')
-                self.send_header('Content-Length', str(len(content)))
-                self.end_headers()
-                self.wfile.write(content)
-            else:
-                self.send_error(HTTPStatus.NOT_FOUND, "File not found")
+            self.send_error(HTTPStatus.NOT_FOUND, 'File not found')
 
 
 class SocialHTTPServer(ThreadingHTTPServer):
@@ -3494,7 +3565,9 @@ class SocialHTTPServer(ThreadingHTTPServer):
 
 
 def run_server(host: str = 'localhost', port: int = 8080) -> None:
+    global KNOWLEDGE
     init_db()
+    KNOWLEDGE = community_knowledge.CommunityKnowledge(get_db_connection)
     httpd = SocialHTTPServer((host, port), RequestHandler)
     print(f"Serving on http://{host}:{port}")
     try:
@@ -3506,8 +3579,7 @@ def run_server(host: str = 'localhost', port: int = 8080) -> None:
         finally:
             conn.close()
 
-        # Start the central simulation engine
-        ENGINE.start()
+        # Restore all simulation state before any queued event can be claimed.
         
         # Auto-boot all communities on startup by scheduling their heartbeats.
         # We use dedupe_key + replace_existing=False so that if a community
@@ -3515,12 +3587,9 @@ def run_server(host: str = 'localhost', port: int = 8080) -> None:
         # Our updated schedule() logic natively handles replacing terminal rows, so no deletes are needed.
         conn = get_db_connection()
         try:
-            # Mark all as active for the UI
-            conn.execute("UPDATE communities SET active = 1")
-            conn.commit()
             
             cur = conn.cursor()
-            cur.execute("SELECT * FROM communities")
+            cur.execute("SELECT * FROM communities WHERE active = 1")
             start_delay = 5
             for row in cur.fetchall():
                 comm_id = row['id']
@@ -3562,14 +3631,22 @@ def run_server(host: str = 'localhost', port: int = 8080) -> None:
         finally:
             conn.close()
         
+        KNOWLEDGE.start()
+        ENGINE.start()
         httpd.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
         # Stop simulation engine on shutdown
         ENGINE.stop()
+        KNOWLEDGE.stop()
         httpd.server_close()
 
 
 if __name__ == '__main__':
-    run_server(host='0.0.0.0', port=5000)
+    import argparse
+    parser = argparse.ArgumentParser(description='Local Social Lab')
+    parser.add_argument('--host', default='0.0.0.0', help='Use 127.0.0.1 for this computer only.')
+    parser.add_argument('--port', type=int, default=5000)
+    args = parser.parse_args()
+    run_server(host=args.host, port=args.port)

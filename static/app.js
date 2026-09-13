@@ -1,26 +1,3 @@
-async function fetchJSON(url, options = {}) {
-    let res;
-    try {
-        res = await fetch(url, options);
-    } catch (err) {
-        throw new Error('Network error. Check your connection and try again.');
-    }
-
-    let data = null;
-    try {
-        data = await res.json();
-    } catch (err) {
-        data = null;
-    }
-
-    if (!res.ok) {
-        throw new Error(data?.error || `Request failed (${res.status})`);
-    }
-    return data || {};
-}
-
-
-
 function formatCount(count, singular, plural = `${singular}s`) {
     return `${count} ${count === 1 ? singular : plural}`;
 }
@@ -43,6 +20,10 @@ function toggleSidebar(force) {
     const page = document.body;
     const nextState = typeof force === 'boolean' ? force : !page.classList.contains('is-sidebar-open');
     page.classList.toggle('is-sidebar-open', nextState);
+    document.getElementById('sidebar-toggle').setAttribute('aria-expanded', String(nextState));
+    const sidebar = document.getElementById('network-sidebar');
+    sidebar.inert = window.innerWidth <= 1024 && !nextState;
+    if (nextState) sidebar.querySelector('a, button')?.focus();
 }
 
 function initScrollObserver() {
@@ -313,6 +294,7 @@ function openDeleteModal(name) {
     const elements = getDeleteModalElements();
     deleteModalState.name = name;
     elements.copy.textContent = `Delete "${name}" and remove its stored posts, comments, and simulation state?`;
+    activateDialog(elements.shell);
     elements.shell.hidden = false;
     elements.shell.classList.add('is-open');
     elements.shell.setAttribute('aria-hidden', 'false');
@@ -324,6 +306,7 @@ function closeDeleteModal() {
     deleteModalState.name = null;
     elements.shell.classList.remove('is-open');
     elements.shell.hidden = true;
+    deactivateDialog(elements.shell);
     elements.shell.setAttribute('aria-hidden', 'true');
 }
 
@@ -332,12 +315,13 @@ function openEditModal(community) {
     editModalState.name = community.name;
     elements.name.value = community.name;
     elements.description.value = community.description || '';
-    elements.model.value = community.model || '';
+    selectSavedModel(elements.model, community.model);
     elements.rate.value = community.posting_rate || 60;
     elements.tone.value = community.tone || 'casual';
     elements.style.value = community.style_notes || '';
     elements.error.textContent = '';
     updateTonePreview('edit-community-tone', 'edit-tone-preview');
+    activateDialog(elements.shell);
     elements.shell.hidden = false;
     elements.shell.classList.add('is-open');
     elements.shell.setAttribute('aria-hidden', 'false');
@@ -349,6 +333,7 @@ function closeEditModal() {
     editModalState.name = null;
     elements.shell.classList.remove('is-open');
     elements.shell.hidden = true;
+    deactivateDialog(elements.shell);
     elements.shell.setAttribute('aria-hidden', 'true');
 }
 
@@ -392,7 +377,12 @@ function renderAuthOptions(users) {
 
 function navigateTo(viewName) {
     if (!appState.currentUser) return;
+    viewName = ['feed', 'communities', 'create'].includes(viewName) ? viewName : 'feed';
+    toggleSidebar(false);
+    closeAccountMenu();
+    if (window.location.hash !== `#${viewName}`) history.pushState(null, '', `#${viewName}`);
     
+    if (appState.activeView !== viewName) window.scrollTo(0, 0);
     appState.activeView = viewName;
     const page = document.body;
     const feedShell = document.getElementById('feed-shell');
@@ -418,8 +408,10 @@ function navigateTo(viewName) {
     document.querySelectorAll('.top-nav .nav-link').forEach(link => {
         if (link.dataset.viewTarget === viewName) {
             link.classList.add('is-active');
+            link.setAttribute('aria-current', 'page');
         } else {
             link.classList.remove('is-active');
+            link.removeAttribute('aria-current');
         }
     });
 
@@ -454,8 +446,8 @@ function renderSessionState() {
         document.getElementById('logout-btn').addEventListener('click', handleLogout);
         appState.sort = readSavedFeedSort();
         syncFeedSortControl();
-        navigateTo(appState.activeView || 'feed');
-        refreshApp();
+        navigateTo(appState.activeView || window.location.hash.slice(1) || 'feed');
+        loadCommunities().catch(err => showToast('Unable to load communities', err.message));
     } else {
         page.dataset.view = 'auth';
         bootShell.hidden = true;
@@ -490,8 +482,8 @@ function renderStats(communities = []) {
 async function loadModels() {
     const select = document.getElementById('comm-model');
     const editSelect = document.getElementById('edit-community-model');
-    select.innerHTML = '<option>Loading models...</option>';
-    editSelect.innerHTML = '<option>Loading models...</option>';
+    select.innerHTML = '<option value="">Loading models...</option>';
+    editSelect.innerHTML = '<option value="">Loading models...</option>';
 
     try {
         const data = await fetchJSON('/api/models');
@@ -501,9 +493,11 @@ async function loadModels() {
             : '<option value="">No local models found</option>';
         select.innerHTML = options;
         editSelect.innerHTML = options;
+        document.getElementById('model-status').textContent = models.length ? `${models.length} local models available` : 'No models installed. Install a text model in Ollama, then retry.';
     } catch (err) {
         select.innerHTML = '<option value="">Model lookup unavailable</option>';
         editSelect.innerHTML = '<option value="">Model lookup unavailable</option>';
+        document.getElementById('model-status').textContent = 'Ollama is unavailable. Start Ollama, then retry. Your saved feed is still available.';
     }
 }
 
@@ -548,7 +542,7 @@ function renderSidebarCommunities() {
         <article class="community-card community-list-item reveal-on-load" data-url="/community.html?name=${encodeURIComponent(community.name)}">
             <div class="community-list-main">
                 <div class="community-list-header">
-                    <h3 class="community-list-title">${escapeHTML(community.name)}</h3>
+                    <h3 class="community-list-title"><a href="/community.html?name=${encodeURIComponent(community.name)}">${escapeHTML(community.name)}</a></h3>
                 </div>
             </div>
         </article>
@@ -588,7 +582,7 @@ function renderDiscoveryCommunities() {
                     <span class="pill">${escapeHTML(`${community.posting_rate}s cycle`)}</span>
                 </div>
                 <div class="card-topline">
-                    <h3>${escapeHTML(community.name)}</h3>
+                    <h3><a href="/community.html?name=${encodeURIComponent(community.name)}">${escapeHTML(community.name)}</a></h3>
                     <div class="card-actions">
                         <button type="button" class="btn-text subscribe-btn ${community.subscribed ? 'is-active' : ''}" data-action="subscribe" data-name="${escapeHTML(community.name)}" data-subscribed="${community.subscribed ? 'true' : 'false'}">
                             ${community.subscribed ? 'Subscribed' : 'Join Community'}
@@ -617,38 +611,36 @@ function renderDiscoveryCommunities() {
 
 async function loadFeed(isLoadMore = false) {
     const feed = document.getElementById('home-feed');
-    if (appState.isLoadingFeed) return;
-
-    if (!isLoadMore) {
-        appState.feedOffset = 0;
-    } else {
-        appState.feedOffset += 20;
-    }
-
+    if (!appState.currentUser || (isLoadMore && appState.isLoadingFeed)) return;
+    const requestId = (appState.feedRequestId || 0) + 1;
+    appState.feedRequestId = requestId;
+    const offset = isLoadMore ? appState.feedOffset : 0;
     appState.isLoadingFeed = true;
-
     try {
-        const data = await fetchJSON(`/api/feed?sort=${encodeURIComponent(appState.sort)}&offset=${appState.feedOffset}&limit=20`);
-        appState.feedHasMore = data.has_more || false;
-
-        if (isLoadMore) {
-            appState.feed = appState.feed.concat(data.posts || []);
-            renderFeed(true);
-        } else {
-            appState.feed = data.posts || [];
-            renderFeed(false);
-        }
+        const data = await fetchJSON(`/api/feed?sort=${encodeURIComponent(appState.sort)}&offset=${offset}&limit=20`);
+        if (requestId !== appState.feedRequestId) return;
+        const posts = data.posts || [];
+        const seen = new Set(isLoadMore ? appState.feed.map(post => post.id) : []);
+        appState.lastPage = posts.filter(post => !seen.has(post.id));
+        appState.feed = isLoadMore ? appState.feed.concat(appState.lastPage) : posts;
+        appState.feedOffset = offset + posts.length;
+        appState.feedHasMore = !!data.has_more;
+        renderFeed(isLoadMore);
     } catch (err) {
+        if (requestId !== appState.feedRequestId) return;
+        homeFeedObserver?.disconnect();
         if (!isLoadMore) {
-            feed.innerHTML = `
-                <div class="empty-state">
-                    <strong>Feed unavailable</strong>
-                    ${escapeHTML(err.message)}
-                </div>
-            `;
+            feed.innerHTML = `<div class="empty-state"><strong>Feed unavailable</strong>${escapeHTML(err.message)}</div>`;
         }
+        const old = document.getElementById('feed-sentinel');
+        if (old) old.remove();
+        const retry = document.createElement('button');
+        retry.className = 'btn-text feed-retry';
+        retry.textContent = isLoadMore ? 'Could not load more · Retry' : 'Retry loading feed';
+        retry.onclick = () => { retry.remove(); loadFeed(isLoadMore); };
+        feed.appendChild(retry);
     } finally {
-        appState.isLoadingFeed = false;
+        if (requestId === appState.feedRequestId) appState.isLoadingFeed = false;
     }
 }
 
@@ -658,6 +650,7 @@ function renderFeed(isLoadMore = false) {
     const feed = document.getElementById('home-feed');
     const title = document.getElementById('feed-title');
     const subtitle = document.getElementById('feed-subtitle');
+    homeFeedObserver?.disconnect();
 
     if (!isLoadMore) {
         title.textContent = `${appState.currentUser.display_name}'s feed`;
@@ -669,7 +662,7 @@ function renderFeed(isLoadMore = false) {
             feed.innerHTML = `
                 <div class="empty-state">
                     <strong>No posts yet</strong>
-                    Subscribe to communities on the right and they will start showing up here.
+                    <a href="#communities">Explore communities</a> and join a room to build your feed.
                 </div>
             `;
             return;
@@ -685,7 +678,7 @@ function renderFeed(isLoadMore = false) {
     }
 
     // Determine which posts to render
-    const postsToRender = isLoadMore ? appState.feed.slice(appState.feedOffset) : appState.feed;
+    const postsToRender = isLoadMore ? appState.lastPage : appState.feed;
 
     const html = postsToRender.map((post) => `
         <article class="post post-feed-card clickable-card reveal-on-load" data-url="/community.html?name=${encodeURIComponent(post.community_name)}#post-${post.id}">
@@ -715,6 +708,7 @@ function renderFeed(isLoadMore = false) {
             </div>
             ${post.media_url ? `<div class="post-media-attachment" style="background: var(--bg-panel); border: 1px dashed var(--border-subtle); padding: 1rem; border-radius: var(--radius-sm); margin-bottom: 1rem; font-style: italic; color: var(--text-muted);"><i data-lucide="image"></i> ${escapeHTML(post.media_url)}</div>` : ''}
             <div class="post-content">${escapeHTML(post.content)}</div>
+            ${renderPostSources(post.sources)}
             <div class="card-footer">
                 <span>${escapeHTML(post.community_description || 'Open the community for the full thread.')}</span>
             </div>
@@ -731,7 +725,8 @@ function renderFeed(isLoadMore = false) {
         const sentinel = document.createElement('div');
         sentinel.id = 'feed-sentinel';
         sentinel.className = 'feed-loader';
-        sentinel.innerHTML = `<i data-lucide="loader-2" class="spin"></i> Loading more posts...`;
+        sentinel.innerHTML = '<button type="button" class="btn-text">Load more posts</button>';
+        sentinel.querySelector('button').onclick = () => loadFeed(true);
         feed.appendChild(sentinel);
         if (window.lucide) {
             lucide.createIcons({ root: sentinel });
@@ -830,7 +825,7 @@ async function handleLogout() {
     } catch (err) {
         const loginError = document.getElementById('login-error');
         if (loginError) {
-            loginError.textContent = err.message;
+            showToast('Unable to sign out', err.message);
         }
     }
 }
@@ -868,6 +863,7 @@ async function handleCreate(event) {
         document.getElementById('comm-tone').value = 'casual';
         updateTonePreview('comm-tone', 'comm-tone-preview');
         await refreshApp();
+        window.location.href = `/community.html?name=${encodeURIComponent(name)}`;
     } catch (err) {
         errorDiv.textContent = err.message;
     } finally {
@@ -888,7 +884,7 @@ async function handleDelete(name) {
     } catch (err) {
         const createError = document.getElementById('create-error');
         if (createError) {
-            createError.textContent = err.message;
+            showToast('Unable to update community', err.message);
         }
     }
 }
@@ -962,6 +958,17 @@ function initSSE() {
     const maxReconnectDelay = 30000; // 30 seconds max delay
     const baseDelay = 1000;
 
+    let refreshTimer;
+    const refreshLiveFeed = () => {
+        clearTimeout(refreshTimer);
+        refreshTimer = setTimeout(() => {
+            if (!appState.currentUser || appState.activeView !== 'feed') return;
+            if (window.scrollY > 200 || appState.feedOffset > 20) {
+                showFeedUpdate(document.getElementById('home-feed'), () => { loadFeed(); window.scrollTo(0, 0); });
+            } else { loadFeed(); }
+        }, 250);
+    };
+
     function connect() {
         if (eventSource) {
             eventSource.close();
@@ -972,7 +979,7 @@ function initSSE() {
         eventSource.addEventListener('new_post', async (event) => {
             try {
                 if (appState.activeView === 'feed') {
-                    await loadFeed();
+                    refreshLiveFeed();
                 }
             } catch (e) {
                 console.error('Failed to parse SSE new_post event', e);
@@ -982,7 +989,7 @@ function initSSE() {
         eventSource.addEventListener('new_comment', async (event) => {
             try {
                 if (appState.activeView === 'feed') {
-                    await loadFeed();
+                    refreshLiveFeed();
                 }
             } catch (e) {
                 console.error('Failed to parse SSE new_comment event', e);
@@ -990,6 +997,7 @@ function initSSE() {
         });
 
         eventSource.onopen = () => {
+            if (reconnectAttempts > 0) refreshLiveFeed();
             reconnectAttempts = 0;
         };
 
@@ -1011,23 +1019,17 @@ document.addEventListener('DOMContentLoaded', async () => {
     initSSE();
     populateToneSelect();
 
-    try {
-        const { current_user } = await fetchJSON('/api/session');
-        if (current_user) {
-            appState.currentUser = current_user;
-            writeCachedSession(current_user);
-            await loadModels();
-            renderAuthOptions([current_user]);
-            renderSessionState();
-        } else {
-            await loadModels();
-            await loadSession();
-        }
-    } catch (err) {
-        await loadModels();
-        await loadSession();
-    }
+    loadModels();
+    loadSession().catch(err => {
+        renderAuthOptions([]);
+        renderSessionState();
+        showToast('Unable to connect', err.message);
+    });
+    window.addEventListener('popstate', () => navigateTo(window.location.hash.slice(1)));
+    window.addEventListener('hashchange', () => navigateTo(window.location.hash.slice(1)));
+    window.addEventListener('resize', () => toggleSidebar(false));
 
+    document.getElementById('retry-models-btn').addEventListener('click', loadModels);
     document.getElementById('login-form').addEventListener('submit', handleLogin);
     document.getElementById('register-form').addEventListener('submit', handleRegister);
     document.getElementById('new-community-form').addEventListener('submit', handleCreate);
@@ -1062,12 +1064,20 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
         if (!accountChip.contains(event.target)) {
             closeAccountMenu();
+            if (document.body.classList.contains('is-sidebar-open')) {
+                toggleSidebar(false);
+                document.getElementById('sidebar-toggle').focus();
+            }
         }
     });
 
     document.addEventListener('keydown', (event) => {
         if (event.key === 'Escape') {
             closeAccountMenu();
+            if (document.body.classList.contains('is-sidebar-open')) {
+                toggleSidebar(false);
+                document.getElementById('sidebar-toggle').focus();
+            }
         }
     });
 
@@ -1111,7 +1121,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             } catch (err) {
                 const createError = document.getElementById('create-error');
                 if (createError) {
-                    createError.textContent = err.message;
+                    showToast('Unable to update community', err.message);
                 }
             }
             return;
@@ -1155,7 +1165,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             } catch (err) {
                 const createError = document.getElementById('create-error');
                 if (createError) {
-                    createError.textContent = err.message;
+                    showToast('Unable to update community', err.message);
                 }
             }
             return;
