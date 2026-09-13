@@ -2155,3 +2155,16 @@ h1, h2, h3, .post-content, .comment-meta, .pill, .stat-value, .account-chip stro
     .section-heading-inline { flex-direction: column; align-items: flex-start; gap: .5rem; }
     .community-tools { margin-bottom: .6rem; }
 }
+/* Shared research stays compact on phones and readable beside the desktop feed. */
+.web-briefing { margin: 0 0 1rem; min-width: 0; scroll-margin-top: 90px; }
+.web-briefing summary { cursor: pointer; min-height: 44px; padding-block: .5rem; font-weight: 650; }
+.web-briefing summary span { display: block; padding-top: .3rem; font-size: .8rem; font-weight: 400; color: var(--text-muted); }
+.web-briefing p { line-height: 1.5; font-size: .875rem; overflow-wrap: anywhere; }
+.briefing-sources { padding-left: 1.2rem; display: grid; gap: .7rem; }
+.briefing-sources a, .post-sources a { color: var(--text-primary); text-decoration: underline; text-underline-offset: 3px; overflow-wrap: anywhere; }
+.briefing-sources a { display: inline-flex; align-items: center; min-height: 44px; padding-block: .5rem; }
+.briefing-sources p { margin-top: .15rem; }
+.briefing-budget { color: var(--text-muted); }
+.post-sources { display: grid; gap: .4rem; margin: .8rem 0; padding-top: .7rem; border-top: 1px solid var(--border-subtle); font-size: .8rem; }
+.post-sources span { color: var(--text-muted); }
+.post-sources a { display: inline-flex; align-items: center; min-height: 44px; padding-block: .35rem; }

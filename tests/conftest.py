@@ -24,6 +24,8 @@ def setup_test_db(monkeypatch):
 
     monkeypatch.setattr(server, 'SIMULATIONS', {})
     monkeypatch.setattr(server, 'ENGINE', server.SimulationEngine())
+    monkeypatch.setattr(server, 'KNOWLEDGE', None)
+    monkeypatch.setattr(server.community_knowledge, 'load_settings', lambda: {'api_key': '', 'engine_id': '', 'daily_limit': 24})
 
     # Initialize the schema
     server.init_db()

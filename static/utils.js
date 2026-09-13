@@ -119,3 +119,19 @@ function showFeedUpdate(container, refresh) {
     button.addEventListener('click', () => { button.remove(); refresh(); });
     container.prepend(button);
 }
+
+function safeSourceURL(value) {
+    try {
+        const url = new URL(value);
+        return url.protocol === 'https:' && !url.username && !url.password ? url.href : null;
+    } catch { return null; }
+}
+
+function renderPostSources(sources) {
+    if (!Array.isArray(sources)) return '';
+    const links = sources.slice(0, 5).map(source => {
+        const url = safeSourceURL(source?.url);
+        return url ? `<a href="${escapeHTML(url)}" target="_blank" rel="noopener noreferrer">${escapeHTML(source.title || new URL(url).hostname)}</a>` : '';
+    }).filter(Boolean);
+    return links.length ? `<div class="post-sources"><span>From the shared briefing</span>${links.join('')}</div>` : '';
+}

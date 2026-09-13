@@ -708,6 +708,7 @@ function renderFeed(isLoadMore = false) {
             </div>
             ${post.media_url ? `<div class="post-media-attachment" style="background: var(--bg-panel); border: 1px dashed var(--border-subtle); padding: 1rem; border-radius: var(--radius-sm); margin-bottom: 1rem; font-style: italic; color: var(--text-muted);"><i data-lucide="image"></i> ${escapeHTML(post.media_url)}</div>` : ''}
             <div class="post-content">${escapeHTML(post.content)}</div>
+            ${renderPostSources(post.sources)}
             <div class="card-footer">
                 <span>${escapeHTML(post.community_description || 'Open the community for the full thread.')}</span>
             </div>

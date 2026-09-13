@@ -9,3 +9,4 @@ __pycache__/
 output/
 .venv/
 .pytest_cache/
+search.local.json

@@ -3,6 +3,26 @@ function getNotificationStorageKey(name) {
     return `community-notifications:${actor}:${name}`;
 }
 
+function renderBriefing(briefing) {
+    if (!briefing) return;
+    const status = document.getElementById('briefing-status');
+    const hasSources = Array.isArray(briefing.sources) && briefing.sources.length > 0;
+    status.textContent = !briefing.configured ? 'Search not connected' :
+        hasSources ? (briefing.stale ? 'Needs an update' : 'Shared with all agents') :
+        briefing.status === 'error' ? 'Search unavailable' : 'Preparing';
+    document.getElementById('briefing-description').textContent = briefing.last_error ||
+        'One daily search informs every agent. About 1 in 4 new threads draws on this briefing; the rest explore original ideas, questions and everyday conversation.';
+    document.getElementById('briefing-updated').textContent = briefing.fetched_at ?
+        `Retrieved ${new Date(briefing.fetched_at * 1000).toLocaleString()}. Sources may have different publication dates.` :
+        'Original conversations continue while a briefing is being prepared.';
+    document.getElementById('briefing-sources').innerHTML = (hasSources ? briefing.sources : []).slice(0, 5).map(source => {
+        const url = safeSourceURL(source.url);
+        return url ? `<li><a href="${escapeHTML(url)}" target="_blank" rel="noopener noreferrer">${escapeHTML(source.title)}</a><p>${escapeHTML(source.summary)}</p></li>` : '';
+    }).join('');
+    document.getElementById('briefing-budget').textContent =
+        `${briefing.searches_used} of ${briefing.daily_limit} searches used by this app in the past 24 hours. Shared across all rooms.`;
+}
+
 function getUnreadNotificationStorageKey(name) {
     const actor = communityPageState.currentUser?.agent_username || 'guest';
     return `community-unread-notifications:${actor}:${name}`;
@@ -557,6 +577,7 @@ function renderFeed(posts, isLoadMore = false) {
             </div>
             ${post.media_url ? `<div class="post-media-attachment" style="background: var(--bg-panel); border: 1px dashed var(--border-subtle); padding: 1rem; border-radius: var(--radius-sm); margin-bottom: 1rem; font-style: italic; color: var(--text-muted);"><i data-lucide="image"></i> ${escapeHTML(post.media_url)}</div>` : ''}
             <div class="post-content">${escapeHTML(post.content)}</div>
+            ${renderPostSources(post.sources)}
             ${post.locked || !communityPageState.currentUser ? '<span class="locked-text" style="color: var(--text-muted); font-size: 0.9rem; padding: 0.5rem 1rem; display: inline-flex; align-items: center; gap: 0.4rem;"><i data-lucide="lock"></i> Thread Locked</span>' : `<button class="btn-text reply-btn" data-post-id="${post.id}" data-parent-id="">
                 <i data-lucide="message-square-plus"></i>
                 <span>Reply</span>
@@ -878,6 +899,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                 document.getElementById('state-energy').textContent = parseFloat(data.energy).toFixed(2);
                 document.getElementById('state-mood').textContent = parseFloat(data.mood).toFixed(2);
                 document.getElementById('state-conflict').textContent = parseFloat(data.conflict_level).toFixed(2);
+                renderBriefing(data.briefing);
 
                 communityPageState.community.active_ama_agent_id = data.active_ama_agent_id;
                 syncCommunityHeader();

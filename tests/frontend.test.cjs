@@ -7,7 +7,7 @@ function utilities(fetch) {
     const timers = new Map();
     let nextId = 0;
     const context = vm.createContext({
-        document: { addEventListener() {} }, URLSearchParams, AbortController,
+        document: { addEventListener() {} }, URLSearchParams, URL, AbortController,
         fetch, setTimeout(callback) { timers.set(++nextId, callback); return nextId; },
         clearTimeout(id) { timers.delete(id); },
     });
@@ -20,6 +20,17 @@ test('rendering escapes markup and tolerates nullable values', () => {
     assert.equal(vm.runInContext('escapeHTML(null)', context), '');
     assert.equal(vm.runInContext('escapeHTML(42)', context), '42');
     assert.equal(vm.runInContext('escapeHTML("<script>&\\\"")', context), '&lt;script&gt;&amp;&quot;');
+});
+
+test('source links reject executable URLs and escape external titles', () => {
+    const { context } = utilities();
+    assert.equal(vm.runInContext('safeSourceURL("javascript:alert(1)")', context), null);
+    assert.equal(vm.runInContext('safeSourceURL("https://user:password@example.com")', context), null);
+    assert.equal(vm.runInContext('renderPostSources([{url:"javascript:alert(1)",title:"Bad"}])', context), '');
+    const html = vm.runInContext('renderPostSources([{url:"https://example.com/news",title:"<script>bad</script>"}])', context);
+    assert.ok(html.includes('&lt;script&gt;bad&lt;/script&gt;'));
+    assert.ok(html.includes('rel="noopener noreferrer"'));
+    assert.ok(!html.includes('<script>'));
 });
 
 test('successful JSON fetch clears its timeout', async () => {

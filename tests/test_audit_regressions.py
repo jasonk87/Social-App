@@ -291,6 +291,6 @@ def test_startup_repairs_orphan_account_metadata_only():
 
 @pytest.mark.parametrize('payload', [{'title': {}, 'content': 'Hello'}, ['title', 'content'], {'title': 'Hi', 'content': ''}])
 def test_invalid_generated_post_never_reaches_sqlite(monkeypatch, payload):
-    monkeypatch.setattr(server, 'generate_text', lambda *args: json.dumps(payload))
+    monkeypatch.setattr(server, 'generate_text', lambda *args, **kwargs: json.dumps(payload))
     with pytest.raises(server.OllamaError):
         server.generate_post('dummy', 'persona', 'Room', 'Description', 'casual')
