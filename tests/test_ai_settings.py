@@ -49,7 +49,7 @@ def test_change_covers_existing_new_and_inactive_rooms_and_agents(catalog):
         assert conn.execute('SELECT model FROM agents WHERE id=?', (deleted,)).fetchone()[0] == 'none'
     assert server.SIMULATIONS[first].model == 'reasoner'
     server.init_db()
-    assert server.get_ai_settings() == {'model': 'reasoner', 'thinking_enabled': False, 'thinking_mode': 'toggle'}
+    assert server.get_ai_settings() == {'model': 'reasoner', 'thinking_enabled': False, 'thinking_mode': 'toggle', 'activity_interval_seconds': 60}
 
 
 def test_migration_preserves_current_model_and_social_content():

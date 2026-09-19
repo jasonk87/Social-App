@@ -175,45 +175,45 @@ const toneOptions = [
     {
         value: 'casual',
         label: 'Casual',
-        description: 'Natural conversation, normal pace, good back-and-forth, still handles serious topics.',
+        description: 'Natural conversation and back-and-forth that can still handle serious topics.',
         previewTitle: 'Balanced and conversational',
-        previewCopy: 'Expect normal-paced posting, short-to-medium replies, and real back-and-forth without drifting into either clown mode or lecture mode.',
+        previewCopy: 'Expect short-to-medium replies and natural back-and-forth without drifting into either clown mode or lecture mode.',
         samplePost: 'Post: Anyone else think remote work is great until your kitchen becomes your whole personality?',
         sampleReply: 'Reply: Yes, and somehow the coffee tastes worse when the office is ten feet away.',
     },
     {
         value: 'funny',
         label: 'Funny',
-        description: 'Shorter, punchier, lighter, more playful, and faster-moving.',
-        previewTitle: 'Fast and playful',
-        previewCopy: 'This room should post quicker, joke more, and keep replies tight. Good for banter, riffs, and lighter conversation.',
+        description: 'Shorter, punchier, lighter and more playful.',
+        previewTitle: 'Punchy and playful',
+        previewCopy: 'This room should joke more and keep replies tight. Good for banter, riffs, and lighter conversation.',
         samplePost: 'Post: My to-do list is now just a wishlist with confidence issues.',
         sampleReply: 'Reply: Same. Mine is mostly decorative at this point.',
     },
     {
         value: 'scholarly',
         label: 'Scholarly',
-        description: 'Thoughtful and informed, a bit slower, with more substance and structure.',
+        description: 'Thoughtful and informed, with more substance and structure.',
         previewTitle: 'Thoughtful and measured',
-        previewCopy: 'Expect slower pacing, more structured posts, and calmer replies. Better for ideas with depth, but still less stiff than before.',
+        previewCopy: 'Expect structured posts and calmer replies. Better for ideas with depth, without becoming stiff.',
         samplePost: 'Post: I think people overstate productivity gains from automation when the coordination cost is still poorly understood.',
         sampleReply: 'Reply: Agreed. The tooling improves throughput, but the handoff and review burden often just moves elsewhere.',
     },
     {
         value: 'debate',
         label: 'Debate',
-        description: 'Sharper opinions, stronger disagreement, more challenge, and quicker replies.',
+        description: 'Sharper opinions, stronger disagreement and more challenge.',
         previewTitle: 'Sharp and reactive',
-        previewCopy: 'This room should challenge people faster, push stronger takes, and generate more heated reply chains instead of quiet agreement.',
+        previewCopy: 'This room should question assumptions, explore opposing views and welcome disagreement.',
         samplePost: 'Post: Hot take: most "unpopular opinions" are just popular opinions said with extra theater.',
         sampleReply: 'Reply: True, but this one is hiding behind irony instead of evidence.',
     },
     {
         value: 'supportive',
         label: 'Supportive',
-        description: 'Constructive, warm, good-faith discussion with a steadier pace.',
+        description: 'Constructive, warm and good-faith discussion.',
         previewTitle: 'Warm and constructive',
-        previewCopy: 'Expect more patient pacing, helpful responses, and a gentler vibe that still keeps the conversation moving.',
+        previewCopy: 'Expect patient, helpful responses and a gentler conversational style.',
         samplePost: 'Post: I am trying to get better at speaking up in meetings without sounding rehearsed. Any advice?',
         sampleReply: 'Reply: Start with one point you know well and build from there. You do not need to sound polished to sound useful.',
     },
@@ -281,7 +281,6 @@ function getEditModalElements() {
         shell: document.getElementById('edit-modal'),
         name: document.getElementById('edit-community-name'),
         description: document.getElementById('edit-community-description'),
-        rate: document.getElementById('edit-community-rate'),
         tone: document.getElementById('edit-community-tone'),
         style: document.getElementById('edit-community-style'),
         error: document.getElementById('edit-community-error'),
@@ -314,7 +313,6 @@ function openEditModal(community) {
     editModalState.name = community.name;
     elements.name.value = community.name;
     elements.description.value = community.description || '';
-    elements.rate.value = community.posting_rate || 60;
     elements.tone.value = community.tone || 'casual';
     elements.style.value = community.style_notes || '';
     elements.error.textContent = '';
@@ -436,7 +434,7 @@ function renderSessionState() {
                 <strong>${escapeHTML(appState.currentUser.display_name)}</strong>
             </button>
             <div id="account-menu" class="account-menu" role="menu" hidden>
-                <a href="/settings.html" class="btn-text" role="menuitem">AI settings</a>
+                <a href="/settings.html" class="account-settings-link" role="menuitem"><i data-lucide="settings" aria-hidden="true"></i><span>AI settings</span></a>
                 <button type="button" id="logout-btn" class="btn-text" role="menuitem">Sign out</button>
             </div>
         `;
@@ -555,7 +553,6 @@ function renderDiscoveryCommunities() {
             <div class="post-header">
                 <div class="pill-row">
                     <span class="pill">${escapeHTML(formatCount(community.subscriber_count || 0, 'subscriber'))}</span>
-                    <span class="pill">${escapeHTML(`${community.posting_rate}s cycle`)}</span>
                 </div>
                 <div class="card-topline">
                     <h3><a href="/community.html?name=${encodeURIComponent(community.name)}">${escapeHTML(community.name)}</a></h3>
@@ -814,7 +811,6 @@ async function handleCreate(event) {
     const errorDiv = document.getElementById('create-error');
     const name = document.getElementById('comm-name').value.trim();
     const description = document.getElementById('comm-desc').value.trim();
-    const rate = parseInt(document.getElementById('comm-rate').value, 10);
     const tone = document.getElementById('comm-tone').value;
     const styleNotes = document.getElementById('comm-style').value.trim();
 
@@ -832,7 +828,7 @@ async function handleCreate(event) {
         await fetchJSON('/api/communities', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ name, description, posting_rate: rate, tone, style_notes: styleNotes }),
+            body: JSON.stringify({ name, description, tone, style_notes: styleNotes }),
         });
         form.reset();
         document.getElementById('comm-tone').value = 'casual';
@@ -869,7 +865,6 @@ async function handleEditSave(event) {
     const elements = getEditModalElements();
     const payload = {
         description: elements.description.value.trim(),
-        posting_rate: parseInt(elements.rate.value, 10),
         tone: elements.tone.value,
         style_notes: elements.style.value.trim(),
     };

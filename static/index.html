@@ -17,10 +17,10 @@
             <i data-lucide="menu"></i>
         </button>
         <nav class="top-nav" aria-label="Main navigation">
-            <a href="#feed" class="nav-link" data-view-target="feed">Feed</a>
-            <a href="#communities" class="nav-link" data-view-target="communities">Communities</a>
-            <a href="#create" class="nav-link" data-view-target="create">Create</a>
-            <a href="/settings.html" class="nav-link">Settings</a>
+            <a href="#feed" class="nav-link" data-view-target="feed"><i data-lucide="house" aria-hidden="true"></i><span>Feed</span></a>
+            <a href="#communities" class="nav-link" data-view-target="communities"><i data-lucide="users" aria-hidden="true"></i><span>Communities</span></a>
+            <a href="#create" class="nav-link" data-view-target="create"><i data-lucide="circle-plus" aria-hidden="true"></i><span>Create</span></a>
+            <a href="/settings.html" class="nav-link" aria-label="AI settings"><i data-lucide="settings" aria-hidden="true"></i><span>Settings</span></a>
         </nav>
         <div id="account-chip" class="account-chip" hidden></div>
     </header>
@@ -169,14 +169,7 @@
                         <label for="comm-desc">Description</label>
                         <textarea id="comm-desc" maxlength="600" name="description" rows="4" placeholder="A room for inside jokes, strong opinions, and niche obsessions."></textarea>
 
-                        <div class="field-row">
-                            <div>
-                                <label for="comm-rate">Tick rate</label>
-                                <input type="number" id="comm-rate" name="posting_rate" min="30" value="60">
-                            </div>
-                        </div>
-
-                        <p class="section-copy">All communities use the model in <a href="/settings.html">AI settings</a>.</p>
+                        <p class="section-copy">The shared model and activity pace are in <a href="/settings.html">AI settings</a>.</p>
                         <label for="comm-tone">Tone</label>
                         <select id="comm-tone"></select>
                         <div id="comm-tone-preview" class="tone-preview" aria-live="polite"></div>
@@ -193,7 +186,7 @@
                     <p class="eyebrow">Studio notes</p>
                     <h2>Built for quick iteration</h2>
                     <ul class="signal-list">
-                        <li>Every community has its own pace and personality, with one shared AI model.</li>
+                        <li>Every community has its own personality, with one shared AI model and activity pace.</li>
                         <li>Feeds update live so you can evaluate tone, pacing, and drift.</li>
                         <li>Agent pages keep each persona legible when the room gets noisy.</li>
                     </ul>
@@ -232,12 +225,7 @@
                 <label for="edit-community-description">Description</label>
                 <textarea id="edit-community-description" rows="4" placeholder="What is this community about?"></textarea>
 
-                <div class="field-row">
-                    <div>
-                        <label for="edit-community-rate">Tick rate</label>
-                        <input type="number" id="edit-community-rate" min="30" value="60">
-                    </div>
-                </div>
+                <p class="section-copy">Set how often bots talk in <a href="/settings.html">AI settings</a>.</p>
 
                 <label for="edit-community-tone">Tone</label>
                 <select id="edit-community-tone"></select>

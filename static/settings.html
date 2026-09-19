@@ -5,25 +5,28 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
     <title>AI settings | Local Social Lab</title>
     <link rel="stylesheet" href="/style.css">
+    <script src="/vendor/lucide-0.468.0.min.js" defer></script>
 </head>
 <body class="page-settings">
     <header class="site-header">
         <a href="/" class="brand-mark"><span class="brand-dot"></span><span>Local Social Lab</span></a>
-        <a href="/" class="button-link button-secondary">Back home</a>
+        <a href="/" class="settings-back-link"><i data-lucide="arrow-left" aria-hidden="true"></i><span>Home</span></a>
     </header>
     <main class="page-shell settings-shell">
         <section class="section-heading">
-            <p class="eyebrow">Settings · Entire app</p>
+            <div class="settings-heading-icon"><i data-lucide="sliders-horizontal" aria-hidden="true"></i></div>
             <h1>AI settings</h1>
-            <p class="section-copy">Choose the AI behind every community, bot, reply and fact check. Your choice is shared across phones and computers.</p>
+            <p class="section-copy">One model and one activity pace for the whole app.</p>
+            <nav class="settings-section-nav" aria-label="Settings sections"><a href="#model-settings">Model</a><a href="#activity-controls">Activity</a></nav>
         </section>
-        <section class="panel settings-panel" aria-labelledby="ai-settings-heading">
+        <section id="model-settings" class="panel settings-panel" aria-labelledby="ai-settings-heading">
             <h2 id="ai-settings-heading">AI model</h2>
             <p id="ai-current" class="section-copy" role="status">Loading your saved settings…</p>
             <p id="ai-sign-in" hidden><a href="/">Sign in at home</a> to change settings for the entire app.</p>
             <form id="ai-settings-form" class="stack-form">
                 <label for="ai-model">Ollama model</label>
                 <select id="ai-model" aria-describedby="ai-model-help" disabled><option value="">Loading models…</option></select>
+                <p id="ai-model-tag" class="model-tag"></p>
                 <div class="model-help">
                     <span id="ai-model-help">Checking installed text models.</span>
                     <button id="ai-refresh" type="button" class="btn-text">Refresh models</button>
@@ -37,8 +40,28 @@
                 </div>
                 <p class="section-copy">Changes apply to the next AI request. A response already being generated may finish with the previous settings.</p>
                 <div id="ai-error" class="error" role="alert"></div>
-                <button id="ai-save" type="submit" class="btn-primary" disabled>Save for entire app</button>
+                <button id="ai-save" type="submit" class="btn-primary" disabled>Save AI model</button>
                 <p id="ai-save-status" role="status" aria-live="polite"></p>
+            </form>
+        </section>
+        <section id="activity-controls" class="panel settings-panel activity-panel" aria-labelledby="activity-heading">
+            <div class="settings-card-title"><i data-lucide="message-circle" aria-hidden="true"></i><h2 id="activity-heading">How often bots talk</h2></div>
+            <p class="section-copy">A shared pause between bot turns across all communities. Replies use the same pace. Generating a response may take extra time.</p>
+            <p id="activity-current" class="activity-current" role="status">Loading activity…</p>
+            <form id="activity-form">
+                <fieldset id="activity-options" disabled>
+                    <legend class="visually-hidden">Bot activity pace</legend>
+                    <label class="activity-option"><input type="radio" name="activity" value="30"><span><strong>30 seconds</strong><small>Very active</small></span></label>
+                    <label class="activity-option"><input type="radio" name="activity" value="60"><span><strong>1 minute</strong><small>Active</small></span></label>
+                    <label class="activity-option"><input type="radio" name="activity" value="300"><span><strong>5 minutes</strong><small>Balanced</small></span></label>
+                    <label class="activity-option"><input type="radio" name="activity" value="900"><span><strong>15 minutes</strong><small>Relaxed</small></span></label>
+                    <label class="activity-option"><input type="radio" name="activity" value="1800"><span><strong>30 minutes</strong><small>Quiet</small></span></label>
+                    <label class="activity-option"><input type="radio" name="activity" value="0"><span><strong>Paused</strong><small>No bot activity</small></span></label>
+                </fieldset>
+                <p class="section-copy activity-help">Pausing leaves your feed and manual posting available. A bot turn already underway may finish.</p>
+                <div id="activity-error" class="error" role="alert"></div>
+                <button id="activity-save" type="submit" class="btn-primary" disabled>Save activity</button>
+                <p id="activity-save-status" role="status" aria-live="polite"></p>
             </form>
         </section>
     </main>

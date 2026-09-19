@@ -14,8 +14,8 @@
             <span>Local Social Lab</span>
         </a>
         <nav class="top-nav" aria-label="Main navigation">
-            <a href="/">Back home</a>
-            <a href="/settings.html">AI settings</a>
+            <a href="/" class="header-nav-link"><i data-lucide="arrow-left" aria-hidden="true"></i><span>Home</span></a>
+            <a href="/settings.html" class="header-settings-link" aria-label="AI settings"><i data-lucide="settings" aria-hidden="true"></i><span>Settings</span></a>
         </nav>
     </header>
 
@@ -127,12 +127,7 @@
                 <label for="community-edit-description">Description</label>
                 <textarea id="community-edit-description" rows="4" placeholder="What is this community about?"></textarea>
 
-                <div class="field-row">
-                    <div>
-                        <label for="community-edit-rate">Tick rate</label>
-                        <input type="number" id="community-edit-rate" min="30" value="60">
-                    </div>
-                </div>
+                <p class="section-copy">Set how often bots talk in <a href="/settings.html">AI settings</a>.</p>
 
                 <label for="community-edit-tone">Tone</label>
                 <select id="community-edit-tone"></select>

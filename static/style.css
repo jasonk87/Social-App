@@ -282,10 +282,12 @@ textarea {
     display: none;
 }
 
-.account-menu button {
+.account-menu button, .account-menu .account-settings-link {
     width: 100%;
     justify-content: flex-start;
 }
+.account-menu .account-settings-link { display: flex; align-items: center; gap: .6rem; min-height: 46px; padding: .65rem .8rem; border-radius: 6px; font-size: .95rem; font-weight: 600; color: var(--text-secondary); }
+.account-menu .account-settings-link:hover { background: var(--accent-soft); color: var(--text-primary); }
 
 .button-link,
 button {
@@ -2083,7 +2085,30 @@ h1, h2, h3, .post-content, .comment-meta, .pill, .stat-value, .account-chip stro
 .feed-update { position: sticky; top: 5rem; z-index: 5; box-shadow: var(--shadow-md); }
 .model-help { display: flex; align-items: center; flex-wrap: wrap; gap: .5rem; color: var(--text-secondary); font-size: .875rem; }
 .settings-shell { max-width: 760px; margin-inline: auto; }
-.settings-panel { margin-top: 1.5rem; }
+.settings-panel { margin-top: 1.25rem; scroll-margin-top: 90px; }
+.settings-shell > .section-heading { padding-top: 1.25rem; }
+.settings-heading-icon { display: inline-flex; width: fit-content; padding: .65rem; border: 1px solid rgb(40 196 143 / 24%); border-radius: 12px; color: var(--accent); background: var(--accent-soft); margin-bottom: .8rem; }
+.settings-back-link, .header-nav-link, .header-settings-link { display: inline-flex; align-items: center; justify-content: center; gap: .5rem; min-height: 44px; padding: .5rem .75rem; border-radius: 10px; color: var(--text-secondary); }
+.settings-back-link:hover, .header-settings-link:hover { background: var(--accent-soft); color: var(--accent); }
+.settings-section-nav { display: flex; gap: .5rem; margin-top: .85rem; }
+.settings-section-nav a { display: inline-flex; align-items: center; min-height: 44px; padding: .5rem 1rem; border: 1px solid var(--border); border-radius: 10px; background: var(--bg-soft); font-weight: 600; font-size: .9rem; }
+.settings-section-nav a:hover { border-color: var(--accent); color: var(--accent); }
+.model-tag { color: var(--text-muted); font-size: .8rem; overflow-wrap: anywhere; }
+.settings-card-title { display: flex; align-items: center; gap: .6rem; margin-bottom: .8rem; }
+.settings-card-title .lucide { color: var(--accent); }
+.activity-current { margin: 1rem 0; color: var(--accent); font-size: .9rem; font-weight: 600; }
+#activity-options { margin: 0; padding: 0; border: 0; display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); gap: .65rem; }
+.activity-option { display: flex; align-items: center; gap: .6rem; border: 1px solid var(--border-strong); border-radius: 12px; padding: .9rem .75rem; min-height: 80px; background: var(--bg-soft); cursor: pointer; }
+.activity-option:has(input:checked) { border-color: var(--accent); background: var(--accent-soft); }
+.activity-option:has(input:focus-visible) { outline: 2px solid var(--accent); outline-offset: 3px; }
+.activity-option input { appearance: auto; padding: 0; margin: 0; width: 18px; min-height: 18px; height: 18px; flex: 0 0 18px; accent-color: var(--accent); }
+.activity-option strong, .activity-option small { display: block; line-height: 1.4; }
+.activity-option strong { font-size: .95rem; }
+.activity-option small { margin-top: .2rem; color: var(--text-muted); font-size: .78rem; }
+.activity-help { margin-top: 1rem; }
+.activity-panel button[type="submit"] { width: 100%; margin-top: 1rem; }
+.activity-panel fieldset:disabled { opacity: .55; }
+.visually-hidden { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; border: 0; }
 .settings-panel select { width: 100%; min-width: 0; text-overflow: ellipsis; }
 .thinking-card { border: 1px solid var(--border-strong); border-radius: 12px; padding: 1rem; margin-top: .5rem; }
 .settings-panel .thinking-control { display: flex; align-items: center; justify-content: space-between; gap: 1rem; min-height: 44px; cursor: pointer; }
@@ -2100,6 +2125,8 @@ h1, h2, h3, .post-content, .comment-meta, .pill, .stat-value, .account-chip stro
     .settings-shell { padding-inline: 1rem; }
     .settings-panel { padding: 1rem; }
     .settings-shell h1 { font-size: 2rem; }
+    #activity-options { grid-template-columns: repeat(2,minmax(0,1fr)); }
+    .settings-shell .settings-card-title h2 { font-size: 1.35rem; }
 }
 .composer-fields { display: grid; gap: .7rem; }
 .composer-disclosure summary { cursor: pointer; font-weight: 650; padding: .75rem 0; }
@@ -2136,10 +2163,14 @@ h1, h2, h3, .post-content, .comment-meta, .pill, .stat-value, .account-chip stro
         gap: .3rem; padding: .45rem .5rem calc(.45rem + env(safe-area-inset-bottom));
         background: var(--bg-elevated); border-top: 1px solid var(--border-strong); z-index: 110;
     }
-    .page-home .top-nav a { justify-content: center; min-height: 48px; font-size: .85rem; font-weight: 600; }
+    .page-home .top-nav a { flex-direction: column; justify-content: center; gap: .15rem; min-height: 56px; padding: .35rem .1rem; font-size: .7rem; font-weight: 600; border-radius: 12px; }
+    .page-home .top-nav .lucide { width: 22px; height: 22px; }
     .page-home .top-nav a.is-active { background: var(--accent-soft); color: var(--accent); }
     body[data-view="auth"] .top-nav, body[data-view="loading"] .top-nav { display: none; }
     .page-community .top-nav, .page-agent .top-nav { display: flex; grid-column: 2 / -1; }
+    .page-community .top-nav { gap: .25rem; flex-wrap: nowrap; }
+    .page-community .header-settings-link { min-width: 44px; padding: .6rem; background: var(--accent-soft); color: var(--accent); border: 1px solid rgb(40 196 143 / 24%); border-radius: 12px; }
+    .page-community .header-settings-link span { display: none; }
     .top-nav a { min-height: 44px; }
     .page-shell { padding-bottom: calc(6rem + env(safe-area-inset-bottom)); }
     .page-hero.hero-community { min-height: 210px; }
