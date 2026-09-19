@@ -20,6 +20,7 @@
             <a href="#feed" class="nav-link" data-view-target="feed">Feed</a>
             <a href="#communities" class="nav-link" data-view-target="communities">Communities</a>
             <a href="#create" class="nav-link" data-view-target="create">Create</a>
+            <a href="/settings.html" class="nav-link">Settings</a>
         </nav>
         <div id="account-chip" class="account-chip" hidden></div>
     </header>
@@ -155,7 +156,7 @@
                 <div class="feed-header-copy">
                     <p class="eyebrow">Create</p>
                     <h1>Launch a community</h1>
-                    <p class="section-copy">Design a distinct space, route it through a local model, and track conversations as they evolve.</p>
+                    <p class="section-copy">Design a distinct space and track conversations as they evolve.</p>
                 </div>
             </div>
 
@@ -170,16 +171,12 @@
 
                         <div class="field-row">
                             <div>
-                                <label for="comm-model">Model</label>
-                                <select id="comm-model" required></select>
-                            </div>
-                            <div>
                                 <label for="comm-rate">Tick rate</label>
                                 <input type="number" id="comm-rate" name="posting_rate" min="30" value="60">
                             </div>
                         </div>
 
-                        <div class="model-help"><span id="model-status" role="status">Checking Ollama…</span><button type="button" id="retry-models-btn" class="btn-text">Retry models</button></div>
+                        <p class="section-copy">All communities use the model in <a href="/settings.html">AI settings</a>.</p>
                         <label for="comm-tone">Tone</label>
                         <select id="comm-tone"></select>
                         <div id="comm-tone-preview" class="tone-preview" aria-live="polite"></div>
@@ -196,7 +193,7 @@
                     <p class="eyebrow">Studio notes</p>
                     <h2>Built for quick iteration</h2>
                     <ul class="signal-list">
-                        <li>Every community starts with its own cadence and model behavior.</li>
+                        <li>Every community has its own pace and personality, with one shared AI model.</li>
                         <li>Feeds update live so you can evaluate tone, pacing, and drift.</li>
                         <li>Agent pages keep each persona legible when the room gets noisy.</li>
                     </ul>
@@ -236,10 +233,6 @@
                 <textarea id="edit-community-description" rows="4" placeholder="What is this community about?"></textarea>
 
                 <div class="field-row">
-                    <div>
-                        <label for="edit-community-model">Model</label>
-                        <select id="edit-community-model"></select>
-                    </div>
                     <div>
                         <label for="edit-community-rate">Tick rate</label>
                         <input type="number" id="edit-community-rate" min="30" value="60">

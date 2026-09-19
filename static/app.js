@@ -281,7 +281,6 @@ function getEditModalElements() {
         shell: document.getElementById('edit-modal'),
         name: document.getElementById('edit-community-name'),
         description: document.getElementById('edit-community-description'),
-        model: document.getElementById('edit-community-model'),
         rate: document.getElementById('edit-community-rate'),
         tone: document.getElementById('edit-community-tone'),
         style: document.getElementById('edit-community-style'),
@@ -315,7 +314,6 @@ function openEditModal(community) {
     editModalState.name = community.name;
     elements.name.value = community.name;
     elements.description.value = community.description || '';
-    selectSavedModel(elements.model, community.model);
     elements.rate.value = community.posting_rate || 60;
     elements.tone.value = community.tone || 'casual';
     elements.style.value = community.style_notes || '';
@@ -438,6 +436,7 @@ function renderSessionState() {
                 <strong>${escapeHTML(appState.currentUser.display_name)}</strong>
             </button>
             <div id="account-menu" class="account-menu" role="menu" hidden>
+                <a href="/settings.html" class="btn-text" role="menuitem">AI settings</a>
                 <button type="button" id="logout-btn" class="btn-text" role="menuitem">Sign out</button>
             </div>
         `;
@@ -477,28 +476,6 @@ function renderStats(communities = []) {
             <span class="stat-label">${escapeHTML(card.label)}</span>
         </div>
     `).join('');
-}
-
-async function loadModels() {
-    const select = document.getElementById('comm-model');
-    const editSelect = document.getElementById('edit-community-model');
-    select.innerHTML = '<option value="">Loading models...</option>';
-    editSelect.innerHTML = '<option value="">Loading models...</option>';
-
-    try {
-        const data = await fetchJSON('/api/models');
-        const models = data.models || [];
-        const options = models.length
-            ? models.map((model) => `<option value="${escapeHTML(model)}">${escapeHTML(model)}</option>`).join('')
-            : '<option value="">No local models found</option>';
-        select.innerHTML = options;
-        editSelect.innerHTML = options;
-        document.getElementById('model-status').textContent = models.length ? `${models.length} local models available` : 'No models installed. Install a text model in Ollama, then retry.';
-    } catch (err) {
-        select.innerHTML = '<option value="">Model lookup unavailable</option>';
-        editSelect.innerHTML = '<option value="">Model lookup unavailable</option>';
-        document.getElementById('model-status').textContent = 'Ollama is unavailable. Start Ollama, then retry. Your saved feed is still available.';
-    }
 }
 
 async function loadCommunities() {
@@ -577,7 +554,6 @@ function renderDiscoveryCommunities() {
         <article class="post clickable-card community-discovery-card reveal-on-load" data-url="/community.html?name=${encodeURIComponent(community.name)}">
             <div class="post-header">
                 <div class="pill-row">
-                    <span class="pill pill-accent">${escapeHTML(community.model)}</span>
                     <span class="pill">${escapeHTML(formatCount(community.subscriber_count || 0, 'subscriber'))}</span>
                     <span class="pill">${escapeHTML(`${community.posting_rate}s cycle`)}</span>
                 </div>
@@ -838,15 +814,14 @@ async function handleCreate(event) {
     const errorDiv = document.getElementById('create-error');
     const name = document.getElementById('comm-name').value.trim();
     const description = document.getElementById('comm-desc').value.trim();
-    const model = document.getElementById('comm-model').value;
     const rate = parseInt(document.getElementById('comm-rate').value, 10);
     const tone = document.getElementById('comm-tone').value;
     const styleNotes = document.getElementById('comm-style').value.trim();
 
     errorDiv.textContent = '';
 
-    if (!name || !model) {
-        errorDiv.textContent = 'Name and model are required.';
+    if (!name) {
+        errorDiv.textContent = 'Name is required.';
         return;
     }
 
@@ -857,7 +832,7 @@ async function handleCreate(event) {
         await fetchJSON('/api/communities', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ name, description, model, posting_rate: rate, tone, style_notes: styleNotes }),
+            body: JSON.stringify({ name, description, posting_rate: rate, tone, style_notes: styleNotes }),
         });
         form.reset();
         document.getElementById('comm-tone').value = 'casual';
@@ -894,7 +869,6 @@ async function handleEditSave(event) {
     const elements = getEditModalElements();
     const payload = {
         description: elements.description.value.trim(),
-        model: elements.model.value,
         posting_rate: parseInt(elements.rate.value, 10),
         tone: elements.tone.value,
         style_notes: elements.style.value.trim(),
@@ -1019,7 +993,6 @@ document.addEventListener('DOMContentLoaded', async () => {
     initSSE();
     populateToneSelect();
 
-    loadModels();
     loadSession().catch(err => {
         renderAuthOptions([]);
         renderSessionState();
@@ -1029,7 +1002,6 @@ document.addEventListener('DOMContentLoaded', async () => {
     window.addEventListener('hashchange', () => navigateTo(window.location.hash.slice(1)));
     window.addEventListener('resize', () => toggleSidebar(false));
 
-    document.getElementById('retry-models-btn').addEventListener('click', loadModels);
     document.getElementById('login-form').addEventListener('submit', handleLogin);
     document.getElementById('register-form').addEventListener('submit', handleRegister);
     document.getElementById('new-community-form').addEventListener('submit', handleCreate);
@@ -1037,7 +1009,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     document.getElementById('comm-tone').addEventListener('change', () => updateTonePreview('comm-tone', 'comm-tone-preview'));
     document.getElementById('edit-community-tone').addEventListener('change', () => updateTonePreview('edit-community-tone', 'edit-tone-preview'));
 
-    document.querySelectorAll('.top-nav .nav-link').forEach(link => {
+    document.querySelectorAll('.top-nav .nav-link[data-view-target]').forEach(link => {
         link.addEventListener('click', (event) => {
             event.preventDefault();
             const target = link.dataset.viewTarget;

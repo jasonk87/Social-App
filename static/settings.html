@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <title>AI settings | Local Social Lab</title>
+    <link rel="stylesheet" href="/style.css">
+</head>
+<body class="page-settings">
+    <header class="site-header">
+        <a href="/" class="brand-mark"><span class="brand-dot"></span><span>Local Social Lab</span></a>
+        <a href="/" class="button-link button-secondary">Back home</a>
+    </header>
+    <main class="page-shell settings-shell">
+        <section class="section-heading">
+            <p class="eyebrow">Settings · Entire app</p>
+            <h1>AI settings</h1>
+            <p class="section-copy">Choose the AI behind every community, bot, reply and fact check. Your choice is shared across phones and computers.</p>
+        </section>
+        <section class="panel settings-panel" aria-labelledby="ai-settings-heading">
+            <h2 id="ai-settings-heading">AI model</h2>
+            <p id="ai-current" class="section-copy" role="status">Loading your saved settings…</p>
+            <p id="ai-sign-in" hidden><a href="/">Sign in at home</a> to change settings for the entire app.</p>
+            <form id="ai-settings-form" class="stack-form">
+                <label for="ai-model">Ollama model</label>
+                <select id="ai-model" aria-describedby="ai-model-help" disabled><option value="">Loading models…</option></select>
+                <div class="model-help">
+                    <span id="ai-model-help">Checking installed text models.</span>
+                    <button id="ai-refresh" type="button" class="btn-text">Refresh models</button>
+                </div>
+                <div class="thinking-card">
+                    <label class="thinking-control" for="ai-thinking">
+                        <span>Enable thinking</span>
+                        <input type="checkbox" id="ai-thinking" role="switch" aria-describedby="ai-thinking-help" disabled>
+                    </label>
+                    <p id="ai-thinking-help" class="section-copy">Choose a model to see its thinking options.</p>
+                </div>
+                <p class="section-copy">Changes apply to the next AI request. A response already being generated may finish with the previous settings.</p>
+                <div id="ai-error" class="error" role="alert"></div>
+                <button id="ai-save" type="submit" class="btn-primary" disabled>Save for entire app</button>
+                <p id="ai-save-status" role="status" aria-live="polite"></p>
+            </form>
+        </section>
+    </main>
+    <script src="/utils.js"></script>
+    <script src="/settings.js"></script>
+</body>
+</html>

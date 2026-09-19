@@ -240,7 +240,7 @@ def test_structured_post_schema_is_sent_to_ollama(monkeypatch):
     assert post.call_args.kwargs['json']['format'] == quality.POST_SCHEMA
 
 
-def test_configured_reviewer_is_used_without_changing_writer(monkeypatch):
+def test_reviewer_uses_global_model_despite_legacy_override(monkeypatch):
     reviewer = Mock(return_value=json.dumps({'supported': True, 'reason': ''}))
     monkeypatch.setattr(server, 'generate_text', reviewer)
     worker = service()
@@ -248,7 +248,7 @@ def test_configured_reviewer_is_used_without_changing_writer(monkeypatch):
     monkeypatch.setattr(server, 'KNOWLEDGE', worker)
     assert server.review_factual_claims('small-writer', {'title': 'The update', 'content': 'The update is available.'},
         {'plan': {'mode': 'news', 'sources': []}, 'briefing': {}}, 'A room') == ''
-    assert reviewer.call_args.args[0] == 'strong-local-reviewer'
+    assert reviewer.call_args.args[0] == server.get_ai_settings()['model']
     assert reviewer.call_args.kwargs['temperature'] == 0.1
 
 

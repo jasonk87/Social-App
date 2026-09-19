@@ -100,7 +100,6 @@ def load_settings():
         'api_key': local['api_key'] if local_pair else os.environ.get('GOOGLE_SEARCH_API_KEY', ''),
         'engine_id': local['engine_id'] if local_pair else (os.environ.get('GOOGLE_SEARCH_ENGINE_ID') or os.environ.get('GOOGLE_CSE_ID', '')),
         'daily_limit': budget,
-        'review_model': os.environ.get('SOCIAL_REVIEW_MODEL') or local.get('review_model', ''),
     }
 
 

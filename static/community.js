@@ -188,41 +188,12 @@ function getEditModalElements() {
     return {
         shell: document.getElementById('community-edit-modal'),
         description: document.getElementById('community-edit-description'),
-        model: document.getElementById('community-edit-model'),
         rate: document.getElementById('community-edit-rate'),
         tone: document.getElementById('community-edit-tone'),
         style: document.getElementById('community-edit-style'),
         error: document.getElementById('community-edit-error'),
         save: document.getElementById('community-edit-save'),
     };
-}
-
-async function loadModelsIntoEditModal() {
-    const modelSelect = document.getElementById('community-edit-model');
-    if (!modelSelect) {
-        return;
-    }
-
-    modelSelect.innerHTML = '<option>Loading models...</option>';
-
-    try {
-        const data = await fetchJSON('/api/models');
-        modelSelect.innerHTML = '';
-
-        if (!data.models.length) {
-            modelSelect.innerHTML = '<option value="">No local models found</option>';
-            return;
-        }
-
-        data.models.forEach((model) => {
-            const option = document.createElement('option');
-            option.value = model;
-            option.textContent = model;
-            modelSelect.appendChild(option);
-        });
-    } catch (err) {
-        modelSelect.innerHTML = '<option value="">Model lookup unavailable</option>';
-    }
 }
 
 async function loadCommunityDetails(name) {
@@ -248,9 +219,6 @@ function openEditModal() {
     elements.style.value = community.style_notes || '';
     elements.error.textContent = '';
 
-    if (community.model) {
-        selectSavedModel(elements.model, community.model);
-    }
 
     updateTonePreview();
     activateDialog(elements.shell);
@@ -282,7 +250,6 @@ async function saveCommunityEdits(event) {
 
     const payload = {
         description: elements.description.value.trim(),
-        model: elements.model.value,
         posting_rate: parseInt(elements.rate.value, 10),
         tone: elements.tone.value,
         style_notes: elements.style.value.trim(),
@@ -724,7 +691,6 @@ document.addEventListener('DOMContentLoaded', async () => {
     document.title = `${name} | Local Social Lab`;
     updateNotificationButtons(name);
     populateToneSelect();
-    loadModelsIntoEditModal();
     await loadFeed(name, { silentNotifications: true, focusTarget: true });
     await loadCommunityState();
     window.addEventListener('hashchange', focusTargetFromHash);
