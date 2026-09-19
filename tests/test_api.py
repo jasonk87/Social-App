@@ -11,7 +11,6 @@ import server
 def api_server():
     # Because DB is recreated per test via conftest, we don't start the simulation engine in tests
     # to avoid background writes. We just test the HTTP handlers.
-    server.init_db()
     httpd = ThreadingHTTPServer(('127.0.0.1', 0), server.RequestHandler)
     port = httpd.server_address[1]
 

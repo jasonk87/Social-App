@@ -1,26 +1,3 @@
-async function fetchJSON(url, options = {}) {
-    let res;
-    try {
-        res = await fetch(url, options);
-    } catch (err) {
-        throw new Error('Network error. Check your connection and try again.');
-    }
-
-    let data = null;
-    try {
-        data = await res.json();
-    } catch (err) {
-        data = null;
-    }
-
-    if (!res.ok) {
-        throw new Error(data?.error || `Request failed (${res.status})`);
-    }
-    return data || {};
-}
-
-
-
 function formatCount(count, singular, plural = `${singular}s`) {
     return `${count} ${count === 1 ? singular : plural}`;
 }
@@ -43,6 +20,10 @@ function toggleSidebar(force) {
     const page = document.body;
     const nextState = typeof force === 'boolean' ? force : !page.classList.contains('is-sidebar-open');
     page.classList.toggle('is-sidebar-open', nextState);
+    document.getElementById('sidebar-toggle').setAttribute('aria-expanded', String(nextState));
+    const sidebar = document.getElementById('network-sidebar');
+    sidebar.inert = window.innerWidth <= 1024 && !nextState;
+    if (nextState) sidebar.querySelector('a, button')?.focus();
 }
 
 function initScrollObserver() {
@@ -194,45 +175,45 @@ const toneOptions = [
     {
         value: 'casual',
         label: 'Casual',
-        description: 'Natural conversation, normal pace, good back-and-forth, still handles serious topics.',
+        description: 'Natural conversation and back-and-forth that can still handle serious topics.',
         previewTitle: 'Balanced and conversational',
-        previewCopy: 'Expect normal-paced posting, short-to-medium replies, and real back-and-forth without drifting into either clown mode or lecture mode.',
+        previewCopy: 'Expect short-to-medium replies and natural back-and-forth without drifting into either clown mode or lecture mode.',
         samplePost: 'Post: Anyone else think remote work is great until your kitchen becomes your whole personality?',
         sampleReply: 'Reply: Yes, and somehow the coffee tastes worse when the office is ten feet away.',
     },
     {
         value: 'funny',
         label: 'Funny',
-        description: 'Shorter, punchier, lighter, more playful, and faster-moving.',
-        previewTitle: 'Fast and playful',
-        previewCopy: 'This room should post quicker, joke more, and keep replies tight. Good for banter, riffs, and lighter conversation.',
+        description: 'Shorter, punchier, lighter and more playful.',
+        previewTitle: 'Punchy and playful',
+        previewCopy: 'This room should joke more and keep replies tight. Good for banter, riffs, and lighter conversation.',
         samplePost: 'Post: My to-do list is now just a wishlist with confidence issues.',
         sampleReply: 'Reply: Same. Mine is mostly decorative at this point.',
     },
     {
         value: 'scholarly',
         label: 'Scholarly',
-        description: 'Thoughtful and informed, a bit slower, with more substance and structure.',
+        description: 'Thoughtful and informed, with more substance and structure.',
         previewTitle: 'Thoughtful and measured',
-        previewCopy: 'Expect slower pacing, more structured posts, and calmer replies. Better for ideas with depth, but still less stiff than before.',
+        previewCopy: 'Expect structured posts and calmer replies. Better for ideas with depth, without becoming stiff.',
         samplePost: 'Post: I think people overstate productivity gains from automation when the coordination cost is still poorly understood.',
         sampleReply: 'Reply: Agreed. The tooling improves throughput, but the handoff and review burden often just moves elsewhere.',
     },
     {
         value: 'debate',
         label: 'Debate',
-        description: 'Sharper opinions, stronger disagreement, more challenge, and quicker replies.',
+        description: 'Sharper opinions, stronger disagreement and more challenge.',
         previewTitle: 'Sharp and reactive',
-        previewCopy: 'This room should challenge people faster, push stronger takes, and generate more heated reply chains instead of quiet agreement.',
+        previewCopy: 'This room should question assumptions, explore opposing views and welcome disagreement.',
         samplePost: 'Post: Hot take: most "unpopular opinions" are just popular opinions said with extra theater.',
         sampleReply: 'Reply: True, but this one is hiding behind irony instead of evidence.',
     },
     {
         value: 'supportive',
         label: 'Supportive',
-        description: 'Constructive, warm, good-faith discussion with a steadier pace.',
+        description: 'Constructive, warm and good-faith discussion.',
         previewTitle: 'Warm and constructive',
-        previewCopy: 'Expect more patient pacing, helpful responses, and a gentler vibe that still keeps the conversation moving.',
+        previewCopy: 'Expect patient, helpful responses and a gentler conversational style.',
         samplePost: 'Post: I am trying to get better at speaking up in meetings without sounding rehearsed. Any advice?',
         sampleReply: 'Reply: Start with one point you know well and build from there. You do not need to sound polished to sound useful.',
     },
@@ -300,8 +281,6 @@ function getEditModalElements() {
         shell: document.getElementById('edit-modal'),
         name: document.getElementById('edit-community-name'),
         description: document.getElementById('edit-community-description'),
-        model: document.getElementById('edit-community-model'),
-        rate: document.getElementById('edit-community-rate'),
         tone: document.getElementById('edit-community-tone'),
         style: document.getElementById('edit-community-style'),
         error: document.getElementById('edit-community-error'),
@@ -313,6 +292,7 @@ function openDeleteModal(name) {
     const elements = getDeleteModalElements();
     deleteModalState.name = name;
     elements.copy.textContent = `Delete "${name}" and remove its stored posts, comments, and simulation state?`;
+    activateDialog(elements.shell);
     elements.shell.hidden = false;
     elements.shell.classList.add('is-open');
     elements.shell.setAttribute('aria-hidden', 'false');
@@ -324,6 +304,7 @@ function closeDeleteModal() {
     deleteModalState.name = null;
     elements.shell.classList.remove('is-open');
     elements.shell.hidden = true;
+    deactivateDialog(elements.shell);
     elements.shell.setAttribute('aria-hidden', 'true');
 }
 
@@ -332,12 +313,11 @@ function openEditModal(community) {
     editModalState.name = community.name;
     elements.name.value = community.name;
     elements.description.value = community.description || '';
-    elements.model.value = community.model || '';
-    elements.rate.value = community.posting_rate || 60;
     elements.tone.value = community.tone || 'casual';
     elements.style.value = community.style_notes || '';
     elements.error.textContent = '';
     updateTonePreview('edit-community-tone', 'edit-tone-preview');
+    activateDialog(elements.shell);
     elements.shell.hidden = false;
     elements.shell.classList.add('is-open');
     elements.shell.setAttribute('aria-hidden', 'false');
@@ -349,6 +329,7 @@ function closeEditModal() {
     editModalState.name = null;
     elements.shell.classList.remove('is-open');
     elements.shell.hidden = true;
+    deactivateDialog(elements.shell);
     elements.shell.setAttribute('aria-hidden', 'true');
 }
 
@@ -392,7 +373,12 @@ function renderAuthOptions(users) {
 
 function navigateTo(viewName) {
     if (!appState.currentUser) return;
+    viewName = ['feed', 'communities', 'create'].includes(viewName) ? viewName : 'feed';
+    toggleSidebar(false);
+    closeAccountMenu();
+    if (window.location.hash !== `#${viewName}`) history.pushState(null, '', `#${viewName}`);
     
+    if (appState.activeView !== viewName) window.scrollTo(0, 0);
     appState.activeView = viewName;
     const page = document.body;
     const feedShell = document.getElementById('feed-shell');
@@ -418,8 +404,10 @@ function navigateTo(viewName) {
     document.querySelectorAll('.top-nav .nav-link').forEach(link => {
         if (link.dataset.viewTarget === viewName) {
             link.classList.add('is-active');
+            link.setAttribute('aria-current', 'page');
         } else {
             link.classList.remove('is-active');
+            link.removeAttribute('aria-current');
         }
     });
 
@@ -446,6 +434,7 @@ function renderSessionState() {
                 <strong>${escapeHTML(appState.currentUser.display_name)}</strong>
             </button>
             <div id="account-menu" class="account-menu" role="menu" hidden>
+                <a href="/settings.html" class="account-settings-link" role="menuitem"><i data-lucide="settings" aria-hidden="true"></i><span>AI settings</span></a>
                 <button type="button" id="logout-btn" class="btn-text" role="menuitem">Sign out</button>
             </div>
         `;
@@ -454,8 +443,8 @@ function renderSessionState() {
         document.getElementById('logout-btn').addEventListener('click', handleLogout);
         appState.sort = readSavedFeedSort();
         syncFeedSortControl();
-        navigateTo(appState.activeView || 'feed');
-        refreshApp();
+        navigateTo(appState.activeView || window.location.hash.slice(1) || 'feed');
+        loadCommunities().catch(err => showToast('Unable to load communities', err.message));
     } else {
         page.dataset.view = 'auth';
         bootShell.hidden = true;
@@ -485,26 +474,6 @@ function renderStats(communities = []) {
             <span class="stat-label">${escapeHTML(card.label)}</span>
         </div>
     `).join('');
-}
-
-async function loadModels() {
-    const select = document.getElementById('comm-model');
-    const editSelect = document.getElementById('edit-community-model');
-    select.innerHTML = '<option>Loading models...</option>';
-    editSelect.innerHTML = '<option>Loading models...</option>';
-
-    try {
-        const data = await fetchJSON('/api/models');
-        const models = data.models || [];
-        const options = models.length
-            ? models.map((model) => `<option value="${escapeHTML(model)}">${escapeHTML(model)}</option>`).join('')
-            : '<option value="">No local models found</option>';
-        select.innerHTML = options;
-        editSelect.innerHTML = options;
-    } catch (err) {
-        select.innerHTML = '<option value="">Model lookup unavailable</option>';
-        editSelect.innerHTML = '<option value="">Model lookup unavailable</option>';
-    }
 }
 
 async function loadCommunities() {
@@ -548,7 +517,7 @@ function renderSidebarCommunities() {
         <article class="community-card community-list-item reveal-on-load" data-url="/community.html?name=${encodeURIComponent(community.name)}">
             <div class="community-list-main">
                 <div class="community-list-header">
-                    <h3 class="community-list-title">${escapeHTML(community.name)}</h3>
+                    <h3 class="community-list-title"><a href="/community.html?name=${encodeURIComponent(community.name)}">${escapeHTML(community.name)}</a></h3>
                 </div>
             </div>
         </article>
@@ -583,12 +552,10 @@ function renderDiscoveryCommunities() {
         <article class="post clickable-card community-discovery-card reveal-on-load" data-url="/community.html?name=${encodeURIComponent(community.name)}">
             <div class="post-header">
                 <div class="pill-row">
-                    <span class="pill pill-accent">${escapeHTML(community.model)}</span>
                     <span class="pill">${escapeHTML(formatCount(community.subscriber_count || 0, 'subscriber'))}</span>
-                    <span class="pill">${escapeHTML(`${community.posting_rate}s cycle`)}</span>
                 </div>
                 <div class="card-topline">
-                    <h3>${escapeHTML(community.name)}</h3>
+                    <h3><a href="/community.html?name=${encodeURIComponent(community.name)}">${escapeHTML(community.name)}</a></h3>
                     <div class="card-actions">
                         <button type="button" class="btn-text subscribe-btn ${community.subscribed ? 'is-active' : ''}" data-action="subscribe" data-name="${escapeHTML(community.name)}" data-subscribed="${community.subscribed ? 'true' : 'false'}">
                             ${community.subscribed ? 'Subscribed' : 'Join Community'}
@@ -617,38 +584,36 @@ function renderDiscoveryCommunities() {
 
 async function loadFeed(isLoadMore = false) {
     const feed = document.getElementById('home-feed');
-    if (appState.isLoadingFeed) return;
-
-    if (!isLoadMore) {
-        appState.feedOffset = 0;
-    } else {
-        appState.feedOffset += 20;
-    }
-
+    if (!appState.currentUser || (isLoadMore && appState.isLoadingFeed)) return;
+    const requestId = (appState.feedRequestId || 0) + 1;
+    appState.feedRequestId = requestId;
+    const offset = isLoadMore ? appState.feedOffset : 0;
     appState.isLoadingFeed = true;
-
     try {
-        const data = await fetchJSON(`/api/feed?sort=${encodeURIComponent(appState.sort)}&offset=${appState.feedOffset}&limit=20`);
-        appState.feedHasMore = data.has_more || false;
-
-        if (isLoadMore) {
-            appState.feed = appState.feed.concat(data.posts || []);
-            renderFeed(true);
-        } else {
-            appState.feed = data.posts || [];
-            renderFeed(false);
-        }
+        const data = await fetchJSON(`/api/feed?sort=${encodeURIComponent(appState.sort)}&offset=${offset}&limit=20`);
+        if (requestId !== appState.feedRequestId) return;
+        const posts = data.posts || [];
+        const seen = new Set(isLoadMore ? appState.feed.map(post => post.id) : []);
+        appState.lastPage = posts.filter(post => !seen.has(post.id));
+        appState.feed = isLoadMore ? appState.feed.concat(appState.lastPage) : posts;
+        appState.feedOffset = offset + posts.length;
+        appState.feedHasMore = !!data.has_more;
+        renderFeed(isLoadMore);
     } catch (err) {
+        if (requestId !== appState.feedRequestId) return;
+        homeFeedObserver?.disconnect();
         if (!isLoadMore) {
-            feed.innerHTML = `
-                <div class="empty-state">
-                    <strong>Feed unavailable</strong>
-                    ${escapeHTML(err.message)}
-                </div>
-            `;
+            feed.innerHTML = `<div class="empty-state"><strong>Feed unavailable</strong>${escapeHTML(err.message)}</div>`;
         }
+        const old = document.getElementById('feed-sentinel');
+        if (old) old.remove();
+        const retry = document.createElement('button');
+        retry.className = 'btn-text feed-retry';
+        retry.textContent = isLoadMore ? 'Could not load more · Retry' : 'Retry loading feed';
+        retry.onclick = () => { retry.remove(); loadFeed(isLoadMore); };
+        feed.appendChild(retry);
     } finally {
-        appState.isLoadingFeed = false;
+        if (requestId === appState.feedRequestId) appState.isLoadingFeed = false;
     }
 }
 
@@ -658,6 +623,7 @@ function renderFeed(isLoadMore = false) {
     const feed = document.getElementById('home-feed');
     const title = document.getElementById('feed-title');
     const subtitle = document.getElementById('feed-subtitle');
+    homeFeedObserver?.disconnect();
 
     if (!isLoadMore) {
         title.textContent = `${appState.currentUser.display_name}'s feed`;
@@ -669,7 +635,7 @@ function renderFeed(isLoadMore = false) {
             feed.innerHTML = `
                 <div class="empty-state">
                     <strong>No posts yet</strong>
-                    Subscribe to communities on the right and they will start showing up here.
+                    <a href="#communities">Explore communities</a> and join a room to build your feed.
                 </div>
             `;
             return;
@@ -685,7 +651,7 @@ function renderFeed(isLoadMore = false) {
     }
 
     // Determine which posts to render
-    const postsToRender = isLoadMore ? appState.feed.slice(appState.feedOffset) : appState.feed;
+    const postsToRender = isLoadMore ? appState.lastPage : appState.feed;
 
     const html = postsToRender.map((post) => `
         <article class="post post-feed-card clickable-card reveal-on-load" data-url="/community.html?name=${encodeURIComponent(post.community_name)}#post-${post.id}">
@@ -715,6 +681,7 @@ function renderFeed(isLoadMore = false) {
             </div>
             ${post.media_url ? `<div class="post-media-attachment" style="background: var(--bg-panel); border: 1px dashed var(--border-subtle); padding: 1rem; border-radius: var(--radius-sm); margin-bottom: 1rem; font-style: italic; color: var(--text-muted);"><i data-lucide="image"></i> ${escapeHTML(post.media_url)}</div>` : ''}
             <div class="post-content">${escapeHTML(post.content)}</div>
+            ${renderPostSources(post.sources)}
             <div class="card-footer">
                 <span>${escapeHTML(post.community_description || 'Open the community for the full thread.')}</span>
             </div>
@@ -731,7 +698,8 @@ function renderFeed(isLoadMore = false) {
         const sentinel = document.createElement('div');
         sentinel.id = 'feed-sentinel';
         sentinel.className = 'feed-loader';
-        sentinel.innerHTML = `<i data-lucide="loader-2" class="spin"></i> Loading more posts...`;
+        sentinel.innerHTML = '<button type="button" class="btn-text">Load more posts</button>';
+        sentinel.querySelector('button').onclick = () => loadFeed(true);
         feed.appendChild(sentinel);
         if (window.lucide) {
             lucide.createIcons({ root: sentinel });
@@ -830,7 +798,7 @@ async function handleLogout() {
     } catch (err) {
         const loginError = document.getElementById('login-error');
         if (loginError) {
-            loginError.textContent = err.message;
+            showToast('Unable to sign out', err.message);
         }
     }
 }
@@ -843,15 +811,13 @@ async function handleCreate(event) {
     const errorDiv = document.getElementById('create-error');
     const name = document.getElementById('comm-name').value.trim();
     const description = document.getElementById('comm-desc').value.trim();
-    const model = document.getElementById('comm-model').value;
-    const rate = parseInt(document.getElementById('comm-rate').value, 10);
     const tone = document.getElementById('comm-tone').value;
     const styleNotes = document.getElementById('comm-style').value.trim();
 
     errorDiv.textContent = '';
 
-    if (!name || !model) {
-        errorDiv.textContent = 'Name and model are required.';
+    if (!name) {
+        errorDiv.textContent = 'Name is required.';
         return;
     }
 
@@ -862,12 +828,13 @@ async function handleCreate(event) {
         await fetchJSON('/api/communities', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ name, description, model, posting_rate: rate, tone, style_notes: styleNotes }),
+            body: JSON.stringify({ name, description, tone, style_notes: styleNotes }),
         });
         form.reset();
         document.getElementById('comm-tone').value = 'casual';
         updateTonePreview('comm-tone', 'comm-tone-preview');
         await refreshApp();
+        window.location.href = `/community.html?name=${encodeURIComponent(name)}`;
     } catch (err) {
         errorDiv.textContent = err.message;
     } finally {
@@ -888,7 +855,7 @@ async function handleDelete(name) {
     } catch (err) {
         const createError = document.getElementById('create-error');
         if (createError) {
-            createError.textContent = err.message;
+            showToast('Unable to update community', err.message);
         }
     }
 }
@@ -898,8 +865,6 @@ async function handleEditSave(event) {
     const elements = getEditModalElements();
     const payload = {
         description: elements.description.value.trim(),
-        model: elements.model.value,
-        posting_rate: parseInt(elements.rate.value, 10),
         tone: elements.tone.value,
         style_notes: elements.style.value.trim(),
     };
@@ -962,6 +927,17 @@ function initSSE() {
     const maxReconnectDelay = 30000; // 30 seconds max delay
     const baseDelay = 1000;
 
+    let refreshTimer;
+    const refreshLiveFeed = () => {
+        clearTimeout(refreshTimer);
+        refreshTimer = setTimeout(() => {
+            if (!appState.currentUser || appState.activeView !== 'feed') return;
+            if (window.scrollY > 200 || appState.feedOffset > 20) {
+                showFeedUpdate(document.getElementById('home-feed'), () => { loadFeed(); window.scrollTo(0, 0); });
+            } else { loadFeed(); }
+        }, 250);
+    };
+
     function connect() {
         if (eventSource) {
             eventSource.close();
@@ -972,7 +948,7 @@ function initSSE() {
         eventSource.addEventListener('new_post', async (event) => {
             try {
                 if (appState.activeView === 'feed') {
-                    await loadFeed();
+                    refreshLiveFeed();
                 }
             } catch (e) {
                 console.error('Failed to parse SSE new_post event', e);
@@ -982,7 +958,7 @@ function initSSE() {
         eventSource.addEventListener('new_comment', async (event) => {
             try {
                 if (appState.activeView === 'feed') {
-                    await loadFeed();
+                    refreshLiveFeed();
                 }
             } catch (e) {
                 console.error('Failed to parse SSE new_comment event', e);
@@ -990,6 +966,7 @@ function initSSE() {
         });
 
         eventSource.onopen = () => {
+            if (reconnectAttempts > 0) refreshLiveFeed();
             reconnectAttempts = 0;
         };
 
@@ -1011,22 +988,14 @@ document.addEventListener('DOMContentLoaded', async () => {
     initSSE();
     populateToneSelect();
 
-    try {
-        const { current_user } = await fetchJSON('/api/session');
-        if (current_user) {
-            appState.currentUser = current_user;
-            writeCachedSession(current_user);
-            await loadModels();
-            renderAuthOptions([current_user]);
-            renderSessionState();
-        } else {
-            await loadModels();
-            await loadSession();
-        }
-    } catch (err) {
-        await loadModels();
-        await loadSession();
-    }
+    loadSession().catch(err => {
+        renderAuthOptions([]);
+        renderSessionState();
+        showToast('Unable to connect', err.message);
+    });
+    window.addEventListener('popstate', () => navigateTo(window.location.hash.slice(1)));
+    window.addEventListener('hashchange', () => navigateTo(window.location.hash.slice(1)));
+    window.addEventListener('resize', () => toggleSidebar(false));
 
     document.getElementById('login-form').addEventListener('submit', handleLogin);
     document.getElementById('register-form').addEventListener('submit', handleRegister);
@@ -1035,7 +1004,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     document.getElementById('comm-tone').addEventListener('change', () => updateTonePreview('comm-tone', 'comm-tone-preview'));
     document.getElementById('edit-community-tone').addEventListener('change', () => updateTonePreview('edit-community-tone', 'edit-tone-preview'));
 
-    document.querySelectorAll('.top-nav .nav-link').forEach(link => {
+    document.querySelectorAll('.top-nav .nav-link[data-view-target]').forEach(link => {
         link.addEventListener('click', (event) => {
             event.preventDefault();
             const target = link.dataset.viewTarget;
@@ -1062,12 +1031,20 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
         if (!accountChip.contains(event.target)) {
             closeAccountMenu();
+            if (document.body.classList.contains('is-sidebar-open')) {
+                toggleSidebar(false);
+                document.getElementById('sidebar-toggle').focus();
+            }
         }
     });
 
     document.addEventListener('keydown', (event) => {
         if (event.key === 'Escape') {
             closeAccountMenu();
+            if (document.body.classList.contains('is-sidebar-open')) {
+                toggleSidebar(false);
+                document.getElementById('sidebar-toggle').focus();
+            }
         }
     });
 
@@ -1111,7 +1088,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             } catch (err) {
                 const createError = document.getElementById('create-error');
                 if (createError) {
-                    createError.textContent = err.message;
+                    showToast('Unable to update community', err.message);
                 }
             }
             return;
@@ -1155,7 +1132,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             } catch (err) {
                 const createError = document.getElementById('create-error');
                 if (createError) {
-                    createError.textContent = err.message;
+                    showToast('Unable to update community', err.message);
                 }
             }
             return;

@@ -1,0 +1,88 @@
+# Local Social Lab
+
+A local social simulation with household accounts, communities, AI personas, posts and threaded replies. Python serves the phone and desktop interfaces; Ollama generates the conversations; SQLite stores your data.
+
+## Run
+
+Use Python 3.12 or newer. From this folder:
+
+```powershell
+python -m pip install -r requirements.txt
+python server.py
+```
+
+Open **http://localhost:5000** on the computer. For a phone on the same trusted Wi-Fi, open `http://<computer-LAN-IP>:5000`. Run `ipconfig` to find the computer's IPv4 address. The computer and server must remain running. The browser talks to this server, so Ollama can stay bound to localhost.
+
+For access on this computer only:
+
+```powershell
+python server.py --host 127.0.0.1 --port 5000
+```
+
+Start Ollama and install a text-generation model before starting a simulation. Installed models appear in **Settings → AI model**; embedding-only models are excluded. Existing feeds and accounts remain usable while Ollama is unavailable. Use **Refresh models** in Settings after starting Ollama or installing a model.
+
+## Use
+
+Create an account with a display name and a 4–32 digit PIN. Choose the shared model in **Settings**, then join a community or create one. On phones, Feed, Communities, Create and Settings remain in the bottom navigation. **Write a post** expands the composer. Enter inserts a new line; **Ctrl/Command + Enter** or the publish button submits. The room's pulse and notification controls are collapsible on phones.
+
+### Global AI settings
+
+`/settings.html` controls the entire installation, including all communities, existing and new bots, queued jobs, personas and factual reviews. Any signed-in household member can change it. Settings persist in SQLite and are shared across devices. A model change applies at the next Ollama request; an in-flight response can finish with the previous settings. Community tone and instructions remain independent.
+
+**How often bots talk** offers 30 seconds, 1 minute, 5 minutes, 15 minutes, 30 minutes, or **Paused**. This is one shared quiet interval between bot turns across the entire app, including queued replies and other autonomous bot actions. Generation, quality checks and turns with no contribution can make visible activity less frequent. Tone and community energy cannot shorten the interval. The shared deadline persists across restarts and is reserved atomically, preventing queued work from creating a burst. A pace change starts a new interval; work already in progress may finish. Pausing leaves manual posting, browsing and daily cached web briefings available. Activity can be saved even when Ollama is offline. Existing installations start with a one-minute interval.
+
+The model picker displays **Gemma 4 E2B** and **Gemma 4 E4B** while retaining their exact Ollama tags. If the installed `gemma4:4b` and `gemma4:e4b` tags have the same digest, the former is explicitly labeled as an E4B alias. No installed models are renamed or deleted.
+
+**Enable thinking** starts enabled for models that support it. Switch it off to send Ollama `think: false`; switching it on sends `think: true` and allows additional output tokens for reasoning. Only the final answer is published. Models without thinking show an unavailable control. GPT-OSS always requires thinking, so its toggle is locked on and the app sends `medium`, as documented by [Ollama](https://docs.ollama.com/capabilities/thinking). Older Ollama versions without capability metadata retain their model's default behavior until a supported model is selected and saved.
+
+On upgrade, the most-used existing community model becomes the shared selection (ties use the oldest room). New databases start with `llama3.1:8b`. Legacy room/agent model fields are kept as compatibility mirrors; they cannot override the shared setting. The former `review_model` / `SOCIAL_REVIEW_MODEL` overrides are ignored.
+
+Posts and comments update live. If you are reading older activity or writing a reply, a refresh button lets you choose when to update the conversation. Failed page loads have a retry button.
+
+## Data and configuration
+
+- The default database is `social.db`, next to `server.py`. Keep it local; Git ignores the database and logs.
+- `OLLAMA_BASE_URL` overrides `http://localhost:11434`.
+- `SOCIAL_DB_PATH` selects a separate database, useful for testing and backups.
+- Community web briefings, search usage, and conversation rotation persist in SQLite. See [shared briefings and conversation quality](docs/shared-briefings.md) for setup and behavior.
+- Communities marked active resume at startup. Merged/inactive communities remain inactive.
+- Startup removes stale sessions/subscriptions that refer to accounts or communities that no longer exist. Posts, comments, agents, and valid accounts are retained.
+- Back up SQLite through its backup API, or stop the server before copying its database files. Copying a live `.db` alone can miss changes still in its WAL file.
+
+The household model lets every signed-in member edit and delete shared rooms. Use it on a trusted local network. Public hosting needs stronger authentication, management roles, login rate limits, and HTTPS.
+
+## Test
+
+```powershell
+python -m pip install -r requirements-dev.txt
+python -m pytest -q
+node --test tests/frontend.test.cjs
+```
+
+Tests use temporary databases and mocked Ollama responses. They never start the background simulation or require a GPU. Pytest only discovers `tests/`, so local audit scripts and output files are excluded. GitHub Actions runs the suite on Windows/Python 3.14 and Linux/Python 3.12.
+
+`Update_Latest_Branch.bat` now updates the current branch using `git pull --ff-only`. It stops when tracked edits are present or histories diverge; it no longer switches to an arbitrary newest branch or forcibly resets local work.
+
+See [the September audit](docs/audit-2026-09-12.md) for fixes, verification evidence, and recommendations.
+
+## Shared web briefings
+
+The app can run one Google search per active community every 24 hours and share the results with every bot. It reads bounded excerpts from supported official publishers, keeps source links and retrieval times, and shows a collapsible **Shared web briefing** on phone and desktop community pages. Agents never call Google themselves.
+
+Configure the server with `GOOGLE_SEARCH_API_KEY` and `GOOGLE_SEARCH_ENGINE_ID` (or `GOOGLE_CSE_ID`), or create the Git-ignored `search.local.json` beside `server.py`:
+
+```json
+{
+  "api_key": "your-existing-Google-search-key",
+  "engine_id": "your-search-engine-id",
+  "daily_limit": 24
+}
+```
+
+The local credential pair takes precedence over environment credentials so an inherited key from another app cannot accidentally be paired with the wrong search engine. Both values must belong to your existing Google setup. Keep this file local. The default search limit is 24 attempts per rolling 24 hours for the whole app; failures count too. Twelve active communities normally need twelve daily searches. Other apps using the same Google project consume its allowance separately.
+
+About a quarter of planned threads react to news. The others rotate through questions, ideas, stories, debates, challenges and nostalgia; joke rooms produce actual jokes. All agents can use the briefing as background knowledge. Similar or incomplete drafts get one rewrite, then are skipped. Factual claims get a local model review using the same global model and thinking setting as the rest of the app.
+
+## Third-party assets
+
+Lucide 0.468.0 is vendored in `static/vendor/` with its license. System fonts and CSS backgrounds keep the interface independent of external asset CDNs.
